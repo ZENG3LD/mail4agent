@@ -3,7 +3,10 @@
 //! blocking-vs-async discipline every method here follows.
 
 use mail4agent_api::{Ack, Address, Message, MessageId, MessageRef, ParticipantId, RoomId};
-use mail4agent_core::{InsertMessageOutcome, MailStore, ParticipantRecord, RoomRecord, SecretDigest, StoreError};
+use mail4agent_core::{
+    InsertMessageOutcome, MailStore, ParticipantRecord, ParticipantSummary, RoomRecord, RoomSummary, SecretDigest,
+    StoreError,
+};
 use serde::{Deserialize, Serialize};
 use stk_db::rusqlite::{self, OptionalExtension};
 use stk_db::{Db, DbConfig, MigrationRunner};
@@ -435,6 +438,68 @@ impl MailStore for SqliteMailStore {
         let acked_at_unix_ms = u64::try_from(acked_at)
             .map_err(|_| StoreError::new(format!("get_ack({message_id}, {reader}): stored acked_at_unix_ms is negative")))?;
         Ok(Some(Ack { message_id: message_id.clone(), reader: reader.clone(), acked_at_unix_ms }))
+    }
+
+    fn list_participants(&self) -> Result<Vec<ParticipantSummary>, StoreError> {
+        let rows: Vec<(String, Option<String>)> = self
+            .db
+            .read_blocking(|conn| {
+                let mut statement = conn.prepare("SELECT id, label FROM participants ORDER BY id")?;
+                let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(|err| StoreError::new(format!("list_participants: {err}")))?;
+
+        rows.into_iter()
+            .map(|(id, label)| {
+                let id = ParticipantId::new(id).map_err(|err| {
+                    StoreError::new(format!("list_participants: stored participant id failed validation: {err}"))
+                })?;
+                Ok(ParticipantSummary { id, label })
+            })
+            .collect()
+    }
+
+    fn list_rooms(&self) -> Result<Vec<RoomSummary>, StoreError> {
+        // One transaction-free read over two statements against the same
+        // connection, not two separate `read_blocking` calls: this keeps
+        // the room list and the membership rows a single consistent
+        // snapshot rather than two reads a concurrent write could land
+        // between.
+        let (room_ids, member_rows): (Vec<String>, Vec<(String, String)>) = self
+            .db
+            .read_blocking(|conn| {
+                let mut room_statement = conn.prepare("SELECT id FROM rooms ORDER BY id")?;
+                let room_ids =
+                    room_statement.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
+
+                let mut member_statement = conn.prepare("SELECT room_id, participant_id FROM room_members")?;
+                let member_rows = member_statement
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<rusqlite::Result<Vec<(String, String)>>>()?;
+
+                Ok((room_ids, member_rows))
+            })
+            .map_err(|err| StoreError::new(format!("list_rooms: {err}")))?;
+
+        let mut members_by_room: std::collections::HashMap<String, std::collections::BTreeSet<ParticipantId>> =
+            std::collections::HashMap::new();
+        for (room_id, participant_id) in member_rows {
+            let participant_id = ParticipantId::new(participant_id).map_err(|err| {
+                StoreError::new(format!("list_rooms: stored member id failed validation: {err}"))
+            })?;
+            members_by_room.entry(room_id).or_default().insert(participant_id);
+        }
+
+        room_ids
+            .into_iter()
+            .map(|id_str| {
+                let members = members_by_room.remove(&id_str).unwrap_or_default();
+                let id = RoomId::new(id_str)
+                    .map_err(|err| StoreError::new(format!("list_rooms: stored room id failed validation: {err}")))?;
+                Ok(RoomSummary { id, members })
+            })
+            .collect()
     }
 }
 

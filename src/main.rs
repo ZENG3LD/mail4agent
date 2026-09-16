@@ -121,6 +121,11 @@ async fn serve(service: Arc<MailboxService>, bind: SocketAddr) -> Result<(), Mai
             post(routes::mail::whoami).with_state(service.clone()),
             TokenTier::Authenticated,
         )
+        .post_tier(
+            "/mail/directory",
+            post(routes::mail::directory).with_state(service.clone()),
+            TokenTier::Authenticated,
+        )
         // MCP door onto the same mail surface -- `mail4agent/CLAUDE.md`,
         // "one implementation, two doors". Same tier as `/mail/*`: an
         // operator calling a mail tool is just a participant.

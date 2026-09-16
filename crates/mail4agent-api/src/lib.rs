@@ -570,19 +570,96 @@ impl Participant {
     pub fn validate(&self) -> Result<(), MailError> {
         self.id.validate()?;
         if let Some(label) = &self.label {
-            if label.len() > SUBJECT_MAX_BYTES {
-                return Err(MailError::TooLarge {
-                    field: "label".to_string(),
-                    limit: SUBJECT_MAX_BYTES,
-                    actual: label.len(),
-                });
-            }
-            if label.chars().any(char::is_control) {
-                return Err(MailError::Malformed {
-                    field: "label".to_string(),
-                    reason: "must not contain control characters".to_string(),
-                });
-            }
+            validate_label(label)?;
+        }
+        Ok(())
+    }
+}
+
+/// Shared by [`Participant::validate`] and [`DirectoryEntry::validate`]:
+/// both carry the exact same `label` shape (an optional display string,
+/// bounded like a subject, no control characters), and a directory entry
+/// is nothing more than a participant's id and label with the rest of
+/// [`Participant`] stripped away -- see [`DirectoryEntry`]'s own doc
+/// comment for why.
+fn validate_label(value: &str) -> Result<(), MailError> {
+    if value.len() > SUBJECT_MAX_BYTES {
+        return Err(MailError::TooLarge {
+            field: "label".to_string(),
+            limit: SUBJECT_MAX_BYTES,
+            actual: value.len(),
+        });
+    }
+    if value.chars().any(char::is_control) {
+        return Err(MailError::Malformed {
+            field: "label".to_string(),
+            reason: "must not contain control characters".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// One entry in the mailbox's own directory of registered participants:
+/// an id and a display label, nothing more. **Never carries a secret
+/// digest or a permission bit** -- a directory answers "who exists", not
+/// "what may they do" or anything that would help forge them, and a type
+/// that structurally has no such field cannot leak one even by accident
+/// (mirrors `mail4agent_core::store::ParticipantSummary`, the store-side
+/// type this is assembled from).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectoryEntry {
+    pub id: ParticipantId,
+    pub label: Option<String>,
+}
+
+impl DirectoryEntry {
+    pub fn validate(&self) -> Result<(), MailError> {
+        self.id.validate()?;
+        if let Some(label) = &self.label {
+            validate_label(label)?;
+        }
+        Ok(())
+    }
+}
+
+/// One room in the mailbox's directory: its id, and whether the caller
+/// who asked for the directory currently belongs to it. `member` is
+/// relative to that one caller -- two different callers reading the
+/// directory at the same moment see the same [`RoomEntry::id`] with
+/// whatever [`RoomEntry::member`] value is true for each of them.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoomEntry {
+    pub id: RoomId,
+    pub member: bool,
+}
+
+impl RoomEntry {
+    pub fn validate(&self) -> Result<(), MailError> {
+        self.id.validate()
+    }
+}
+
+/// Answers a directory request: every participant the mailbox has
+/// registered and every room it tracks, from the point of view of
+/// whoever asked (see [`RoomEntry::member`]). The whole mailbox's
+/// population in one call, deliberately unpaginated -- this is a small,
+/// local directory, not a social graph (`mail4agent/CLAUDE.md`).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Directory {
+    pub participants: Vec<DirectoryEntry>,
+    pub rooms: Vec<RoomEntry>,
+}
+
+impl Directory {
+    pub fn validate(&self) -> Result<(), MailError> {
+        for participant in &self.participants {
+            participant.validate()?;
+        }
+        for room in &self.rooms {
+            room.validate()?;
         }
         Ok(())
     }
@@ -1059,6 +1136,40 @@ mod tests {
             .expect("old shape without idempotency_key must still deserialize");
         assert_eq!(request.idempotency_key, None);
         request.validate().expect("decoded request is otherwise valid");
+    }
+
+    #[test]
+    fn directory_entry_serialises_with_id_and_label_only() {
+        let entry = DirectoryEntry { id: participant("alice"), label: Some("Alice".to_string()) };
+        let json = serde_json::to_value(&entry).expect("directory entry serializes");
+        assert_eq!(json, serde_json::json!({"id": "alice", "label": "Alice"}));
+        let decoded: DirectoryEntry = serde_json::from_value(json).expect("directory entry deserializes");
+        assert_eq!(decoded, entry);
+    }
+
+    #[test]
+    fn directory_entry_rejects_a_control_character_label() {
+        let entry = DirectoryEntry { id: participant("alice"), label: Some("bad\u{0007}label".to_string()) };
+        let err = entry.validate().expect_err("control character in label must be rejected");
+        assert!(matches!(err, MailError::Malformed { field, .. } if field == "label"));
+    }
+
+    #[test]
+    fn room_entry_round_trips_its_member_flag() {
+        let entry = RoomEntry { id: RoomId::new("room-1").expect("valid room id"), member: true };
+        let json = serde_json::to_value(&entry).expect("room entry serializes");
+        assert_eq!(json, serde_json::json!({"id": "room-1", "member": true}));
+        let decoded: RoomEntry = serde_json::from_value(json).expect("room entry deserializes");
+        assert_eq!(decoded, entry);
+    }
+
+    #[test]
+    fn directory_validates_every_entry_it_carries() {
+        let directory = Directory {
+            participants: vec![DirectoryEntry { id: participant("alice"), label: None }],
+            rooms: vec![RoomEntry { id: RoomId::new("room-1").expect("valid room id"), member: false }],
+        };
+        directory.validate().expect("a directory of otherwise-valid entries validates");
     }
 
     #[test]

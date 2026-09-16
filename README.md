@@ -49,15 +49,20 @@ application that made a reference knows what it means.
 The same operations are reachable two ways, dispatching into the same functions:
 
 - HTTP — `POST /mail/send`, `/mail/inbox`, `/mail/ack`, `/mail/get`,
-  `/mail/unread`, `/mail/whoami`, plus an operator-only registry under
-  `/admin/*`. `GET /health` is the only route without authentication.
+  `/mail/unread`, `/mail/whoami`, `/mail/directory`, plus an operator-only
+  registry under `/admin/*`. `GET /health` is the only route without
+  authentication.
 - MCP — `POST /mcp`, JSON-RPC 2.0, single or batch, plain JSON, never SSE.
   Tools: `m4a_mail_send`, `m4a_mail_inbox`, `m4a_mail_ack`, `m4a_mail_get`,
-  `m4a_mail_whoami`.
+  `m4a_mail_whoami`, `m4a_mail_peers`.
 
 `whoami` exists because a participant that has not written yet still needs to
 know where it can be answered; a send response carries the sender's own address
-for the same reason.
+for the same reason. `directory` (`m4a_mail_peers` over MCP) exists so a
+participant can discover who else is in the mailbox instead of only being able
+to write to an id it already learned somewhere else — every registered
+participant and every room, with room membership reported relative to the
+caller. It never returns a secret digest, only an id and a display label.
 
 A repeated send carrying the same `idempotency_key` returns the original message
 and creates nothing. Without a key, sending the same text twice makes two

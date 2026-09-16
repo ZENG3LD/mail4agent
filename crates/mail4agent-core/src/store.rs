@@ -74,6 +74,30 @@ pub struct RoomRecord {
     pub members: BTreeSet<ParticipantId>,
 }
 
+/// A directory-listable summary of a registered participant: enough to
+/// list it, and no more. Deliberately excludes [`ParticipantRecord`]'s
+/// `secret_digest`, `may_send`, `may_read` and `operator` -- a directory
+/// answers "who exists", never "what may they do" or anything that would
+/// help forge one, and a type that structurally has no `secret_digest`
+/// field cannot leak one even by accident, regardless of what
+/// [`MailStore::list_participants`]'s implementation does internally. See
+/// `mail4agent_api::DirectoryEntry`, the wire type this is assembled into.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParticipantSummary {
+    pub id: ParticipantId,
+    pub label: Option<String>,
+}
+
+/// A directory-listable summary of a room: its id and current membership,
+/// as raw fact -- not yet filtered through any one caller's point of view.
+/// `crate::MailboxEngine::directory` is what turns "who is a member" into
+/// "is the caller a member".
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoomSummary {
+    pub id: RoomId,
+    pub members: BTreeSet<ParticipantId>,
+}
+
 /// What [`MailStore::insert_message`] did. Distinguishes a genuinely new
 /// message from a retry recognised by its idempotency key, so the engine can
 /// return the *original* [`mail4agent_api::SendResponse`] without needing a
@@ -163,6 +187,18 @@ pub trait MailStore {
     fn record_ack(&mut self, ack: Ack) -> Result<Ack, StoreError>;
 
     fn get_ack(&self, message_id: &MessageId, reader: &ParticipantId) -> Result<Option<Ack>, StoreError>;
+
+    /// Every registered participant, for the mailbox's own directory
+    /// (`crate::MailboxEngine::directory`). Returns the full set, always
+    /// -- this mailbox is a small, local directory, not a paginated
+    /// social graph. **Never returns a secret digest or a permission
+    /// bit**: see [`ParticipantSummary`]'s own doc comment for why the
+    /// return type itself rules that out.
+    fn list_participants(&self) -> Result<Vec<ParticipantSummary>, StoreError>;
+
+    /// Every room the mailbox tracks, with its current membership, for
+    /// the same directory. Also the full set, always, for the same reason.
+    fn list_rooms(&self) -> Result<Vec<RoomSummary>, StoreError>;
 }
 
 /// An in-memory [`MailStore`], used by this crate's own tests. Not meant for
@@ -300,5 +336,21 @@ impl MailStore for InMemoryStore {
 
     fn get_ack(&self, message_id: &MessageId, reader: &ParticipantId) -> Result<Option<Ack>, StoreError> {
         Ok(self.acks.get(&(message_id.clone(), reader.clone())).cloned())
+    }
+
+    fn list_participants(&self) -> Result<Vec<ParticipantSummary>, StoreError> {
+        Ok(self
+            .participants
+            .iter()
+            .map(|(id, record)| ParticipantSummary { id: id.clone(), label: record.label.clone() })
+            .collect())
+    }
+
+    fn list_rooms(&self) -> Result<Vec<RoomSummary>, StoreError> {
+        Ok(self
+            .rooms
+            .iter()
+            .map(|(id, record)| RoomSummary { id: id.clone(), members: record.members.clone() })
+            .collect())
     }
 }

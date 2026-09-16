@@ -86,7 +86,7 @@ use mail4agent_api::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::routes::mail::{ack_impl, get_impl, inbox_impl, resolve_caller, send_impl, whoami_impl};
+use crate::routes::mail::{ack_impl, directory_impl, get_impl, inbox_impl, resolve_caller, send_impl, whoami_impl};
 use crate::service::{AuthenticatedParticipant, MailboxService};
 
 /// Echoed back from `initialize` when the client's own `protocolVersion` is
@@ -254,7 +254,7 @@ fn handle_initialize(params: &Value) -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// tools/list -- five tools, schemas kept next to the dispatch arm for the
+// tools/list -- six tools, schemas kept next to the dispatch arm for the
 // same tool so they cannot drift from what `arguments` actually
 // deserialises into.
 // ---------------------------------------------------------------------------
@@ -267,6 +267,7 @@ fn tools_list() -> Value {
             tool_mail_ack(),
             tool_mail_get(),
             tool_mail_whoami(),
+            tool_mail_peers(),
         ]
     })
 }
@@ -394,6 +395,18 @@ fn tool_mail_whoami() -> Value {
     })
 }
 
+fn tool_mail_peers() -> Value {
+    json!({
+        "name": "m4a_mail_peers",
+        "description": "List every participant registered in the mailbox and every room it tracks, with room membership reported relative to the caller: an agent that has just started learns its own address from m4a_mail_whoami and learns who it can write to from this.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {}
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // tools/call dispatch
 // ---------------------------------------------------------------------------
@@ -431,6 +444,7 @@ async fn handle_tools_call(
             Ok(tool_result(get_impl(service, caller.id.clone(), req).await))
         }
         "m4a_mail_whoami" => Ok(tool_result(whoami_impl(service, caller.clone()).await)),
+        "m4a_mail_peers" => Ok(tool_result(directory_impl(service, caller.id.clone()).await)),
         other => Err((JSONRPC_INVALID_PARAMS, format!("unknown tool {other:?}"))),
     }
 }
@@ -617,15 +631,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_returns_five_named_tools() {
+    async fn tools_list_returns_six_named_tools() {
         let (service, headers) = service_with_bearer().await;
         let resp = post(&service, &headers, json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" })).await;
         let tools = resp["result"]["tools"].as_array().expect("tools must be an array");
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().expect("name must be a string")).collect();
-        assert_eq!(names, vec!["m4a_mail_send", "m4a_mail_inbox", "m4a_mail_ack", "m4a_mail_get", "m4a_mail_whoami"]);
+        assert_eq!(
+            names,
+            vec!["m4a_mail_send", "m4a_mail_inbox", "m4a_mail_ack", "m4a_mail_get", "m4a_mail_whoami", "m4a_mail_peers"]
+        );
         for tool in tools {
             assert_eq!(tool["inputSchema"]["type"], "object", "{} inputSchema must be type object", tool["name"]);
         }
+    }
+
+    #[tokio::test]
+    async fn peers_tool_returns_the_same_content_as_the_http_directory_route() {
+        let (service, headers) = service_with_bearer().await;
+        let caller = match resolve_caller(&service, &headers).await {
+            Ok(caller) => caller,
+            Err(crate::error::ApiError(err)) => panic!("resolve caller: {err}"),
+        };
+
+        let via_http = directory_impl(&service, caller.id.clone()).await.expect("directory_impl succeeds");
+
+        let resp = post(
+            &service,
+            &headers,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": "m4a_mail_peers", "arguments": {} }
+            }),
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], false);
+        let via_mcp: mail4agent_api::Directory = serde_json::from_value(resp["result"]["structuredContent"].clone())
+            .expect("structuredContent deserializes into Directory");
+
+        assert_eq!(via_mcp, via_http);
     }
 
     #[tokio::test]

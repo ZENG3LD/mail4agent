@@ -278,6 +278,67 @@ fn ack_is_keyed_by_message_and_reader_independently() {
 }
 
 #[test]
+fn list_participants_and_list_rooms_return_the_full_current_set() {
+    let mut store = store();
+    let alice = participant("alice");
+    let bob = participant("bob");
+    store.register_participant(alice.clone(), participant_record(1)).expect("alice registers");
+    store.register_participant(bob.clone(), participant_record(2)).expect("bob registers");
+    let room_id = room("room-1");
+    store.create_room(room_id.clone(), 1_000).expect("room is created");
+    store.add_room_member(&room_id, alice.clone()).expect("alice joins");
+
+    let participants = store.list_participants().expect("list succeeds");
+    let participant_ids: BTreeSet<_> = participants.iter().map(|entry| entry.id.clone()).collect();
+    assert_eq!(participant_ids, BTreeSet::from([alice.clone(), bob.clone()]));
+
+    let rooms = store.list_rooms().expect("list succeeds");
+    assert_eq!(rooms.len(), 1);
+    assert_eq!(rooms[0].id, room_id);
+    assert_eq!(rooms[0].members, BTreeSet::from([alice]));
+}
+
+#[test]
+fn list_participants_stops_naming_a_deregistered_participant() {
+    let mut store = store();
+    let alice = participant("alice");
+    let bob = participant("bob");
+    store.register_participant(alice.clone(), participant_record(1)).expect("alice registers");
+    store.register_participant(bob.clone(), participant_record(2)).expect("bob registers");
+
+    store.deregister_participant(&bob).expect("bob is deregistered");
+
+    let participant_ids: BTreeSet<_> = store.list_participants().expect("list succeeds").into_iter().map(|entry| entry.id).collect();
+    assert_eq!(participant_ids, BTreeSet::from([alice]));
+}
+
+#[test]
+fn neither_directory_listing_method_ever_carries_a_secret_digest_in_any_form() {
+    let mut store = store();
+    let alice = participant("alice");
+    let bob = participant("bob");
+    store.register_participant(alice.clone(), participant_record(0xab)).expect("alice registers");
+    store.register_participant(bob.clone(), participant_record(0xcd)).expect("bob registers");
+    let room_id = room("room-1");
+    store.create_room(room_id.clone(), 1_000).expect("room is created");
+    store.add_room_member(&room_id, alice.clone()).expect("alice joins");
+
+    // The exact byte pattern of each digest, as Debug would render it if it
+    // ever ended up inside a listed value -- not a substring guess, the
+    // literal `[u8; 32]` debug output.
+    let digest_ab_debug = format!("{:?}", digest(0xab));
+    let digest_cd_debug = format!("{:?}", digest(0xcd));
+
+    let participants_debug = format!("{:?}", store.list_participants().expect("list succeeds"));
+    assert!(!participants_debug.contains(&digest_ab_debug), "list_participants leaked alice's secret digest");
+    assert!(!participants_debug.contains(&digest_cd_debug), "list_participants leaked bob's secret digest");
+
+    let rooms_debug = format!("{:?}", store.list_rooms().expect("list succeeds"));
+    assert!(!rooms_debug.contains(&digest_ab_debug), "list_rooms leaked alice's secret digest");
+    assert!(!rooms_debug.contains(&digest_cd_debug), "list_rooms leaked bob's secret digest");
+}
+
+#[test]
 fn migrations_are_idempotent_when_run_twice_over_the_same_database() {
     let db = Db::open(&DbConfig::in_memory()).expect("in-memory db opens");
     db.run_migrations_blocking(MigrationRunner::new(migrations())).expect("first run applies the schema");

@@ -22,10 +22,10 @@ use mail4agent_core::ParticipantPermissions;
 use crate::service::MailboxService;
 
 /// The id minted for the bootstrap operator. Fixed and well-known so a
-/// later start can check for exactly this participant rather than
-/// scanning the registry -- which `MailStore` has no call to do anyway
-/// (see `mail4agent-core`'s own store contract: participants are looked up
-/// by id or by secret digest, never listed).
+/// later start can check for exactly this participant directly (see
+/// [`MailboxService::participant_exists`]) rather than scanning
+/// `MailStore::list_participants` -- the mailbox's own directory listing,
+/// added for `/mail/directory` -- for one specific id.
 const BOOTSTRAP_OPERATOR_ID: &str = "operator";
 
 #[derive(Debug, thiserror::Error)]

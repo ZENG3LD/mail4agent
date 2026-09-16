@@ -463,6 +463,75 @@ fn message_get_refuses_unknown_message_by_name() {
 }
 
 #[test]
+fn directory_lists_every_registered_participant_and_room() {
+    let mut engine = engine();
+    let alice = participant("alice");
+    let bob = participant("bob");
+    let room_id = room("room-1");
+    engine
+        .register_participant(alice.clone(), Some("Alice".to_string()), permissions(true, true, false))
+        .expect("alice registers");
+    engine.register_participant(bob.clone(), None, permissions(true, true, false)).expect("bob registers");
+    engine.create_room(room_id.clone(), 1_000).expect("room is created");
+
+    let directory = engine.directory(&alice).expect("alice reads the directory");
+
+    let participant_ids: std::collections::BTreeSet<_> =
+        directory.participants.iter().map(|entry| entry.id.clone()).collect();
+    assert_eq!(participant_ids, std::collections::BTreeSet::from([alice.clone(), bob]));
+    let alice_entry = directory.participants.iter().find(|entry| entry.id == alice).expect("alice is listed");
+    assert_eq!(alice_entry.label, Some("Alice".to_string()));
+
+    let room_ids: std::collections::BTreeSet<_> = directory.rooms.iter().map(|entry| entry.id.clone()).collect();
+    assert_eq!(room_ids, std::collections::BTreeSet::from([room_id]));
+}
+
+#[test]
+fn deregistered_participant_stops_appearing_in_the_directory() {
+    let mut engine = engine();
+    let alice = participant("alice");
+    let bob = participant("bob");
+    engine.register_participant(alice.clone(), None, permissions(true, true, false)).expect("alice registers");
+    engine.register_participant(bob.clone(), None, permissions(true, true, false)).expect("bob registers");
+
+    engine.deregister_participant(&bob).expect("bob is deregistered");
+
+    let directory = engine.directory(&alice).expect("alice reads the directory");
+    assert!(directory.participants.iter().all(|entry| entry.id != bob), "a deregistered participant must not be listed");
+}
+
+#[test]
+fn directory_reports_room_membership_relative_to_the_caller() {
+    let mut engine = engine();
+    let alice = participant("alice");
+    let bob = participant("bob");
+    let joined = room("joined");
+    let not_joined = room("not-joined");
+    engine.register_participant(alice.clone(), None, permissions(true, true, false)).expect("alice registers");
+    engine.register_participant(bob.clone(), None, permissions(true, true, false)).expect("bob registers");
+    engine.create_room(joined.clone(), 1_000).expect("joined room is created");
+    engine.create_room(not_joined.clone(), 1_000).expect("not-joined room is created");
+    engine.add_room_member(&joined, alice.clone()).expect("alice joins");
+
+    let directory = engine.directory(&alice).expect("alice reads the directory");
+
+    let joined_entry = directory.rooms.iter().find(|entry| entry.id == joined).expect("joined room is listed");
+    assert!(joined_entry.member, "alice must be reported as a member of the room she joined");
+    let not_joined_entry = directory.rooms.iter().find(|entry| entry.id == not_joined).expect("not-joined room is listed");
+    assert!(!not_joined_entry.member, "alice must not be reported as a member of a room she never joined");
+}
+
+#[test]
+fn directory_without_may_read_is_refused_by_name() {
+    let mut engine = engine();
+    let alice = participant("alice");
+    engine.register_participant(alice.clone(), None, permissions(true, false, false)).expect("alice registers");
+
+    let err = engine.directory(&alice).expect_err("must be refused");
+    assert_eq!(err, MailError::PermissionDenied { need: "mail:read".to_string() });
+}
+
+#[test]
 fn add_room_member_refuses_unknown_room_and_unknown_participant_by_name() {
     let mut engine = engine();
     let alice = participant("alice");

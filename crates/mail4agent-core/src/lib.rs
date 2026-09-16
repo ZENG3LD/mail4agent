@@ -19,7 +19,10 @@ mod engine;
 mod store;
 
 pub use engine::{MailboxEngine, ParticipantPermissions, SECRET_HEX_LEN};
-pub use store::{InMemoryStore, InsertMessageOutcome, MailStore, ParticipantRecord, RoomRecord, SecretDigest, StoreError};
+pub use store::{
+    InMemoryStore, InsertMessageOutcome, MailStore, ParticipantRecord, ParticipantSummary, RoomRecord, RoomSummary,
+    SecretDigest, StoreError,
+};
 
 #[cfg(test)]
 mod tests;
