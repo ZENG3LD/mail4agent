@@ -380,14 +380,14 @@ fn tool_mail_send() -> Value {
 fn tool_mail_inbox() -> Value {
     json!({
         "name": "m4a_mail_inbox",
-        "description": format!("Page through the caller's own inbox: messages addressed directly to the caller, plus messages to any room the caller currently belongs to. since_unix_ms filters to that timestamp onward (omit for the full history); limit bounds the page size (default {INBOX_LIMIT_DEFAULT}, max {INBOX_LIMIT_MAX}). wait_secs long-polls (clamped to {INBOX_WAIT_SECS_MAX}s, never refused for asking longer) when the inbox would otherwise answer empty: waits for mail to arrive for the caller, or for the wait to elapse, and answers an empty page rather than an error either way. Omit it (or use 0) to keep answering at once."),
+        "description": format!("Page through the caller's own inbox: messages addressed directly to the caller, plus messages to any room the caller currently belongs to. since_unix_ms filters to that timestamp onward (omit for the full history); limit bounds the page size (default {INBOX_LIMIT_DEFAULT}, max {INBOX_LIMIT_MAX}). wait_secs long-polls (clamped to {INBOX_WAIT_SECS_MAX}s, never refused for asking longer) when the inbox would otherwise answer empty: waits for mail to arrive for the caller, or for the wait to elapse, and answers an empty page rather than an error either way. Omit it (or use 0) to keep answering at once. Pair it with since_unix_ms carrying the timestamp of the newest message you have already seen: an inbox that holds any history is never empty, so wait_secs on its own answers at once with old mail and nothing will ever appear to wait."),
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
             "properties": {
                 "since_unix_ms": { "type": ["integer", "null"], "minimum": 0 },
                 "limit": { "type": ["integer", "null"], "minimum": 1, "maximum": INBOX_LIMIT_MAX },
-                "wait_secs": { "type": ["integer", "null"], "minimum": 0, "maximum": INBOX_WAIT_SECS_MAX, "description": "Long-polls up to this many seconds (clamped, never refused for asking longer) when the inbox would otherwise answer empty." }
+                "wait_secs": { "type": ["integer", "null"], "minimum": 0, "maximum": INBOX_WAIT_SECS_MAX, "description": "Long-polls up to this many seconds (clamped, never refused for asking longer) when the inbox would otherwise answer empty. Use with since_unix_ms set to the newest message you have seen, or an inbox with any history answers at once." }
             }
         }
     })
