@@ -1,0 +1,36 @@
+[package]
+name = "mail4agent"
+version = "0.1.0"
+edition = "2021"
+description = "A mailbox for agent sessions: addresses, messages, threads and acknowledgements, served over HTTP and MCP."
+license = "MIT"
+readme = "README.md"
+keywords = ["agent", "mailbox", "mcp", "messaging"]
+categories = ["development-tools", "network-programming"]
+
+[[bin]]
+name = "mail4agent"
+path = "src/main.rs"
+
+[dependencies]
+mail4agent-api = { path = "crates/mail4agent-api", version = "0.1.0" }
+mail4agent-core = { path = "crates/mail4agent-core", version = "0.1.0" }
+
+axum = { version = "0.8", features = ["json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tower-http = { version = "0.6", features = ["cors"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+subtle = "2"
+
+# Internal workspace; independent from any parent workspace.
+[workspace]
+members = [
+    "crates/mail4agent-api",
+    "crates/mail4agent-core",
+    "crates/mail4agent-client",
+]
