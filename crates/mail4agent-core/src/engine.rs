@@ -114,6 +114,7 @@ impl<S: MailStore> MailboxEngine<S> {
             may_send: permissions.may_send,
             may_read: permissions.may_read,
             operator: permissions.operator,
+            listener_url: None,
         };
         self.store.register_participant(id, record).map_err(|err| store_unavailable("register_participant", err))?;
         Ok(secret)
@@ -147,6 +148,26 @@ impl<S: MailStore> MailboxEngine<S> {
     /// be re-registered) to authenticate again.
     pub fn revoke_participant_secret(&mut self, id: &ParticipantId) -> Result<(), MailError> {
         self.rotate_participant_secret(id).map(|_secret| ())
+    }
+
+    /// Registers (or replaces) the URL the mailbox POSTs a
+    /// [`mail4agent_api::DeliveryNotification`] to whenever mail arrives
+    /// for `id` or any of its sessions. Operator-only at the daemon's own
+    /// admin surface (`POST /admin/listener`); this method itself only
+    /// enforces that `id` is a real, already-registered participant and
+    /// that `url` is a well-formed loopback URL -- see
+    /// [`validate_listener_url`] for exactly what that means and why.
+    pub fn set_listener(&mut self, id: &ParticipantId, url: String) -> Result<(), MailError> {
+        validate_listener_url(&url)?;
+        self.require_participant(id)?;
+        self.store.set_listener_url(id, Some(url)).map_err(|err| store_unavailable("set_listener_url", err))
+    }
+
+    /// Removes `id`'s registered delivery listener, if any. Idempotent:
+    /// removing an account with no listener registered is not an error.
+    pub fn remove_listener(&mut self, id: &ParticipantId) -> Result<(), MailError> {
+        self.require_participant(id)?;
+        self.store.set_listener_url(id, None).map_err(|err| store_unavailable("set_listener_url", err))
     }
 
     /// Creates a room with no members. `now_unix_ms` is threaded through by
@@ -690,6 +711,62 @@ impl<S: MailStore> MailboxEngine<S> {
 fn store_unavailable(operation: &'static str, err: StoreError) -> MailError {
     tracing::error!(operation, error = %err, "mail store operation failed");
     MailError::StoreUnavailable { operation: operation.to_string() }
+}
+
+/// Bound on a registered listener URL's length. Reuses the same order of
+/// magnitude `mail4agent_api::REF_LOCATOR_MAX_BYTES` picks for a comparable
+/// free-text pointer field, rather than inventing a third bound for one more
+/// plain string this crate happens to store.
+const LISTENER_URL_MAX_BYTES: usize = 512;
+
+/// Structural validation for `MailboxEngine::set_listener`'s `url`:
+/// bounded, no control characters, and -- the rule that actually matters
+/// here -- **loopback only**. This mailbox is a local service; a listener
+/// URL pointing off the machine would turn every future message to that
+/// account into an outbound call to somewhere the operator may not have
+/// meant, and there is no reason to allow that yet (`mail4agent/CLAUDE.md`
+/// task brief, "Only `http://127.0.0.1:*` and `http://localhost:*` URLs are
+/// accepted, refused by name otherwise").
+///
+/// Deliberately hand-parsed rather than pulled through a URL-parsing crate
+/// (this crate's own dependency list stays short and I/O-free) but not a
+/// naive prefix check either: `http://127.0.0.1.evil.example/` and
+/// `http://user:pass@evil.example` both look like they start with an
+/// accepted prefix under a plain `starts_with`, and neither is loopback.
+/// The authority component is isolated first (everything up to the first
+/// `/`, `?`, or `#`, exactly where a URL's authority ends), a bare `@`
+/// inside it is refused outright (a loopback listener never needs
+/// userinfo), and only then is the part before an optional `:port` compared
+/// against `127.0.0.1` / `localhost` for an exact match.
+fn validate_listener_url(url: &str) -> Result<(), MailError> {
+    let malformed = |reason: &str| MailError::Malformed { field: "url".to_string(), reason: reason.to_string() };
+
+    if url.len() > LISTENER_URL_MAX_BYTES {
+        return Err(MailError::TooLarge {
+            field: "url".to_string(),
+            limit: LISTENER_URL_MAX_BYTES,
+            actual: url.len(),
+        });
+    }
+    if url.chars().any(char::is_control) {
+        return Err(malformed("must not contain control characters"));
+    }
+
+    const LOOPBACK_REFUSAL: &str = "must be an http://127.0.0.1:* or http://localhost:* URL -- this mailbox is \
+         a local service and never turns a message into an outbound call anywhere else";
+
+    let Some(after_scheme) = url.strip_prefix("http://") else {
+        return Err(malformed(LOOPBACK_REFUSAL));
+    };
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.contains('@') {
+        return Err(malformed("must not carry userinfo (\"user:pass@\") in a loopback listener URL"));
+    }
+    let host = authority.split(':').next().unwrap_or("");
+    if !host.eq_ignore_ascii_case("127.0.0.1") && !host.eq_ignore_ascii_case("localhost") {
+        return Err(malformed(LOOPBACK_REFUSAL));
+    }
+    Ok(())
 }
 
 fn generate_secret() -> String {

@@ -26,8 +26,12 @@ mail4agent-attest = { path = "crates/mail4agent-attest", version = "0.1.0" }
 stk = { package = "servertoolkit", path = "../servertoolkit/crates/servertoolkit", version = "0.1.0" }
 
 axum = { version = "0.8", features = ["json"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net"] }
 tower-http = { version = "0.6", features = ["cors"] }
+# Fires a registered delivery listener's URL after a message commits (see
+# `src/service.rs`, `MailboxService::spawn_listener_delivery`). Same version
+# `mail4agent-client` already pins for the same job.
+reqwest = { version = "0.12", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

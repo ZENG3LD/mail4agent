@@ -47,6 +47,7 @@ fn participant_record(digest_byte: u8) -> ParticipantRecord {
         may_send: true,
         may_read: true,
         operator: false,
+        listener_url: None,
     }
 }
 
@@ -96,6 +97,23 @@ fn participant_round_trips_through_register_get_and_deregister() {
 
     store.deregister_participant(&alice).expect("deregisters");
     assert_eq!(store.get_participant(&alice).expect("get succeeds"), None);
+}
+
+#[test]
+fn set_listener_url_persists_and_clears_through_get_participant() {
+    let mut store = store();
+    let alice = participant("alice");
+    store.register_participant(alice.clone(), participant_record(1)).expect("registers");
+    assert_eq!(store.get_participant(&alice).expect("get succeeds").expect("exists").listener_url, None);
+
+    store.set_listener_url(&alice, Some("http://127.0.0.1:9000/hook".to_string())).expect("sets the listener url");
+    assert_eq!(
+        store.get_participant(&alice).expect("get succeeds").expect("exists").listener_url,
+        Some("http://127.0.0.1:9000/hook".to_string())
+    );
+
+    store.set_listener_url(&alice, None).expect("clears the listener url");
+    assert_eq!(store.get_participant(&alice).expect("get succeeds").expect("exists").listener_url, None);
 }
 
 #[test]
@@ -551,7 +569,7 @@ fn migrations_are_idempotent_when_run_twice_over_the_same_database() {
 fn a_v1_database_survives_the_v2_migration_with_every_v1_row_still_readable() {
     let db = Db::open(&DbConfig::in_memory()).expect("in-memory db opens");
     let all_migrations = migrations();
-    assert_eq!(all_migrations.len(), 2, "this test assumes exactly v1 and v2 exist so far");
+    assert_eq!(all_migrations.len(), 3, "this test assumes exactly v1, v2 and v3 exist so far");
 
     // Apply only v1 -- the shape the live mailbox on 18301 is at right now.
     db.run_migrations_blocking(MigrationRunner::new(vec![all_migrations[0].clone()])).expect("v1 alone applies");
@@ -599,13 +617,17 @@ fn a_v1_database_survives_the_v2_migration_with_every_v1_row_still_readable() {
     })
     .expect("v1-shaped rows insert directly");
 
-    // Now bring the database up to v2.
-    db.run_migrations_blocking(MigrationRunner::new(all_migrations)).expect("v2 applies on top of the live v1 data");
+    // Now bring the database up to the latest schema (v2, then v3).
+    db.run_migrations_blocking(MigrationRunner::new(all_migrations))
+        .expect("v2 and v3 apply on top of the live v1 data");
 
     let mut mail_store = SqliteMailStore::new(db);
 
     let alice_record = mail_store.get_participant(&alice).expect("get succeeds").expect("alice survives the migration");
     assert_eq!(alice_record.secret_digest, [1u8; 32]);
+    // v3 adds `listener_url` as a nullable column -- a row written before
+    // it existed reads back with no listener on file, not a decode error.
+    assert_eq!(alice_record.listener_url, None);
     let bob_record = mail_store.get_participant(&bob).expect("get succeeds").expect("bob survives the migration");
     assert_eq!(bob_record.secret_digest, [2u8; 32]);
 

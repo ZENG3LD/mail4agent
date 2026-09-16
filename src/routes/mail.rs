@@ -10,6 +10,7 @@
 //! into the very same `*_impl` functions the HTTP routes call").
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::State;
 use axum::http::HeaderMap;
@@ -17,7 +18,7 @@ use axum::Json;
 use mail4agent_api::{
     Ack, AckRequest, AckResponse, Address, Directory, InboxPage, InboxRequest, MailError,
     Message, MessageGetRequest, SendRequest, SendResponse, SessionDeclared, UnreadCount,
-    UnreadCountRequest,
+    UnreadCountRequest, INBOX_WAIT_SECS_MAX,
 };
 
 use crate::auth::extract_bearer;
@@ -92,7 +93,17 @@ pub async fn inbox(
 pub(crate) async fn inbox_impl(service: &MailboxService, reader: Address, request: InboxRequest) -> Result<InboxPage, MailError> {
     request.validate()?;
     let since_unix_ms = request.since_unix_ms.unwrap_or(0);
-    service.inbox(reader, since_unix_ms, request.limit).await
+    let wait = clamp_wait_secs(request.wait_secs);
+    service.inbox(reader, since_unix_ms, request.limit, wait).await
+}
+
+/// Clamps a caller's requested `wait_secs` to [`INBOX_WAIT_SECS_MAX`]
+/// rather than refusing a longer request -- see that constant's own doc
+/// comment. `None` (the caller did not ask to wait at all) stays `None`;
+/// there is no lower clamp because `InboxRequest::wait_secs` is a `u16` and
+/// cannot be negative.
+fn clamp_wait_secs(wait_secs: Option<u16>) -> Option<Duration> {
+    wait_secs.map(|secs| Duration::from_secs(u64::from(secs.min(INBOX_WAIT_SECS_MAX))))
 }
 
 pub async fn ack(
@@ -216,4 +227,29 @@ pub(crate) async fn status_impl(
         .await?
         .ok_or_else(|| MailError::UnknownSession { session })?;
     Ok(StatusResponse { card })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clamp_wait_secs_is_none_when_the_caller_omits_it() {
+        assert_eq!(clamp_wait_secs(None), None);
+    }
+
+    #[test]
+    fn clamp_wait_secs_passes_a_request_at_or_under_the_cap_through_unchanged() {
+        assert_eq!(clamp_wait_secs(Some(5)), Some(Duration::from_secs(5)));
+        assert_eq!(clamp_wait_secs(Some(INBOX_WAIT_SECS_MAX)), Some(Duration::from_secs(u64::from(INBOX_WAIT_SECS_MAX))));
+    }
+
+    #[test]
+    fn clamp_wait_secs_clamps_a_request_over_the_cap_instead_of_refusing() {
+        // There is no `Err` arm at all in `clamp_wait_secs`'s own signature
+        // -- this is the type-level half of "clamp, don't refuse"; this
+        // test is the behavioural half.
+        let clamped = clamp_wait_secs(Some(u16::MAX)).expect("a Some request still yields a Some duration");
+        assert_eq!(clamped, Duration::from_secs(u64::from(INBOX_WAIT_SECS_MAX)));
+    }
 }

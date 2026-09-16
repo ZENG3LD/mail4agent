@@ -93,3 +93,22 @@ pub struct RoomMemberRequest {
 /// report (deregister, room create, membership add/remove).
 #[derive(Debug, Serialize)]
 pub struct EmptyResponse {}
+
+/// Body for `POST /admin/listener`: registers (or replaces) the URL the
+/// mailbox POSTs a `mail4agent_api::DeliveryNotification` to whenever mail
+/// arrives for `account` or any of its sessions. `url`'s own shape (bounded,
+/// loopback-only) is validated by `mail4agent_core::MailboxEngine::set_listener`,
+/// not here -- this daemon's admin bodies carry no validation logic of
+/// their own, the same way every other request in this module forwards
+/// straight into the engine (see `RegisterParticipantRequest`).
+#[derive(Debug, Deserialize)]
+pub struct SetListenerRequest {
+    pub account: ParticipantId,
+    pub url: String,
+}
+
+/// Body for `POST /admin/listener/remove`.
+#[derive(Debug, Deserialize)]
+pub struct RemoveListenerRequest {
+    pub account: ParticipantId,
+}

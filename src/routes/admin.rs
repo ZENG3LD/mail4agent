@@ -19,8 +19,8 @@ use axum::Json;
 use mail4agent_api::MailError;
 
 use crate::dto::{
-    EmptyResponse, ParticipantIdRequest, RegisterParticipantRequest, RoomIdRequest,
-    RoomMemberRequest, SecretResponse,
+    EmptyResponse, ParticipantIdRequest, RegisterParticipantRequest, RemoveListenerRequest, RoomIdRequest,
+    RoomMemberRequest, SecretResponse, SetListenerRequest,
 };
 use crate::error::{ApiError, ApiJson};
 use crate::routes::mail::authenticate_caller;
@@ -127,4 +127,32 @@ pub async fn remove_room_member(
 
 async fn remove_room_member_impl(service: &MailboxService, request: RoomMemberRequest) -> Result<(), MailError> {
     service.remove_room_member(request.room, request.participant).await
+}
+
+pub async fn set_listener(
+    State(app): State<Arc<AppState>>,
+    headers: HeaderMap,
+    ApiJson(request): ApiJson<SetListenerRequest>,
+) -> Result<Json<EmptyResponse>, ApiError> {
+    require_operator(&app, &headers).await?;
+    set_listener_impl(&app.service, request).await?;
+    Ok(Json(EmptyResponse {}))
+}
+
+async fn set_listener_impl(service: &MailboxService, request: SetListenerRequest) -> Result<(), MailError> {
+    service.set_listener(request.account, request.url).await
+}
+
+pub async fn remove_listener(
+    State(app): State<Arc<AppState>>,
+    headers: HeaderMap,
+    ApiJson(request): ApiJson<RemoveListenerRequest>,
+) -> Result<Json<EmptyResponse>, ApiError> {
+    require_operator(&app, &headers).await?;
+    remove_listener_impl(&app.service, request).await?;
+    Ok(Json(EmptyResponse {}))
+}
+
+async fn remove_listener_impl(service: &MailboxService, request: RemoveListenerRequest) -> Result<(), MailError> {
+    service.remove_listener(request.account).await
 }

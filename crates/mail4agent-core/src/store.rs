@@ -60,6 +60,13 @@ pub struct ParticipantRecord {
     pub may_send: bool,
     pub may_read: bool,
     pub operator: bool,
+    /// The URL the mailbox POSTs a [`mail4agent_api::DeliveryNotification`]
+    /// to when mail arrives for this account or any of its sessions --
+    /// `None` until `crate::MailboxEngine::set_listener` registers one.
+    /// Structural validation (bounded, loopback-only) happens once, in
+    /// that engine method, before this is ever written -- this store keeps
+    /// whatever string it is handed, the same way `label` does.
+    pub listener_url: Option<String>,
 }
 
 /// A room the mailbox tracks membership for. Membership is explicit and
@@ -146,6 +153,12 @@ pub trait MailStore {
     /// mechanism behind both revoking and rotating a secret (see
     /// `crate::MailboxEngine::rotate_participant_secret`).
     fn set_participant_secret_digest(&mut self, id: &ParticipantId, digest: SecretDigest) -> Result<(), StoreError>;
+
+    /// Replaces a participant's registered delivery-listener URL --
+    /// `Some` to register or replace one, `None` to remove it. The caller
+    /// (the engine) has already confirmed `id` is registered and, on
+    /// `Some`, already validated `url`'s shape.
+    fn set_listener_url(&mut self, id: &ParticipantId, url: Option<String>) -> Result<(), StoreError>;
 
     fn get_participant(&self, id: &ParticipantId) -> Result<Option<ParticipantRecord>, StoreError>;
 
@@ -290,6 +303,13 @@ impl MailStore for InMemoryStore {
 
     fn get_participant(&self, id: &ParticipantId) -> Result<Option<ParticipantRecord>, StoreError> {
         Ok(self.participants.get(id).cloned())
+    }
+
+    fn set_listener_url(&mut self, id: &ParticipantId, url: Option<String>) -> Result<(), StoreError> {
+        if let Some(record) = self.participants.get_mut(id) {
+            record.listener_url = url;
+        }
+        Ok(())
     }
 
     fn find_participant_by_digest(

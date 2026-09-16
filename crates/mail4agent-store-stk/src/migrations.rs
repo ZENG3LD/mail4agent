@@ -229,6 +229,19 @@ CREATE INDEX idx_messages_room_recipient
     WHERE to_kind = 'room';
 ";
 
+/// `v3`: one nullable column, `participants.listener_url` -- the URL the
+/// mailbox POSTs a `mail4agent_api::DeliveryNotification` to when mail
+/// arrives for that account or any of its sessions
+/// (`mail4agent_core::MailboxEngine::set_listener`/`remove_listener`).
+/// `NULL` until an operator registers one via `POST /admin/listener`, so
+/// every existing row reads back with no listener on file -- no data
+/// migration needed, unlike `v2`'s `messages` rebuild: SQLite's own
+/// `ALTER TABLE ... ADD COLUMN` handles a nullable column with no `CHECK`
+/// in one statement.
+const SCHEMA_V3_SQL: &str = "
+ALTER TABLE participants ADD COLUMN listener_url TEXT;
+";
+
 /// This crate's own migrations, in the order [`stk_db::MigrationRunner`]
 /// must apply them. A daemon runs these once against the [`stk_db::Db`] it
 /// hands to [`crate::SqliteMailStore::new`]; [`crate::SqliteMailStore::open_in_memory`]
@@ -237,5 +250,6 @@ pub fn migrations() -> Vec<Migration> {
     vec![
         Migration::new(1, "mail4agent_v1_schema", SCHEMA_V1_SQL),
         Migration::new(2, "mail4agent_v2_sessions_and_session_addressing", SCHEMA_V2_SQL),
+        Migration::new(3, "mail4agent_v3_participant_listener_url", SCHEMA_V3_SQL),
     ]
 }
