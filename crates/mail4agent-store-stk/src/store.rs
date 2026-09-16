@@ -56,8 +56,8 @@ impl MailStore for SqliteMailStore {
         self.db
             .write_blocking(|conn| {
                 conn.execute(
-                    "INSERT INTO participants (id, label, secret_digest, may_send, may_read, operator)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    "INSERT INTO participants (id, label, secret_digest, may_send, may_read, operator, listener_url)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     rusqlite::params![
                         id.as_str(),
                         record.label,
@@ -65,11 +65,24 @@ impl MailStore for SqliteMailStore {
                         record.may_send,
                         record.may_read,
                         record.operator,
+                        record.listener_url,
                     ],
                 )?;
                 Ok(())
             })
             .map_err(|err| StoreError::new(format!("register_participant({id}): {err}")))
+    }
+
+    fn set_listener_url(&mut self, id: &ParticipantId, url: Option<String>) -> Result<(), StoreError> {
+        self.db
+            .write_blocking(|conn| {
+                conn.execute(
+                    "UPDATE participants SET listener_url = ?1 WHERE id = ?2",
+                    rusqlite::params![url, id.as_str()],
+                )?;
+                Ok(())
+            })
+            .map_err(|err| StoreError::new(format!("set_listener_url({id}): {err}")))
     }
 
     fn deregister_participant(&mut self, id: &ParticipantId) -> Result<(), StoreError> {
@@ -97,7 +110,8 @@ impl MailStore for SqliteMailStore {
         self.db
             .read_blocking(|conn| {
                 conn.query_row(
-                    "SELECT label, secret_digest, may_send, may_read, operator FROM participants WHERE id = ?1",
+                    "SELECT label, secret_digest, may_send, may_read, operator, listener_url
+                       FROM participants WHERE id = ?1",
                     rusqlite::params![id.as_str()],
                     |row| {
                         Ok(ParticipantRecord {
@@ -106,6 +120,7 @@ impl MailStore for SqliteMailStore {
                             may_send: row.get(2)?,
                             may_read: row.get(3)?,
                             operator: row.get(4)?,
+                            listener_url: row.get(5)?,
                         })
                     },
                 )
@@ -122,7 +137,8 @@ impl MailStore for SqliteMailStore {
             .db
             .read_blocking(|conn| {
                 conn.query_row(
-                    "SELECT id, label, may_send, may_read, operator FROM participants WHERE secret_digest = ?1",
+                    "SELECT id, label, may_send, may_read, operator, listener_url
+                       FROM participants WHERE secret_digest = ?1",
                     rusqlite::params![digest.as_slice()],
                     |row| {
                         let id: String = row.get(0)?;
@@ -130,14 +146,15 @@ impl MailStore for SqliteMailStore {
                         let may_send: bool = row.get(2)?;
                         let may_read: bool = row.get(3)?;
                         let operator: bool = row.get(4)?;
-                        Ok((id, label, may_send, may_read, operator))
+                        let listener_url: Option<String> = row.get(5)?;
+                        Ok((id, label, may_send, may_read, operator, listener_url))
                     },
                 )
                 .optional()
             })
             .map_err(|err| StoreError::new(format!("find_participant_by_digest: {err}")))?;
 
-        let Some((id, label, may_send, may_read, operator)) = found else {
+        let Some((id, label, may_send, may_read, operator, listener_url)) = found else {
             return Ok(None);
         };
         let participant_id = ParticipantId::new(id).map_err(|err| {
@@ -145,7 +162,7 @@ impl MailStore for SqliteMailStore {
         })?;
         Ok(Some((
             participant_id,
-            ParticipantRecord { label, secret_digest: *digest, may_send, may_read, operator },
+            ParticipantRecord { label, secret_digest: *digest, may_send, may_read, operator, listener_url },
         )))
     }
 

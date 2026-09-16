@@ -63,6 +63,17 @@ pub const INBOX_LIMIT_MAX: u16 = 256;
 /// Value [`InboxRequest::limit`] defaults to when a caller's JSON omits it.
 pub const INBOX_LIMIT_DEFAULT: u16 = 50;
 
+/// Ceiling on [`InboxRequest::wait_secs`]. **Clamped, not refused**, when a
+/// caller asks for longer -- unlike [`INBOX_LIMIT_MAX`], which
+/// [`InboxRequest::validate`] refuses outright above. The daemon holds an
+/// HTTP (or MCP) connection open for the whole wait, so this door must
+/// answer within a bounded time the same way
+/// `mirage2operator/crates/operator-box/src/ops/mcp.rs`'s own
+/// `GET /ops/jobs/{id}?wait_secs=N` caps its one long-poll shape, for the
+/// same reason: nothing about this door streams, so nothing about it may
+/// hold a connection open indefinitely either.
+pub const INBOX_WAIT_SECS_MAX: u16 = 60;
+
 fn default_inbox_limit() -> u16 {
     INBOX_LIMIT_DEFAULT
 }
@@ -1035,6 +1046,18 @@ pub struct InboxRequest {
     pub since_unix_ms: Option<u64>,
     #[serde(default = "default_inbox_limit")]
     pub limit: u16,
+    /// Long-polls when a read would otherwise answer an empty page: waits
+    /// up to this many seconds for mail to arrive for the caller (or a room
+    /// the caller currently belongs to) before answering, rather than
+    /// returning empty at once. Clamped to [`INBOX_WAIT_SECS_MAX`] --
+    /// **not refused** -- when a caller asks for longer; see that
+    /// constant's own doc comment for why. Answers an empty page on
+    /// expiry, never an error: waiting and finding nothing is not a
+    /// refusal. `None` (the default when a caller's JSON omits this field)
+    /// keeps today's behaviour exactly: an empty inbox answers empty at
+    /// once, with no wait at all.
+    #[serde(default)]
+    pub wait_secs: Option<u16>,
 }
 
 impl InboxRequest {
@@ -1157,6 +1180,44 @@ pub struct UnreadCount {
 impl UnreadCount {
     pub fn validate(&self) -> Result<(), MailError> {
         validate_participant_address("target", &self.target)
+    }
+}
+
+/// The body a registered delivery listener receives at its own URL when
+/// mail arrives for the account that registered it, or for any of that
+/// account's sessions. **Carries only ids, never `subject` or `body`.**
+///
+/// A notification is a doorbell, not a copy of the letter: it crosses a
+/// boundary to a URL this mailbox does not control, chosen by whoever
+/// registered it (`POST /admin/listener`, operator-only). The recipient can
+/// already fetch the message itself, with its own credential, through the
+/// ordinary mail surface once it knows `message_id` -- carrying `subject`
+/// or `body` here would hand the message's actual content to a process
+/// this mailbox has no way to vouch for, for no reason: nothing about
+/// *acting on* "mail arrived" needs the mail's content, only the fact that
+/// it arrived and where to go fetch it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveryNotification {
+    /// The account whose listener this is -- the one `POST /admin/listener`
+    /// named, not necessarily the account `to` addresses (a room message
+    /// notifies every member's own listener with the same `to`).
+    pub account: ParticipantId,
+    /// The address the mail was actually sent to -- a direct account, one
+    /// specific session, or a room; never simplified down to just
+    /// `account`, so the listener can tell a room message from a message
+    /// aimed at one exact session.
+    pub to: Address,
+    pub message_id: MessageId,
+    pub from: Address,
+}
+
+impl DeliveryNotification {
+    pub fn validate(&self) -> Result<(), MailError> {
+        self.account.validate()?;
+        self.to.validate()?;
+        self.message_id.validate()?;
+        self.from.validate()
     }
 }
 
@@ -1503,16 +1564,50 @@ mod tests {
 
     #[test]
     fn inbox_request_rejects_limit_over_the_max() {
-        let request = InboxRequest { since_unix_ms: None, limit: INBOX_LIMIT_MAX + 1 };
+        let request = InboxRequest { since_unix_ms: None, limit: INBOX_LIMIT_MAX + 1, wait_secs: None };
         let err = request.validate().expect_err("limit over the max must be rejected");
         assert!(matches!(err, MailError::TooLarge { field, .. } if field == "limit"));
     }
 
     #[test]
     fn inbox_request_rejects_zero_limit() {
-        let request = InboxRequest { since_unix_ms: None, limit: 0 };
+        let request = InboxRequest { since_unix_ms: None, limit: 0, wait_secs: None };
         let err = request.validate().expect_err("zero limit must be rejected");
         assert!(matches!(err, MailError::Malformed { field, .. } if field == "limit"));
+    }
+
+    #[test]
+    fn inbox_request_defaults_wait_secs_to_none_when_json_omits_it() {
+        let request: InboxRequest = serde_json::from_str(r#"{"since_unix_ms": null}"#)
+            .expect("inbox request without wait_secs still deserializes");
+        assert_eq!(request.wait_secs, None);
+    }
+
+    #[test]
+    fn inbox_request_accepts_wait_secs_over_the_cap_without_refusing() {
+        // `wait_secs` is clamped by the daemon, never refused here --
+        // `validate` has no opinion on it at all, unlike `limit`.
+        let request =
+            InboxRequest { since_unix_ms: None, limit: INBOX_LIMIT_DEFAULT, wait_secs: Some(INBOX_WAIT_SECS_MAX + 1) };
+        request.validate().expect("wait_secs over the cap is not a validation failure");
+    }
+
+    #[test]
+    fn delivery_notification_round_trips_and_never_carries_a_subject_or_body_field() {
+        let notification = DeliveryNotification {
+            account: participant("alice"),
+            to: Address::Direct { participant: participant("alice") },
+            message_id: message_id(),
+            from: Address::Direct { participant: participant("bob") },
+        };
+        notification.validate().expect("a well-formed notification validates");
+
+        let json = serde_json::to_value(&notification).expect("notification serializes");
+        assert!(json.get("subject").is_none());
+        assert!(json.get("body").is_none());
+        let decoded: DeliveryNotification =
+            serde_json::from_value(json).expect("notification round-trips through serde");
+        assert_eq!(decoded, notification);
     }
 
     #[test]

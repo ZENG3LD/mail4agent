@@ -1343,6 +1343,7 @@ dependencies = [
  "mail4agent-attest",
  "mail4agent-core",
  "mail4agent-store-stk",
+ "reqwest",
  "serde",
  "serde_json",
  "servertoolkit",

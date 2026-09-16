@@ -101,6 +101,39 @@ A repeated send carrying the same `idempotency_key` returns the original message
 and creates nothing. Without a key, sending the same text twice makes two
 messages — which is what you asked for.
 
+## Waiting for mail
+
+`inbox` (`/mail/inbox`, `m4a_mail_inbox`) takes an optional `wait_secs`. Without
+it, a read that finds nothing answers an empty page at once, exactly as
+before. With it, a read that finds nothing waits — parked on a per-account
+wake-up, not polling the store — until mail arrives for the caller or the wait
+expires, then answers: an empty page on expiry, never an error. `wait_secs` is
+clamped to 60 seconds rather than refused for asking longer — the same bound
+`mirage2operator`'s own `GET /ops/jobs/{id}?wait_secs=N` long-poll uses, for
+the same reason: nothing about this door streams, so nothing about it may
+hold a connection open indefinitely either. A waiting read never holds the
+mailbox's own lock while parked, so it cannot stall a concurrent send or
+another caller's read.
+
+## Delivery listeners
+
+An account can register a URL (`POST /admin/listener`, operator-only;
+`POST /admin/listener/remove` to clear it) that the mailbox POSTs to whenever
+mail arrives for that account or any of its sessions. The notification is a
+doorbell, not a copy of the letter: it carries only the account, the address
+the mail was actually for, the message id and the sender's address — **never
+the subject or body**. The registrant already knows how to act on "mail
+arrived"; it fetches the message itself, with its own credential, through the
+ordinary mail surface.
+
+Firing a listener is best-effort and happens only after the message has
+already committed, never inside the send itself: a listener that is down,
+refuses the request, or times out is logged and otherwise ignored, and never
+makes the send that triggered it fail. There is no retry in this version. Only
+`http://127.0.0.1:*` and `http://localhost:*` URLs are accepted — this is a
+local service, and a listener pointed off the machine would turn every message
+into an outbound call somewhere the operator may not have meant.
+
 ## Status
 
 Working, unreleased. Send, threaded reply, room delivery, acknowledgement,

@@ -795,3 +795,53 @@ fn directorys_live_flag_comes_from_the_given_liveness_check_not_the_engine_itsel
     let dead_entry = dead_directory.participants.iter().find(|entry| entry.id == claude).expect("claude is listed");
     assert!(!dead_entry.sessions[0].live, "the given liveness check said dead, so the entry must say dead");
 }
+
+#[test]
+fn set_listener_accepts_a_loopback_url_and_remove_listener_clears_it() {
+    let mut engine = engine();
+    let alice = participant("alice");
+    engine.register_participant(alice.clone(), None, permissions(true, true, false)).expect("alice registers");
+
+    engine.set_listener(&alice, "http://127.0.0.1:9000/hook".to_string()).expect("a loopback url is accepted");
+    engine.remove_listener(&alice).expect("removing a listener is not an error");
+    // Removing again is still not an error -- idempotent, like every other
+    // removal in this engine.
+    engine.remove_listener(&alice).expect("removing an already-absent listener is not an error");
+}
+
+#[test]
+fn set_listener_refuses_a_non_loopback_url_by_name() {
+    let mut engine = engine();
+    let alice = participant("alice");
+    engine.register_participant(alice.clone(), None, permissions(true, true, false)).expect("alice registers");
+
+    let err = engine
+        .set_listener(&alice, "http://example.com/hook".to_string())
+        .expect_err("a non-loopback url must be refused");
+    assert!(matches!(err, MailError::Malformed { field, .. } if field == "url"));
+
+    let err = engine
+        .set_listener(&alice, "https://127.0.0.1/hook".to_string())
+        .expect_err("https is refused too -- only http is accepted for a loopback listener");
+    assert!(matches!(err, MailError::Malformed { field, .. } if field == "url"));
+
+    let err = engine
+        .set_listener(&alice, "http://127.0.0.1.evil.example/hook".to_string())
+        .expect_err("a host that merely starts with the loopback address must still be refused");
+    assert!(matches!(err, MailError::Malformed { field, .. } if field == "url"));
+
+    let err = engine
+        .set_listener(&alice, "http://user:pass@127.0.0.1/hook".to_string())
+        .expect_err("userinfo in the authority must be refused");
+    assert!(matches!(err, MailError::Malformed { field, .. } if field == "url"));
+}
+
+#[test]
+fn set_listener_refuses_an_unknown_participant_by_name() {
+    let mut engine = engine();
+    let ghost = participant("ghost");
+    let err = engine
+        .set_listener(&ghost, "http://127.0.0.1:9000/hook".to_string())
+        .expect_err("an unregistered participant must be refused");
+    assert!(matches!(err, MailError::UnknownParticipant { participant } if participant == ghost));
+}

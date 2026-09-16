@@ -179,6 +179,16 @@ async fn serve(service: Arc<MailboxService>, bind: SocketAddr) -> Result<(), Mai
             post(routes::admin::remove_room_member).with_state(app.clone()),
             TokenTier::Admin,
         )
+        .post_tier(
+            "/admin/listener",
+            post(routes::admin::set_listener).with_state(app.clone()),
+            TokenTier::Admin,
+        )
+        .post_tier(
+            "/admin/listener/remove",
+            post(routes::admin::remove_listener).with_state(app.clone()),
+            TokenTier::Admin,
+        )
         // `GET /health` is the framework's own built-in route (always
         // mounted; a user route at the same path would panic the router at
         // build time on the overlapping method). `.with_detail_health()`
