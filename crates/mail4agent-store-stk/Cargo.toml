@@ -1,0 +1,23 @@
+[package]
+name = "mail4agent-store-stk"
+version = "0.1.0"
+edition = "2021"
+description = "A MailStore backed by SQLite through servertoolkit's Db: versioned migrations, WAL, one transaction per mutation."
+license = "MIT"
+
+[dependencies]
+mail4agent-api = { path = "../mail4agent-api", version = "0.1.0" }
+mail4agent-core = { path = "../mail4agent-core", version = "0.1.0" }
+
+# The bundled SQLite build, `Db`, versioned migrations and the spawn_blocking
+# wrappers all come from stk's own db module. Depended on directly (not
+# through the `servertoolkit` facade, which does not re-export it) because
+# this crate needs only the db surface, not the HTTP-daemon surface the
+# facade also carries; `stk_db::rusqlite` is the same rusqlite the facade's
+# other consumers use, so there is no second dependency on it here.
+stk_db = { package = "servertoolkit-db", path = "../../../servertoolkit/crates/servertoolkit-db", version = "0.1.0" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
