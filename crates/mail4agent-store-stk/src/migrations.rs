@@ -120,10 +120,122 @@ CREATE TABLE idempotency (
 );
 ";
 
+/// `v2`: sessions, plus room for a session on both sides of a message's
+/// envelope. **Never edits `SCHEMA_V1_SQL` above** -- a live database
+/// (the mailbox on 18301) is at v1 right now with real participants,
+/// rooms and messages in it, and every one of those rows must still read
+/// back exactly as before once this migration has run.
+///
+/// - `sessions` is new. Keyed on `session_id` alone, not on `(account,
+///   session_id)`, because `MailStore::get_session` looks a session up
+///   by its id with no account in hand yet -- that lookup is exactly how
+///   `MailboxEngine::ensure_session` and `::resolve_identity` *learn*
+///   which account owns a session, so the primary key has to support it
+///   without the account as an input. `idx_sessions_account` is the
+///   reverse index `sessions_of` runs against, playing the same role
+///   `idx_room_members_participant` already plays for `rooms_containing`.
+///   `card` carries the session's whole `SessionCard` -- its
+///   `attested`/`corroborated`/`declared` groups together -- as one JSON
+///   blob, the same choice `messages.payload` already made for this
+///   crate's free-form fields: nothing inside a `SessionCard` is filtered
+///   or ordered on by any `MailStore` method, so it earns no columns of
+///   its own. `account` and `last_seen_unix_ms` do get real columns
+///   because `sessions_of` filters on the former and `ensure_session`
+///   refreshes the latter on every call.
+///
+/// - `messages` gains a session shape on **both** sides of the envelope.
+///   `to_kind`'s `CHECK` widens from `('direct', 'room')` to `('direct',
+///   'session', 'room')`, with a new `to_session` column alongside the
+///   existing `to_participant`/`to_room` -- a session recipient gets its
+///   own column rather than sharing `to_participant` with a direct
+///   account address, so a query can never confuse the two kinds even if
+///   it forgot to check `to_kind` first. `from_participant` was `NOT
+///   NULL` and singular in v1 because nothing but an account could ever
+///   send a message then; it now gains a sibling `from_kind` (defaulted
+///   to `'direct'`, matching what every v1 row actually means) and a
+///   nullable `from_session`, mirroring the `to` side exactly.
+///
+///   SQLite has no `ALTER TABLE ... DROP CONSTRAINT` (or any way to
+///   widen one in place), so loosening `to_kind`'s `CHECK` means
+///   rebuilding the table: create the v2 shape under a temporary name,
+///   copy every v1 row across (`from_kind` literally `'direct'`,
+///   `to_session` literally `NULL` -- the only values a v1 row could
+///   ever have meant), drop the v1 table, rename the new one into place,
+///   and recreate every index the old table carried (both survive
+///   unchanged: `idx_messages_direct_recipient`,
+///   `idx_messages_room_recipient`) plus the new
+///   `idx_messages_session_recipient`, indexed the same way the rest of
+///   this table is -- `messages_to_since` and `room_messages_since` are
+///   both still exactly "messages for this address, no older than this
+///   time".
+///
+/// - `acks` and `idempotency` need **no schema change at all**. Their
+///   `reader`/`sender` columns were always plain `TEXT`, and a v1 row's
+///   value there was already exactly an account's [`mail4agent_api::Address::Direct`]
+///   `Display` form (`"claude"`) -- the same string
+///   `mail4agent_store_stk::store::address_text` still writes for a
+///   direct address today. A session's `Display` form (`"claude/s-7f3a..."`)
+///   is simply a longer string in the same column; the two can never
+///   collide because neither a participant id's nor a session id's
+///   charset permits `/` (see `Address`'s own `Display`/`FromStr` doc
+///   comment in `mail4agent-api`). This is the one place the
+///   address-as-a-key change turned out to cost nothing: only the
+///   `messages` table's structured, per-kind columns needed rebuilding.
+const SCHEMA_V2_SQL: &str = "
+CREATE TABLE sessions (
+    session_id        TEXT PRIMARY KEY,
+    account           TEXT NOT NULL,
+    card              TEXT NOT NULL,
+    last_seen_unix_ms INTEGER NOT NULL
+);
+
+CREATE INDEX idx_sessions_account ON sessions(account);
+
+CREATE TABLE messages_v2 (
+    message_id         TEXT PRIMARY KEY,
+    from_participant   TEXT NOT NULL,
+    from_kind          TEXT NOT NULL DEFAULT 'direct' CHECK (from_kind IN ('direct', 'session')),
+    from_session       TEXT,
+    to_kind            TEXT NOT NULL CHECK (to_kind IN ('direct', 'session', 'room')),
+    to_participant     TEXT,
+    to_session         TEXT,
+    to_room            TEXT,
+    created_at_unix_ms INTEGER NOT NULL,
+    payload            TEXT NOT NULL
+);
+
+INSERT INTO messages_v2 (
+    message_id, from_participant, from_kind, from_session,
+    to_kind, to_participant, to_session, to_room, created_at_unix_ms, payload
+)
+SELECT message_id, from_participant, 'direct', NULL,
+       to_kind, to_participant, NULL, to_room, created_at_unix_ms, payload
+FROM messages;
+
+DROP TABLE messages;
+
+ALTER TABLE messages_v2 RENAME TO messages;
+
+CREATE INDEX idx_messages_direct_recipient
+    ON messages(to_participant, created_at_unix_ms)
+    WHERE to_kind = 'direct';
+
+CREATE INDEX idx_messages_session_recipient
+    ON messages(to_participant, to_session, created_at_unix_ms)
+    WHERE to_kind = 'session';
+
+CREATE INDEX idx_messages_room_recipient
+    ON messages(to_room, created_at_unix_ms)
+    WHERE to_kind = 'room';
+";
+
 /// This crate's own migrations, in the order [`stk_db::MigrationRunner`]
 /// must apply them. A daemon runs these once against the [`stk_db::Db`] it
 /// hands to [`crate::SqliteMailStore::new`]; [`crate::SqliteMailStore::open_in_memory`]
 /// runs them itself for tests and small tools.
 pub fn migrations() -> Vec<Migration> {
-    vec![Migration::new(1, "mail4agent_v1_schema", SCHEMA_V1_SQL)]
+    vec![
+        Migration::new(1, "mail4agent_v1_schema", SCHEMA_V1_SQL),
+        Migration::new(2, "mail4agent_v2_sessions_and_session_addressing", SCHEMA_V2_SQL),
+    ]
 }

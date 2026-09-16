@@ -2,10 +2,10 @@
 //! exists to provide. See the crate's module doc comment for the
 //! blocking-vs-async discipline every method here follows.
 
-use mail4agent_api::{Ack, Address, Message, MessageId, MessageRef, ParticipantId, RoomId};
+use mail4agent_api::{Ack, Address, Message, MessageId, MessageRef, ParticipantId, RoomId, SessionCard, SessionId};
 use mail4agent_core::{
     InsertMessageOutcome, MailStore, ParticipantRecord, ParticipantSummary, RoomRecord, RoomSummary, SecretDigest,
-    StoreError,
+    SessionRecord, StoreError,
 };
 use serde::{Deserialize, Serialize};
 use stk_db::rusqlite::{self, OptionalExtension};
@@ -229,9 +229,11 @@ impl MailStore for SqliteMailStore {
     fn insert_message(
         &mut self,
         message: Message,
-        idempotency: Option<(ParticipantId, String)>,
+        idempotency: Option<(Address, String)>,
     ) -> Result<InsertMessageOutcome, StoreError> {
-        let (to_kind, to_participant, to_room) = address_columns(&message.to);
+        let (from_kind, from_participant, from_session) = from_address_columns(&message.from)
+            .map_err(|err| StoreError::new(format!("insert_message({}): {err}", message.message_id)))?;
+        let (to_kind, to_participant, to_session, to_room) = to_address_columns(&message.to);
         let payload = MessagePayloadWrite {
             subject: &message.subject,
             body: &message.body,
@@ -244,6 +246,10 @@ impl MailStore for SqliteMailStore {
         let created_at_unix_ms = i64::try_from(message.created_at_unix_ms).map_err(|_| {
             StoreError::new(format!("insert_message({}): created_at_unix_ms overflows i64", message.message_id))
         })?;
+        // Encoded once, outside the closure, as `Address`'s own `Display`
+        // form -- see [`address_text`] for why that needs no schema change
+        // to hold a session address distinctly from its account's.
+        let idempotency_sender = idempotency.as_ref().map(|(sender, key)| (address_text(sender), key.clone()));
 
         let raw_outcome = self
             .db
@@ -251,23 +257,27 @@ impl MailStore for SqliteMailStore {
                 let tx = conn.transaction()?;
                 tx.execute(
                     "INSERT INTO messages
-                        (message_id, from_participant, to_kind, to_participant, to_room, created_at_unix_ms, payload)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        (message_id, from_participant, from_kind, from_session,
+                         to_kind, to_participant, to_session, to_room, created_at_unix_ms, payload)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     rusqlite::params![
                         message.message_id.as_str(),
-                        message.from.as_str(),
+                        from_participant,
+                        from_kind,
+                        from_session,
                         to_kind,
                         to_participant,
+                        to_session,
                         to_room,
                         created_at_unix_ms,
                         payload_json,
                     ],
                 )?;
 
-                let outcome = match &idempotency {
+                let outcome = match &idempotency_sender {
                     Some((sender, key)) => match tx.execute(
                         "INSERT INTO idempotency (sender, idempotency_key, message_id) VALUES (?1, ?2, ?3)",
-                        rusqlite::params![sender.as_str(), key, message.message_id.as_str()],
+                        rusqlite::params![sender, key, message.message_id.as_str()],
                     ) {
                         Ok(_) => RawInsertOutcome::Inserted,
                         Err(rusqlite::Error::SqliteFailure(sql_err, _))
@@ -275,7 +285,7 @@ impl MailStore for SqliteMailStore {
                         {
                             let existing: String = tx.query_row(
                                 "SELECT message_id FROM idempotency WHERE sender = ?1 AND idempotency_key = ?2",
-                                rusqlite::params![sender.as_str(), key],
+                                rusqlite::params![sender, key],
                                 |row| row.get(0),
                             )?;
                             RawInsertOutcome::Deduplicated(existing)
@@ -317,7 +327,8 @@ impl MailStore for SqliteMailStore {
             .db
             .read_blocking(|conn| {
                 conn.query_row(
-                    "SELECT message_id, from_participant, to_kind, to_participant, to_room, created_at_unix_ms, payload
+                    "SELECT message_id, from_participant, from_kind, from_session,
+                            to_kind, to_participant, to_session, to_room, created_at_unix_ms, payload
                        FROM messages WHERE message_id = ?1",
                     rusqlite::params![id.as_str()],
                     row_to_stored_message,
@@ -328,23 +339,49 @@ impl MailStore for SqliteMailStore {
         row.map(assemble_message).transpose()
     }
 
-    fn direct_messages_since(&self, participant: &ParticipantId, since_unix_ms: u64) -> Result<Vec<Message>, StoreError> {
-        let since = i64::try_from(since_unix_ms).map_err(|_| {
-            StoreError::new(format!("direct_messages_since({participant}): since_unix_ms overflows i64"))
-        })?;
-        let rows = self
-            .db
-            .read_blocking(|conn| {
-                let mut statement = conn.prepare(
-                    "SELECT message_id, from_participant, to_kind, to_participant, to_room, created_at_unix_ms, payload
-                       FROM messages
-                      WHERE to_kind = 'direct' AND to_participant = ?1 AND created_at_unix_ms >= ?2
-                   ORDER BY created_at_unix_ms ASC",
-                )?;
-                let rows = statement.query_map(rusqlite::params![participant.as_str(), since], row_to_stored_message)?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()
-            })
-            .map_err(|err| StoreError::new(format!("direct_messages_since({participant}): {err}")))?;
+    fn messages_to_since(&self, to: &Address, since_unix_ms: u64) -> Result<Vec<Message>, StoreError> {
+        let since = i64::try_from(since_unix_ms)
+            .map_err(|_| StoreError::new(format!("messages_to_since({to}): since_unix_ms overflows i64")))?;
+        let rows = match to {
+            Address::Direct { participant } => self
+                .db
+                .read_blocking(|conn| {
+                    let mut statement = conn.prepare(
+                        "SELECT message_id, from_participant, from_kind, from_session,
+                                to_kind, to_participant, to_session, to_room, created_at_unix_ms, payload
+                           FROM messages
+                          WHERE to_kind = 'direct' AND to_participant = ?1 AND created_at_unix_ms >= ?2
+                       ORDER BY created_at_unix_ms ASC",
+                    )?;
+                    let rows =
+                        statement.query_map(rusqlite::params![participant.as_str(), since], row_to_stored_message)?;
+                    rows.collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .map_err(|err| StoreError::new(format!("messages_to_since({to}): {err}")))?,
+            Address::Session { participant, session } => self
+                .db
+                .read_blocking(|conn| {
+                    let mut statement = conn.prepare(
+                        "SELECT message_id, from_participant, from_kind, from_session,
+                                to_kind, to_participant, to_session, to_room, created_at_unix_ms, payload
+                           FROM messages
+                          WHERE to_kind = 'session' AND to_participant = ?1 AND to_session = ?2
+                                AND created_at_unix_ms >= ?3
+                       ORDER BY created_at_unix_ms ASC",
+                    )?;
+                    let rows = statement.query_map(
+                        rusqlite::params![participant.as_str(), session.as_str(), since],
+                        row_to_stored_message,
+                    )?;
+                    rows.collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .map_err(|err| StoreError::new(format!("messages_to_since({to}): {err}")))?,
+            Address::Room { .. } => {
+                return Err(StoreError::new(format!(
+                    "messages_to_since({to}): a room address must use room_messages_since instead"
+                )));
+            }
+        };
         rows.into_iter().map(assemble_message).collect()
     }
 
@@ -355,7 +392,8 @@ impl MailStore for SqliteMailStore {
             .db
             .read_blocking(|conn| {
                 let mut statement = conn.prepare(
-                    "SELECT message_id, from_participant, to_kind, to_participant, to_room, created_at_unix_ms, payload
+                    "SELECT message_id, from_participant, from_kind, from_session,
+                            to_kind, to_participant, to_session, to_room, created_at_unix_ms, payload
                        FROM messages
                       WHERE to_kind = 'room' AND to_room = ?1 AND created_at_unix_ms >= ?2
                    ORDER BY created_at_unix_ms ASC",
@@ -390,6 +428,7 @@ impl MailStore for SqliteMailStore {
     fn record_ack(&mut self, ack: Ack) -> Result<Ack, StoreError> {
         let acked_at = i64::try_from(ack.acked_at_unix_ms)
             .map_err(|_| StoreError::new(format!("record_ack({}, {}): acked_at_unix_ms overflows i64", ack.message_id, ack.reader)))?;
+        let reader = address_text(&ack.reader);
 
         // `DO UPDATE SET reader = excluded.reader` is a genuine no-op --
         // `reader` is part of the conflict key, so it never changes -- but
@@ -407,7 +446,7 @@ impl MailStore for SqliteMailStore {
                     "INSERT INTO acks (message_id, reader, acked_at_unix_ms) VALUES (?1, ?2, ?3)
                      ON CONFLICT (message_id, reader) DO UPDATE SET reader = excluded.reader
                      RETURNING acked_at_unix_ms",
-                    rusqlite::params![ack.message_id.as_str(), ack.reader.as_str(), acked_at],
+                    rusqlite::params![ack.message_id.as_str(), reader, acked_at],
                     |row| row.get(0),
                 )
             })
@@ -419,13 +458,14 @@ impl MailStore for SqliteMailStore {
         Ok(Ack { message_id: ack.message_id, reader: ack.reader, acked_at_unix_ms })
     }
 
-    fn get_ack(&self, message_id: &MessageId, reader: &ParticipantId) -> Result<Option<Ack>, StoreError> {
+    fn get_ack(&self, message_id: &MessageId, reader: &Address) -> Result<Option<Ack>, StoreError> {
+        let reader_text = address_text(reader);
         let row = self
             .db
             .read_blocking(|conn| {
                 conn.query_row(
                     "SELECT acked_at_unix_ms FROM acks WHERE message_id = ?1 AND reader = ?2",
-                    rusqlite::params![message_id.as_str(), reader.as_str()],
+                    rusqlite::params![message_id.as_str(), reader_text],
                     |row| row.get::<_, i64>(0),
                 )
                 .optional()
@@ -501,6 +541,86 @@ impl MailStore for SqliteMailStore {
             })
             .collect()
     }
+
+    fn get_session(&self, session: &SessionId) -> Result<Option<SessionRecord>, StoreError> {
+        let row = self
+            .db
+            .read_blocking(|conn| {
+                conn.query_row(
+                    "SELECT account, card, last_seen_unix_ms FROM sessions WHERE session_id = ?1",
+                    rusqlite::params![session.as_str()],
+                    |row| {
+                        let account: String = row.get(0)?;
+                        let card: String = row.get(1)?;
+                        let last_seen: i64 = row.get(2)?;
+                        Ok((account, card, last_seen))
+                    },
+                )
+                .optional()
+            })
+            .map_err(|err| StoreError::new(format!("get_session({session}): {err}")))?;
+
+        let Some((account, card_json, last_seen)) = row else {
+            return Ok(None);
+        };
+        let account = ParticipantId::new(account).map_err(|err| {
+            StoreError::new(format!("get_session({session}): stored account failed validation: {err}"))
+        })?;
+        let card: SessionCard = serde_json::from_str(&card_json)
+            .map_err(|err| StoreError::new(format!("get_session({session}): stored card failed to parse: {err}")))?;
+        let last_seen_unix_ms = u64::try_from(last_seen)
+            .map_err(|_| StoreError::new(format!("get_session({session}): stored last_seen_unix_ms is negative")))?;
+        Ok(Some(SessionRecord { account, card, last_seen_unix_ms }))
+    }
+
+    fn upsert_session(&mut self, session: SessionId, record: SessionRecord) -> Result<(), StoreError> {
+        let card_json = serde_json::to_string(&record.card)
+            .map_err(|err| StoreError::new(format!("upsert_session({session}): serialize card: {err}")))?;
+        let last_seen_unix_ms = i64::try_from(record.last_seen_unix_ms)
+            .map_err(|_| StoreError::new(format!("upsert_session({session}): last_seen_unix_ms overflows i64")))?;
+        self.db
+            .write_blocking(|conn| {
+                conn.execute(
+                    "INSERT INTO sessions (session_id, account, card, last_seen_unix_ms) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT (session_id) DO UPDATE SET
+                         account = excluded.account,
+                         card = excluded.card,
+                         last_seen_unix_ms = excluded.last_seen_unix_ms",
+                    rusqlite::params![session.as_str(), record.account.as_str(), card_json, last_seen_unix_ms],
+                )?;
+                Ok(())
+            })
+            .map_err(|err| StoreError::new(format!("upsert_session({session}): {err}")))
+    }
+
+    fn sessions_of(&self, account: &ParticipantId) -> Result<Vec<(SessionId, SessionRecord)>, StoreError> {
+        let rows: Vec<(String, String, i64)> = self
+            .db
+            .read_blocking(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT session_id, card, last_seen_unix_ms FROM sessions WHERE account = ?1 ORDER BY session_id",
+                )?;
+                let rows = statement
+                    .query_map(rusqlite::params![account.as_str()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(|err| StoreError::new(format!("sessions_of({account}): {err}")))?;
+
+        rows.into_iter()
+            .map(|(session_id, card_json, last_seen)| {
+                let session_id = SessionId::new(session_id).map_err(|err| {
+                    StoreError::new(format!("sessions_of({account}): stored session id failed validation: {err}"))
+                })?;
+                let card: SessionCard = serde_json::from_str(&card_json).map_err(|err| {
+                    StoreError::new(format!("sessions_of({account}): stored card failed to parse: {err}"))
+                })?;
+                let last_seen_unix_ms = u64::try_from(last_seen).map_err(|_| {
+                    StoreError::new(format!("sessions_of({account}): stored last_seen_unix_ms is negative"))
+                })?;
+                Ok((session_id, SessionRecord { account: account.clone(), card, last_seen_unix_ms }))
+            })
+            .collect()
+    }
 }
 
 /// What [`MailStore::insert_message`]'s own transaction decided, before
@@ -515,14 +635,17 @@ enum RawInsertOutcome {
     Deduplicated(String),
 }
 
-/// A message row exactly as its seven columns hold it, before
+/// A message row exactly as its ten columns hold it, before
 /// [`assemble_message`] re-validates each id and parses `payload` back
 /// into the rest of a [`Message`].
 struct StoredMessageRow {
     message_id: String,
     from_participant: String,
+    from_kind: String,
+    from_session: Option<String>,
     to_kind: String,
     to_participant: Option<String>,
+    to_session: Option<String>,
     to_room: Option<String>,
     created_at_unix_ms: i64,
     payload: String,
@@ -532,11 +655,14 @@ fn row_to_stored_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMess
     Ok(StoredMessageRow {
         message_id: row.get(0)?,
         from_participant: row.get(1)?,
-        to_kind: row.get(2)?,
-        to_participant: row.get(3)?,
-        to_room: row.get(4)?,
-        created_at_unix_ms: row.get(5)?,
-        payload: row.get(6)?,
+        from_kind: row.get(2)?,
+        from_session: row.get(3)?,
+        to_kind: row.get(4)?,
+        to_participant: row.get(5)?,
+        to_session: row.get(6)?,
+        to_room: row.get(7)?,
+        created_at_unix_ms: row.get(8)?,
+        payload: row.get(9)?,
     })
 }
 
@@ -572,9 +698,8 @@ struct MessagePayloadRead {
 fn assemble_message(row: StoredMessageRow) -> Result<Message, StoreError> {
     let message_id = MessageId::new(row.message_id)
         .map_err(|err| StoreError::new(format!("stored message id failed validation: {err}")))?;
-    let from = ParticipantId::new(row.from_participant)
-        .map_err(|err| StoreError::new(format!("stored sender id failed validation: {err}")))?;
-    let to = address_from_columns(&row.to_kind, row.to_participant, row.to_room)?;
+    let from = address_from_from_columns(&row.from_kind, row.from_participant, row.from_session)?;
+    let to = address_from_to_columns(&row.to_kind, row.to_participant, row.to_session, row.to_room)?;
     let created_at_unix_ms = u64::try_from(row.created_at_unix_ms)
         .map_err(|_| StoreError::new("stored created_at_unix_ms is negative".to_string()))?;
     let payload: MessagePayloadRead = serde_json::from_str(&row.payload)
@@ -598,34 +723,116 @@ fn assemble_message(row: StoredMessageRow) -> Result<Message, StoreError> {
     })
 }
 
-/// Splits an [`Address`] into `(to_kind, to_participant, to_room)` the way
-/// `messages` stores it.
-fn address_columns(address: &Address) -> (&'static str, Option<&str>, Option<&str>) {
+/// Splits a message's `to` [`Address`] into `(to_kind, to_participant,
+/// to_session, to_room)` the way `messages` stores a recipient -- a
+/// session gets its own `to_session` column rather than being packed into
+/// `to_participant` alongside a direct account address, so the two kinds
+/// can never be confused by a query that forgets to check `to_kind` first.
+fn to_address_columns(address: &Address) -> (&'static str, Option<&str>, Option<&str>, Option<&str>) {
     match address {
-        Address::Direct { participant } => ("direct", Some(participant.as_str()), None),
-        Address::Room { room } => ("room", None, Some(room.as_str())),
+        Address::Direct { participant } => ("direct", Some(participant.as_str()), None, None),
+        Address::Session { participant, session } => {
+            ("session", Some(participant.as_str()), Some(session.as_str()), None)
+        }
+        Address::Room { room } => ("room", None, None, Some(room.as_str())),
     }
 }
 
-/// The inverse of [`address_columns`].
-fn address_from_columns(kind: &str, to_participant: Option<String>, to_room: Option<String>) -> Result<Address, StoreError> {
+/// The inverse of [`to_address_columns`].
+fn address_from_to_columns(
+    kind: &str,
+    to_participant: Option<String>,
+    to_session: Option<String>,
+    to_room: Option<String>,
+) -> Result<Address, StoreError> {
     match kind {
         "direct" => {
-            let participant = to_participant
-                .ok_or_else(|| StoreError::new("stored message has to_kind = direct but to_participant is NULL".to_string()))?;
+            let participant = to_participant.ok_or_else(|| {
+                StoreError::new("stored message has to_kind = direct but to_participant is NULL".to_string())
+            })?;
             let participant = ParticipantId::new(participant)
                 .map_err(|err| StoreError::new(format!("stored direct recipient id failed validation: {err}")))?;
             Ok(Address::Direct { participant })
         }
+        "session" => {
+            let participant = to_participant.ok_or_else(|| {
+                StoreError::new("stored message has to_kind = session but to_participant is NULL".to_string())
+            })?;
+            let participant = ParticipantId::new(participant).map_err(|err| {
+                StoreError::new(format!("stored session recipient account id failed validation: {err}"))
+            })?;
+            let session = to_session.ok_or_else(|| {
+                StoreError::new("stored message has to_kind = session but to_session is NULL".to_string())
+            })?;
+            let session = SessionId::new(session)
+                .map_err(|err| StoreError::new(format!("stored session recipient id failed validation: {err}")))?;
+            Ok(Address::Session { participant, session })
+        }
         "room" => {
-            let room = to_room
-                .ok_or_else(|| StoreError::new("stored message has to_kind = room but to_room is NULL".to_string()))?;
+            let room = to_room.ok_or_else(|| {
+                StoreError::new("stored message has to_kind = room but to_room is NULL".to_string())
+            })?;
             let room = RoomId::new(room)
                 .map_err(|err| StoreError::new(format!("stored room recipient id failed validation: {err}")))?;
             Ok(Address::Room { room })
         }
         other => Err(StoreError::new(format!("stored message has unknown to_kind {other:?}"))),
     }
+}
+
+/// Splits a message's `from` [`Address`] into `(from_kind, from_participant,
+/// from_session)`. Unlike [`to_address_columns`], `from` is never a room --
+/// `Message::validate`'s `validate_participant_address` already rules that
+/// out before a message ever reaches this store -- so a room reaching here
+/// is named as a [`StoreError`] rather than silently coerced into some
+/// other shape.
+fn from_address_columns(address: &Address) -> Result<(&'static str, &str, Option<&str>), StoreError> {
+    match address {
+        Address::Direct { participant } => Ok(("direct", participant.as_str(), None)),
+        Address::Session { participant, session } => Ok(("session", participant.as_str(), Some(session.as_str()))),
+        Address::Room { room } => {
+            Err(StoreError::new(format!("a message's `from` must not be a room address (got \"{room}\")")))
+        }
+    }
+}
+
+/// The inverse of [`from_address_columns`].
+fn address_from_from_columns(
+    kind: &str,
+    from_participant: String,
+    from_session: Option<String>,
+) -> Result<Address, StoreError> {
+    let participant = ParticipantId::new(from_participant)
+        .map_err(|err| StoreError::new(format!("stored sender id failed validation: {err}")))?;
+    match kind {
+        "direct" => Ok(Address::Direct { participant }),
+        "session" => {
+            let session = from_session.ok_or_else(|| {
+                StoreError::new("stored message has from_kind = session but from_session is NULL".to_string())
+            })?;
+            let session = SessionId::new(session)
+                .map_err(|err| StoreError::new(format!("stored sender session id failed validation: {err}")))?;
+            Ok(Address::Session { participant, session })
+        }
+        other => Err(StoreError::new(format!("stored message has unknown from_kind {other:?}"))),
+    }
+}
+
+/// Encodes a participant-identifying [`Address`] (never a room -- see
+/// [`Ack::validate`] and [`Message::validate`], the only two places an
+/// address reaches `acks.reader` or `idempotency.sender`) as the single
+/// TEXT value those two columns already held before this crate's addresses
+/// could name a session. `Address`'s own `Display` -- `"claude"` for an
+/// account, `"claude/s-7f3a..."` for one of its sessions -- is exactly
+/// that value, and the two shapes never collide (see `Address`'s own
+/// `Display`/`FromStr` doc comment: neither `ParticipantId`'s nor
+/// `SessionId`'s charset permits `/`). That is why neither `acks` nor
+/// `idempotency` needed a v2 migration at all: a v1 row's `reader`/`sender`
+/// was already exactly an account's `Display` form, and a session's
+/// `Display` form is simply a new, longer string the same column always
+/// could have held.
+fn address_text(address: &Address) -> String {
+    address.to_string()
 }
 
 /// A tiny local error so [`digest_from_row`] can report a length mismatch
