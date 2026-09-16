@@ -33,7 +33,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::routing::post;
+use axum::routing::{delete, post};
 use config::{Config, ConfigError};
 use service::MailboxService;
 use stk::{AuthChain, Server, TokenTier};
@@ -121,6 +121,15 @@ async fn serve(service: Arc<MailboxService>, bind: SocketAddr) -> Result<(), Mai
             post(routes::mail::whoami).with_state(service.clone()),
             TokenTier::Authenticated,
         )
+        // MCP door onto the same mail surface -- `mail4agent/CLAUDE.md`,
+        // "one implementation, two doors". Same tier as `/mail/*`: an
+        // operator calling a mail tool is just a participant.
+        .post_tier(
+            "/mcp",
+            post(routes::mcp::handle_mcp_post).with_state(service.clone()),
+            TokenTier::Authenticated,
+        )
+        .delete_tier("/mcp", delete(routes::mcp::handle_mcp_delete), TokenTier::Authenticated)
         .post_tier(
             "/admin/participant",
             post(routes::admin::register_participant).with_state(service.clone()),

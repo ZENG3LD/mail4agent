@@ -49,7 +49,7 @@ pub async fn send(
     Ok(Json(response))
 }
 
-async fn send_impl(
+pub(crate) async fn send_impl(
     service: &MailboxService,
     sender: ParticipantId,
     request: SendRequest,
@@ -67,7 +67,7 @@ pub async fn inbox(
     Ok(Json(page))
 }
 
-async fn inbox_impl(
+pub(crate) async fn inbox_impl(
     service: &MailboxService,
     reader: ParticipantId,
     request: InboxRequest,
@@ -87,7 +87,7 @@ pub async fn ack(
     Ok(Json(AckResponse { ack }))
 }
 
-async fn ack_impl(service: &MailboxService, reader: ParticipantId, request: AckRequest) -> Result<Ack, MailError> {
+pub(crate) async fn ack_impl(service: &MailboxService, reader: ParticipantId, request: AckRequest) -> Result<Ack, MailError> {
     request.validate()?;
     service.ack(reader, request.message_id).await
 }
@@ -102,7 +102,7 @@ pub async fn get(
     Ok(Json(message))
 }
 
-async fn get_impl(
+pub(crate) async fn get_impl(
     service: &MailboxService,
     reader: ParticipantId,
     request: MessageGetRequest,
@@ -139,7 +139,7 @@ pub async fn whoami(
     Ok(Json(response))
 }
 
-async fn whoami_impl(
+pub(crate) async fn whoami_impl(
     service: &MailboxService,
     caller: AuthenticatedParticipant,
 ) -> Result<WhoAmIResponse, MailError> {
