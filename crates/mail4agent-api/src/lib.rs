@@ -97,6 +97,12 @@ pub enum MailError {
     /// A field exceeded its bound. Carries both the bound and what was sent
     /// so the caller can act without a second round trip.
     TooLarge { field: String, limit: usize, actual: usize },
+    /// The storage layer could not complete `operation` (a filesystem
+    /// error, a lock, a corrupt row -- never a domain refusal). Names only
+    /// the operation, never the underlying cause: that cause is logged
+    /// server-side for the operator, so a caller learns *what* failed
+    /// without a path or a driver's error text leaving the process.
+    StoreUnavailable { operation: String },
 }
 
 impl fmt::Display for MailError {
@@ -117,6 +123,9 @@ impl fmt::Display for MailError {
             }
             Self::TooLarge { field, limit, actual } => {
                 write!(f, "field \"{field}\" is too large: limit {limit}, actual {actual}")
+            }
+            Self::StoreUnavailable { operation } => {
+                write!(f, "the store could not complete \"{operation}\"")
             }
         }
     }
@@ -596,6 +605,18 @@ pub struct SendRequest {
     pub correlation: Option<String>,
     #[serde(default)]
     pub refs: Vec<MessageRef>,
+    /// Scopes a retry: a repeat [`SendRequest`] from the same participant
+    /// carrying the same key returns the original [`SendResponse`] and
+    /// creates nothing (`mail4agent-core`'s `MailboxEngine::send`).
+    /// Optional and defaulted on decode so a payload written before this
+    /// field existed still deserializes.
+    ///
+    /// **Without a key, a repeat send is a second message, and that is
+    /// correct** -- sending the same text twice on purpose should produce
+    /// two messages. This field opts a caller into dedup; it is never
+    /// inferred from content.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 impl SendRequest {
@@ -610,6 +631,9 @@ impl SendRequest {
             validate_correlation(correlation)?;
         }
         validate_refs(&self.refs)?;
+        if let Some(idempotency_key) = &self.idempotency_key {
+            validate_selector("idempotency_key", idempotency_key)?;
+        }
         Ok(())
     }
 }
@@ -1001,6 +1025,21 @@ mod tests {
         };
         let err = reference.validate().expect_err("digest over the bound must be rejected");
         assert!(matches!(err, MailError::TooLarge { field, .. } if field == "ref digest"));
+    }
+
+    #[test]
+    fn send_request_old_shape_without_idempotency_key_still_deserializes_and_validates() {
+        let json = serde_json::json!({
+            "to": {"kind": "direct", "participant": "bob"},
+            "subject": "hi",
+            "body": "hi",
+            "reply_to": null,
+            "correlation": null
+        });
+        let request: SendRequest = serde_json::from_value(json)
+            .expect("old shape without idempotency_key must still deserialize");
+        assert_eq!(request.idempotency_key, None);
+        request.validate().expect("decoded request is otherwise valid");
     }
 
     #[test]
