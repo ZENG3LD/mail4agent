@@ -82,8 +82,6 @@ pub enum MailError {
     UnknownParticipant { participant: ParticipantId },
     /// No room is registered under this id.
     UnknownRoom { room: RoomId },
-    /// The room exists, but the participant is not one of its members.
-    NotAMember { room: RoomId },
     /// No message is stored under this id.
     UnknownMessage { message_id: MessageId },
     /// The message exists, but was not sent to the caller (not their direct
@@ -112,7 +110,6 @@ impl fmt::Display for MailError {
                 write!(f, "unknown participant \"{participant}\"")
             }
             Self::UnknownRoom { room } => write!(f, "unknown room \"{room}\""),
-            Self::NotAMember { room } => write!(f, "not a member of room \"{room}\""),
             Self::UnknownMessage { message_id } => write!(f, "unknown message \"{message_id}\""),
             Self::NotAddressedToYou { message_id } => {
                 write!(f, "message \"{message_id}\" is not addressed to you")

@@ -15,9 +15,15 @@ path = "src/main.rs"
 [dependencies]
 mail4agent-api = { path = "crates/mail4agent-api", version = "0.1.0" }
 mail4agent-core = { path = "crates/mail4agent-core", version = "0.1.0" }
+mail4agent-store-stk = { path = "crates/mail4agent-store-stk", version = "0.1.0" }
+
+# The stk facade -- name/bind/auth-chain/router/manifest/db wiring. Depended
+# on directly rather than the sub-crates it re-exports (see
+# `mail4agent-store-stk`'s own comment on the same choice for `stk_db`).
+stk = { package = "servertoolkit", path = "../servertoolkit/crates/servertoolkit", version = "0.1.0" }
 
 axum = { version = "0.8", features = ["json"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync"] }
 tower-http = { version = "0.6", features = ["cors"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -26,6 +32,13 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 subtle = "2"
+# Implements `stk::AuthLayer` (`#[async_trait]`-shaped) for `MailboxAuth`.
+async-trait = "0.1"
+# Per-user data directory for the sqlite default path, and the home
+# directory for the bootstrap operator key file (smm8mail's own pattern).
+directories = "6"
+# Parses `mail4agent.toml`.
+toml = "0.8"
 
 # Internal workspace; independent from any parent workspace.
 [workspace]
