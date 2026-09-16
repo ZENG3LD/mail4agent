@@ -82,6 +82,16 @@ pub enum MailError {
     UnknownParticipant { participant: ParticipantId },
     /// No room is registered under this id.
     UnknownRoom { room: RoomId },
+    /// No session is registered under this id -- it has never been named in
+    /// an [`Address::Session`] that reached [`Address::Session`]'s
+    /// registering call, `MailboxEngine::ensure_session`.
+    UnknownSession { session: SessionId },
+    /// `session` is registered, but under a different account than the one
+    /// presented alongside it in an [`Address::Session`]. Refused rather
+    /// than silently resolved either way, because either party being wrong
+    /// about which account owns a session is exactly the confusion the
+    /// account/session split exists to prevent.
+    SessionAccountMismatch { session: SessionId, expected: ParticipantId, presented: ParticipantId },
     /// No message is stored under this id.
     UnknownMessage { message_id: MessageId },
     /// The message exists, but was not sent to the caller (not their direct
@@ -110,6 +120,11 @@ impl fmt::Display for MailError {
                 write!(f, "unknown participant \"{participant}\"")
             }
             Self::UnknownRoom { room } => write!(f, "unknown room \"{room}\""),
+            Self::UnknownSession { session } => write!(f, "unknown session \"{session}\""),
+            Self::SessionAccountMismatch { session, expected, presented } => write!(
+                f,
+                "session \"{session}\" belongs to account \"{expected}\", not \"{presented}\""
+            ),
             Self::UnknownMessage { message_id } => write!(f, "unknown message \"{message_id}\""),
             Self::NotAddressedToYou { message_id } => {
                 write!(f, "message \"{message_id}\" is not addressed to you")
@@ -130,21 +145,35 @@ impl fmt::Display for MailError {
 
 impl std::error::Error for MailError {}
 
-fn validate_opaque_id(label: &'static str, value: &str, prefix: &str) -> Result<(), MailError> {
+/// `min_hex_len`/`max_hex_len` let one function serve both a fixed-width id
+/// ([`MessageId`], `min == max`) and a variable-width one ([`SessionId`],
+/// which has no fixed width because it is derived by the *caller* from a
+/// process identity, never invented by this crate).
+fn validate_opaque_id(
+    label: &'static str,
+    value: &str,
+    prefix: &str,
+    min_hex_len: usize,
+    max_hex_len: usize,
+) -> Result<(), MailError> {
     let Some(hex) = value.strip_prefix(prefix) else {
         return Err(MailError::Malformed {
             field: label.to_string(),
             reason: format!("must start with \"{prefix}\""),
         });
     };
-    if hex.len() != MESSAGE_ID_HEX_LEN
+    if hex.len() < min_hex_len
+        || hex.len() > max_hex_len
         || !hex.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
+        let width = if min_hex_len == max_hex_len {
+            min_hex_len.to_string()
+        } else {
+            format!("{min_hex_len}..={max_hex_len}")
+        };
         return Err(MailError::Malformed {
             field: label.to_string(),
-            reason: format!(
-                "body after \"{prefix}\" must be {MESSAGE_ID_HEX_LEN} lowercase hex characters"
-            ),
+            reason: format!("body after \"{prefix}\" must be {width} lowercase hex characters"),
         });
     }
     Ok(())
@@ -177,21 +206,32 @@ fn validate_selector(label: &'static str, value: &str) -> Result<(), MailError> 
     Ok(())
 }
 
-fn validate_subject(value: &str) -> Result<(), MailError> {
+/// Bound shared by every free-text field that is otherwise unstructured:
+/// [`Message::subject`]/[`SendRequest::subject`], a participant's or
+/// directory entry's `label`, and every free-text field a [`SessionCard`]
+/// carries (an executable path, a provider session id, a model name, a
+/// working directory, a role, a one-line description of what a session is
+/// working on). One rule, one place, so the bound and the "no control
+/// characters" rule cannot drift between the fields that share it.
+fn validate_bounded_text(field: &'static str, value: &str) -> Result<(), MailError> {
     if value.len() > SUBJECT_MAX_BYTES {
         return Err(MailError::TooLarge {
-            field: "subject".to_string(),
+            field: field.to_string(),
             limit: SUBJECT_MAX_BYTES,
             actual: value.len(),
         });
     }
     if value.chars().any(char::is_control) {
         return Err(MailError::Malformed {
-            field: "subject".to_string(),
+            field: field.to_string(),
             reason: "must not contain control characters".to_string(),
         });
     }
     Ok(())
+}
+
+fn validate_subject(value: &str) -> Result<(), MailError> {
+    validate_bounded_text("subject", value)
 }
 
 fn validate_body(value: &str) -> Result<(), MailError> {
@@ -251,7 +291,7 @@ fn validate_refs(refs: &[MessageRef]) -> Result<(), MailError> {
 /// both `new()` and decode. Ported from `gate4agent-harness-protocol`'s
 /// `opaque_id!` macro (`gate4agent-harness-protocol/src/lib.rs:50-97`).
 macro_rules! opaque_id {
-    ($name:ident, $prefix:expr, $label:literal, $doc:expr) => {
+    ($name:ident, $prefix:expr, $label:literal, $min_hex:expr, $max_hex:expr, $doc:expr) => {
         #[doc = $doc]
         #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
         #[serde(transparent)]
@@ -262,12 +302,12 @@ macro_rules! opaque_id {
 
             pub fn new(value: impl Into<String>) -> Result<Self, MailError> {
                 let value = value.into();
-                validate_opaque_id($label, &value, Self::PREFIX)?;
+                validate_opaque_id($label, &value, Self::PREFIX, $min_hex, $max_hex)?;
                 Ok(Self(value))
             }
 
             pub fn validate(&self) -> Result<(), MailError> {
-                validate_opaque_id($label, &self.0, Self::PREFIX)
+                validate_opaque_id($label, &self.0, Self::PREFIX, $min_hex, $max_hex)
             }
 
             pub fn as_str(&self) -> &str {
@@ -373,10 +413,44 @@ opaque_id!(
     MessageId,
     MESSAGE_ID_PREFIX,
     "message id",
+    MESSAGE_ID_HEX_LEN,
+    MESSAGE_ID_HEX_LEN,
     "Opaque, prefixed, fixed-width hex id for a stored [`Message`]. Ported \
      from `HarnessMailMessageId` (prefix `hmail_` there, `m4a_` here so a \
      value can never be mistaken for a harness message id from the crate \
      this was ported out of)."
+);
+
+/// Prefix every [`SessionId`] carries, chosen so a printed address like
+/// `claude/s-7f3a...` reads unambiguously as "an account, then one of its
+/// sessions" -- see [`Address`]'s `Display`/`FromStr`.
+pub const SESSION_ID_PREFIX: &str = "s-";
+
+/// Minimum length, in lower-hex characters, of a [`SessionId`]'s body after
+/// its prefix -- a floor against an accidentally-empty id, not an exact
+/// width (see [`SESSION_ID_HEX_MAX_CHARS`] for why there is no exact
+/// width).
+pub const SESSION_ID_HEX_MIN_CHARS: usize = 8;
+
+/// Maximum length, in lower-hex characters, of a [`SessionId`]'s body.
+/// Unlike [`MessageId`], a session id is derived by the *caller* from a
+/// process identity (`mail4agent-attest::PeerProcess`'s `(pid,
+/// started_at_unix_ms)` pair, typically hashed) and handed to this crate
+/// already formed, so it has no width this crate gets to fix -- this bound
+/// is generous enough for a SHA-256 hex digest (64 characters), a
+/// reasonable way to derive one.
+pub const SESSION_ID_HEX_MAX_CHARS: usize = 64;
+
+opaque_id!(
+    SessionId,
+    SESSION_ID_PREFIX,
+    "session id",
+    SESSION_ID_HEX_MIN_CHARS,
+    SESSION_ID_HEX_MAX_CHARS,
+    "Opaque id for one live session under a [`ParticipantId`] account. \
+     Derived by the caller from a process identity and handed to this \
+     crate already formed -- `MailboxEngine::ensure_session` registers one, \
+     it never invents one."
 );
 
 selector_id!(
@@ -394,18 +468,23 @@ selector_id!(
      Distinct from [`ParticipantId`] on purpose (see there)."
 );
 
-/// Where a message goes: one participant directly, or a room the mailbox
-/// tracks membership for. Serde-tagged on `kind` (`"direct"` / `"room"`).
+/// Where a message goes, or who it is from: one account directly, one of
+/// that account's live sessions, or a room the mailbox tracks membership
+/// for. Serde-tagged on `kind` (`"direct"` / `"session"` / `"room"`).
 ///
 /// Replaces the source's `HarnessMailAddressV1::Session`/`Task`: a room is
 /// a named group of participants the mailbox itself tracks, with no
 /// relationship to any task system -- unlike `Task`, which addressed every
 /// grant able to read a given `task_id` in a foreign task kernel this crate
-/// must never learn about.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// must never learn about. [`Self::Session`] is this crate's own addition
+/// (`mailbox-service-extraction-and-signed-session-identity-2026-09-16.md`
+/// §5e): a session *is* a participant, not a new concept beside one, so it
+/// is a third shape of the same address type rather than a parallel id.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Address {
     Direct { participant: ParticipantId },
+    Session { participant: ParticipantId, session: SessionId },
     Room { room: RoomId },
 }
 
@@ -413,7 +492,78 @@ impl Address {
     pub fn validate(&self) -> Result<(), MailError> {
         match self {
             Self::Direct { participant } => participant.validate(),
+            Self::Session { participant, session } => {
+                participant.validate()?;
+                session.validate()
+            }
             Self::Room { room } => room.validate(),
+        }
+    }
+
+    /// The account this address ultimately names: itself for [`Self::Direct`],
+    /// the owning account for [`Self::Session`], `None` for [`Self::Room`]
+    /// (a room has no owning account).
+    pub fn account(&self) -> Option<&ParticipantId> {
+        match self {
+            Self::Direct { participant } | Self::Session { participant, .. } => Some(participant),
+            Self::Room { .. } => None,
+        }
+    }
+}
+
+/// Shared by [`Message::validate`] (`from`) and [`Ack::validate`]
+/// (`reader`) and [`SendResponse::validate`] (`from`): an address that
+/// identifies *someone*, never somewhere mail merely goes. A room fails
+/// this even though [`Address::validate`] alone would accept it -- nobody
+/// sends mail "from" a room or acknowledges one "as" a room, so the field
+/// itself, not just its components, must not be one.
+fn validate_participant_address(field: &'static str, address: &Address) -> Result<(), MailError> {
+    address.validate()?;
+    if address.account().is_none() {
+        return Err(MailError::Malformed {
+            field: field.to_string(),
+            reason: "must be a participant address (direct or session), not a room".to_string(),
+        });
+    }
+    Ok(())
+}
+
+impl fmt::Display for Address {
+    /// The shape a human or a tool argument writes -- `claude` for the
+    /// account, `claude/s-7f3a...` for one of its sessions, `#room-1` for a
+    /// room -- not the wire shape. The wire shape stays the tagged JSON
+    /// object [`Serialize`]/[`Deserialize`] above produce; this is a second,
+    /// display-only encoding, chosen to match
+    /// `mailbox-service-extraction-and-signed-session-identity-2026-09-16.md`
+    /// §5e's own example.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Direct { participant } => write!(f, "{participant}"),
+            Self::Session { participant, session } => write!(f, "{participant}/{session}"),
+            Self::Room { room } => write!(f, "#{room}"),
+        }
+    }
+}
+
+impl std::str::FromStr for Address {
+    type Err = MailError;
+
+    /// Parses the same shape [`Display`] writes: a leading `#` names a
+    /// room; one `/` splits an account from one of its sessions; anything
+    /// else is the account address directly. A room id and a participant id
+    /// share the same charset (see their own `new` methods), so the
+    /// leading `#` is what disambiguates a room from an account whose name
+    /// happens to look the same -- neither charset permits `#` or `/`, so
+    /// there is nothing for either component to accidentally supply.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if let Some(room) = value.strip_prefix('#') {
+            return Ok(Self::Room { room: RoomId::new(room)? });
+        }
+        match value.split_once('/') {
+            Some((participant, session)) => {
+                Ok(Self::Session { participant: ParticipantId::new(participant)?, session: SessionId::new(session)? })
+            }
+            None => Ok(Self::Direct { participant: ParticipantId::new(value)? }),
         }
     }
 }
@@ -484,7 +634,10 @@ impl MessageRef {
 #[serde(deny_unknown_fields)]
 pub struct Message {
     pub message_id: MessageId,
-    pub from: ParticipantId,
+    /// The session's own address if a session sent this, the account's
+    /// address if an account did -- never a room (see
+    /// [`validate_participant_address`]).
+    pub from: Address,
     pub to: Address,
     pub subject: String,
     pub body: String,
@@ -503,7 +656,7 @@ pub struct Message {
 impl Message {
     pub fn validate(&self) -> Result<(), MailError> {
         self.message_id.validate()?;
-        self.from.validate()?;
+        validate_participant_address("from", &self.from)?;
         self.to.validate()?;
         validate_subject(&self.subject)?;
         validate_body(&self.body)?;
@@ -537,14 +690,19 @@ impl Message {
 #[serde(deny_unknown_fields)]
 pub struct Ack {
     pub message_id: MessageId,
-    pub reader: ParticipantId,
+    /// The exact address that acknowledged: a session's own address if a
+    /// session acked, the account's if an account did -- so two sessions of
+    /// the same account track their own read state independently, the way
+    /// Matrix scopes read markers to a `(user_id, device_id)` pair rather
+    /// than to the account alone.
+    pub reader: Address,
     pub acked_at_unix_ms: u64,
 }
 
 impl Ack {
     pub fn validate(&self) -> Result<(), MailError> {
         self.message_id.validate()?;
-        self.reader.validate()?;
+        validate_participant_address("reader", &self.reader)?;
         if self.acked_at_unix_ms == 0 {
             return Err(MailError::Malformed {
                 field: "acked_at_unix_ms".to_string(),
@@ -552,6 +710,166 @@ impl Ack {
             });
         }
         Ok(())
+    }
+}
+
+/// A value corroborated from a source that is real but not proof -- read
+/// out of a process's own command line, for instance, rather than attested
+/// by the kernel. Mirrors `mail4agent-attest::Declared`, which this crate
+/// cannot depend on directly: `mail4agent/CLAUDE.md` keeps this crate's
+/// dependency list empty of everything that is not serialisation, and that
+/// crate links Windows process APIs to do its job. Getting the inner value
+/// means calling [`Declared::into_inner`] or [`Declared::as_ref`], never a
+/// plain field read, so a caller cannot treat a corroborated fact with the
+/// same weight as an attested one by accident. See [`SessionCard`] for
+/// where the split this type exists to preserve actually matters.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Declared<T>(T);
+
+impl<T> Declared<T> {
+    pub fn new(value: T) -> Self {
+        Self(value)
+    }
+
+    /// Consumes the wrapper and returns the declared value.
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+
+    /// Borrows the declared value without consuming the wrapper.
+    pub fn as_ref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T: fmt::Display> fmt::Display for Declared<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+/// Proved by the kernel at the moment the connection carrying this
+/// session's request was accepted -- never rewritable by the process it
+/// describes. Mirrors the three kernel-sourced fields of
+/// `mail4agent-attest::PeerProcess` (`pid`, `started_at_unix_ms`, `exe`);
+/// this crate cannot depend on that one directly (see [`Declared`]), so
+/// this is the wire shape of the same three facts.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionAttested {
+    pub pid: u32,
+    pub started_at_unix_ms: u64,
+    pub exe: Option<String>,
+}
+
+impl SessionAttested {
+    pub fn validate(&self) -> Result<(), MailError> {
+        if let Some(exe) = &self.exe {
+            validate_bounded_text("attested exe", exe)?;
+        }
+        Ok(())
+    }
+}
+
+/// Read out of the process's own command line (or a CLI hook) -- real in
+/// the sense that *some* process held this in memory at read time, and
+/// never proof of what that process actually is or was launched with. Each
+/// field is [`Declared`] for that reason; see its doc comment before
+/// treating any of these with the same weight as [`SessionAttested`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionCorroborated {
+    pub provider_session_id: Option<Declared<String>>,
+    pub model: Option<Declared<String>>,
+    pub cwd: Option<Declared<String>>,
+}
+
+impl SessionCorroborated {
+    pub fn validate(&self) -> Result<(), MailError> {
+        if let Some(value) = &self.provider_session_id {
+            validate_bounded_text("corroborated provider_session_id", value.as_ref())?;
+        }
+        if let Some(value) = &self.model {
+            validate_bounded_text("corroborated model", value.as_ref())?;
+        }
+        if let Some(value) = &self.cwd {
+            validate_bounded_text("corroborated cwd", value.as_ref())?;
+        }
+        Ok(())
+    }
+}
+
+/// Said by the session about itself -- the weakest tier, and the only one a
+/// session can write at all: see `MailboxEngine::set_declared`, the sole
+/// way this group is ever set.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionDeclared {
+    pub working_on: Option<String>,
+    pub role: Option<String>,
+    /// Which session spawned this one, said by this session about itself --
+    /// not verified against the registry, the same way the rest of this
+    /// group is not.
+    pub parent: Option<SessionId>,
+}
+
+impl SessionDeclared {
+    pub fn validate(&self) -> Result<(), MailError> {
+        if let Some(value) = &self.working_on {
+            validate_bounded_text("declared working_on", value)?;
+        }
+        if let Some(value) = &self.role {
+            validate_bounded_text("declared role", value)?;
+        }
+        if let Some(parent) = &self.parent {
+            parent.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// What the mailbox knows about one session, split by how sure it can be:
+/// [`SessionAttested`] from the kernel, [`SessionCorroborated`] from the
+/// process's own command line, [`SessionDeclared`] said by the session
+/// about itself. Kept as three distinct nested structs -- never flattened
+/// into one -- so the provenance of every field is visible in the type and
+/// survives into the JSON exactly as it should be trusted. See
+/// `mailbox-service-extraction-and-signed-session-identity-2026-09-16.md`
+/// §5e.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionCard {
+    pub attested: SessionAttested,
+    pub corroborated: SessionCorroborated,
+    pub declared: SessionDeclared,
+}
+
+impl SessionCard {
+    pub fn validate(&self) -> Result<(), MailError> {
+        self.attested.validate()?;
+        self.corroborated.validate()?;
+        self.declared.validate()
+    }
+}
+
+/// One session under an account, as the mailbox's directory reports it.
+/// `live` is filled by the mailbox from a liveness check it is *given*, not
+/// one it performs itself -- `mail4agent-core` learns nothing about
+/// processes or Windows; see `MailboxEngine::directory`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionEntry {
+    pub id: SessionId,
+    pub card: SessionCard,
+    pub last_seen_unix_ms: u64,
+    pub live: bool,
+}
+
+impl SessionEntry {
+    pub fn validate(&self) -> Result<(), MailError> {
+        self.id.validate()?;
+        self.card.validate()
     }
 }
 
@@ -583,34 +901,27 @@ impl Participant {
 /// [`Participant`] stripped away -- see [`DirectoryEntry`]'s own doc
 /// comment for why.
 fn validate_label(value: &str) -> Result<(), MailError> {
-    if value.len() > SUBJECT_MAX_BYTES {
-        return Err(MailError::TooLarge {
-            field: "label".to_string(),
-            limit: SUBJECT_MAX_BYTES,
-            actual: value.len(),
-        });
-    }
-    if value.chars().any(char::is_control) {
-        return Err(MailError::Malformed {
-            field: "label".to_string(),
-            reason: "must not contain control characters".to_string(),
-        });
-    }
-    Ok(())
+    validate_bounded_text("label", value)
 }
 
-/// One entry in the mailbox's own directory of registered participants:
-/// an id and a display label, nothing more. **Never carries a secret
-/// digest or a permission bit** -- a directory answers "who exists", not
-/// "what may they do" or anything that would help forge them, and a type
-/// that structurally has no such field cannot leak one even by accident
-/// (mirrors `mail4agent_core::store::ParticipantSummary`, the store-side
-/// type this is assembled from).
+/// One **account** in the mailbox's directory, with its live sessions
+/// nested under it -- the XMPP/Matrix shape (an account, then its
+/// individually addressable sessions), not a flat list of CLI brands. See
+/// `mailbox-service-extraction-and-signed-session-identity-2026-09-16.md`
+/// §5e. **Never carries a secret digest or a permission bit** -- a
+/// directory answers "who exists", not "what may they do" or anything that
+/// would help forge them, and a type that structurally has no such field
+/// cannot leak one even by accident (mirrors
+/// `mail4agent_core::store::ParticipantSummary`, the store-side type this
+/// is assembled from). `sessions` defaults to empty on decode so a payload
+/// written before this field existed still deserializes.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DirectoryEntry {
     pub id: ParticipantId,
     pub label: Option<String>,
+    #[serde(default)]
+    pub sessions: Vec<SessionEntry>,
 }
 
 impl DirectoryEntry {
@@ -618,6 +929,9 @@ impl DirectoryEntry {
         self.id.validate()?;
         if let Some(label) = &self.label {
             validate_label(label)?;
+        }
+        for session in &self.sessions {
+            session.validate()?;
         }
         Ok(())
     }
@@ -770,16 +1084,17 @@ impl MessageGetRequest {
     }
 }
 
-/// Requests the unread count for `participant`.
+/// Requests the unread count for `target` -- an account or one of its
+/// sessions.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UnreadCountRequest {
-    pub participant: ParticipantId,
+    pub target: Address,
 }
 
 impl UnreadCountRequest {
     pub fn validate(&self) -> Result<(), MailError> {
-        self.participant.validate()
+        validate_participant_address("target", &self.target)
     }
 }
 
@@ -789,13 +1104,13 @@ impl UnreadCountRequest {
 #[serde(deny_unknown_fields)]
 pub struct SendResponse {
     pub message_id: MessageId,
-    pub from: ParticipantId,
+    pub from: Address,
 }
 
 impl SendResponse {
     pub fn validate(&self) -> Result<(), MailError> {
         self.message_id.validate()?;
-        self.from.validate()
+        validate_participant_address("from", &self.from)
     }
 }
 
@@ -835,13 +1150,13 @@ impl AckResponse {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UnreadCount {
-    pub participant: ParticipantId,
+    pub target: Address,
     pub unread: u32,
 }
 
 impl UnreadCount {
     pub fn validate(&self) -> Result<(), MailError> {
-        self.participant.validate()
+        validate_participant_address("target", &self.target)
     }
 }
 
@@ -859,10 +1174,14 @@ mod tests {
         MessageId::new(VALID_MESSAGE_ID).expect("test message id is valid")
     }
 
+    fn session_id(value: &str) -> SessionId {
+        SessionId::new(value).expect("test session id is valid")
+    }
+
     fn sample_message() -> Message {
         Message {
             message_id: message_id(),
-            from: participant("alice"),
+            from: Address::Direct { participant: participant("alice") },
             to: Address::Direct { participant: participant("bob") },
             subject: "hi".to_string(),
             body: "hi".to_string(),
@@ -1039,7 +1358,7 @@ mod tests {
         let json = format!(
             r#"{{
                 "message_id": "{VALID_MESSAGE_ID}",
-                "from": "alice",
+                "from": {{"kind": "direct", "participant": "alice"}},
                 "to": {{"kind": "direct", "participant": "bob"}},
                 "subject": "hi",
                 "body": "hi",
@@ -1061,11 +1380,117 @@ mod tests {
         let decoded: Address = serde_json::from_value(json).expect("direct address deserializes");
         assert_eq!(decoded, direct);
 
+        let session = Address::Session { participant: participant("claude"), session: session_id("s-7f3a0000") };
+        let json = serde_json::to_value(&session).expect("session address serializes");
+        assert_eq!(
+            json,
+            serde_json::json!({"kind": "session", "participant": "claude", "session": "s-7f3a0000"})
+        );
+        let decoded: Address = serde_json::from_value(json).expect("session address deserializes");
+        assert_eq!(decoded, session);
+
         let room = Address::Room { room: RoomId::new("room-1").expect("valid room id") };
         let json = serde_json::to_value(&room).expect("room address serializes");
         assert_eq!(json, serde_json::json!({"kind": "room", "room": "room-1"}));
         let decoded: Address = serde_json::from_value(json).expect("room address deserializes");
         assert_eq!(decoded, room);
+    }
+
+    #[test]
+    fn address_display_and_from_str_use_the_familiar_shape() {
+        let direct = Address::Direct { participant: participant("claude") };
+        assert_eq!(direct.to_string(), "claude");
+        assert_eq!("claude".parse::<Address>().expect("direct address parses"), direct);
+
+        let session = Address::Session { participant: participant("claude"), session: session_id("s-7f3a0000") };
+        assert_eq!(session.to_string(), "claude/s-7f3a0000");
+        assert_eq!("claude/s-7f3a0000".parse::<Address>().expect("session address parses"), session);
+
+        let room = Address::Room { room: RoomId::new("room-1").expect("valid room id") };
+        assert_eq!(room.to_string(), "#room-1");
+        assert_eq!("#room-1".parse::<Address>().expect("room address parses"), room);
+    }
+
+    #[test]
+    fn address_account_names_the_owning_account_and_none_for_a_room() {
+        let alice = participant("alice");
+        assert_eq!(Address::Direct { participant: alice.clone() }.account(), Some(&alice));
+        assert_eq!(
+            Address::Session { participant: alice.clone(), session: session_id("s-7f3a0000") }.account(),
+            Some(&alice)
+        );
+        assert_eq!(Address::Room { room: RoomId::new("room-1").expect("valid room id") }.account(), None);
+    }
+
+    #[test]
+    fn message_and_ack_and_send_response_refuse_a_room_as_the_participant_address() {
+        let room = Address::Room { room: RoomId::new("room-1").expect("valid room id") };
+
+        let mut message = sample_message();
+        message.from = room.clone();
+        let err = message.validate().expect_err("a room must not be accepted as `from`");
+        assert!(matches!(err, MailError::Malformed { field, .. } if field == "from"));
+
+        let ack = Ack { message_id: message_id(), reader: room.clone(), acked_at_unix_ms: 1 };
+        let err = ack.validate().expect_err("a room must not be accepted as `reader`");
+        assert!(matches!(err, MailError::Malformed { field, .. } if field == "reader"));
+
+        let response = SendResponse { message_id: message_id(), from: room };
+        let err = response.validate().expect_err("a room must not be accepted as `from`");
+        assert!(matches!(err, MailError::Malformed { field, .. } if field == "from"));
+    }
+
+    #[test]
+    fn session_id_round_trips_and_rejects_a_short_body() {
+        let id: SessionId = "s-7f3a0000".parse().expect("valid session id parses");
+        assert_eq!(id.to_string(), "s-7f3a0000");
+
+        let err = SessionId::new("s-abc").expect_err("a body shorter than the minimum must be rejected");
+        assert!(matches!(err, MailError::Malformed { field, .. } if field == "session id"));
+
+        let err = SessionId::new("wrong-7f3a0000").expect_err("a wrong prefix must be rejected");
+        assert!(matches!(err, MailError::Malformed { field, .. } if field == "session id"));
+    }
+
+    #[test]
+    fn session_card_validates_every_group_and_rejects_a_control_character_anywhere() {
+        let mut card = SessionCard {
+            attested: SessionAttested { pid: 4242, started_at_unix_ms: 1, exe: Some("claude.exe".to_string()) },
+            corroborated: SessionCorroborated {
+                provider_session_id: Some(Declared::new("prov-1".to_string())),
+                model: Some(Declared::new("opus".to_string())),
+                cwd: None,
+            },
+            declared: SessionDeclared { working_on: Some("parity work".to_string()), role: None, parent: None },
+        };
+        card.validate().expect("a well-formed card validates");
+
+        card.corroborated.model = Some(Declared::new("bad\u{0007}model".to_string()));
+        let err = card.validate().expect_err("a control character in a corroborated field must be rejected");
+        assert!(matches!(err, MailError::Malformed { field, .. } if field == "corroborated model"));
+    }
+
+    #[test]
+    fn directory_entry_nests_its_sessions_and_defaults_to_none_on_decode() {
+        let entry = DirectoryEntry {
+            id: participant("claude"),
+            label: None,
+            sessions: vec![SessionEntry {
+                id: session_id("s-7f3a0000"),
+                card: SessionCard {
+                    attested: SessionAttested { pid: 1, started_at_unix_ms: 1, exe: None },
+                    corroborated: SessionCorroborated { provider_session_id: None, model: None, cwd: None },
+                    declared: SessionDeclared::default(),
+                },
+                last_seen_unix_ms: 1,
+                live: true,
+            }],
+        };
+        entry.validate().expect("a well-formed entry with a session validates");
+
+        let json = serde_json::json!({"id": "claude", "label": null});
+        let decoded: DirectoryEntry = serde_json::from_value(json).expect("an entry without sessions still decodes");
+        assert!(decoded.sessions.is_empty());
     }
 
     #[test]
@@ -1139,17 +1564,18 @@ mod tests {
     }
 
     #[test]
-    fn directory_entry_serialises_with_id_and_label_only() {
-        let entry = DirectoryEntry { id: participant("alice"), label: Some("Alice".to_string()) };
+    fn directory_entry_serialises_with_id_label_and_sessions() {
+        let entry = DirectoryEntry { id: participant("alice"), label: Some("Alice".to_string()), sessions: Vec::new() };
         let json = serde_json::to_value(&entry).expect("directory entry serializes");
-        assert_eq!(json, serde_json::json!({"id": "alice", "label": "Alice"}));
+        assert_eq!(json, serde_json::json!({"id": "alice", "label": "Alice", "sessions": []}));
         let decoded: DirectoryEntry = serde_json::from_value(json).expect("directory entry deserializes");
         assert_eq!(decoded, entry);
     }
 
     #[test]
     fn directory_entry_rejects_a_control_character_label() {
-        let entry = DirectoryEntry { id: participant("alice"), label: Some("bad\u{0007}label".to_string()) };
+        let entry =
+            DirectoryEntry { id: participant("alice"), label: Some("bad\u{0007}label".to_string()), sessions: Vec::new() };
         let err = entry.validate().expect_err("control character in label must be rejected");
         assert!(matches!(err, MailError::Malformed { field, .. } if field == "label"));
     }
@@ -1166,7 +1592,7 @@ mod tests {
     #[test]
     fn directory_validates_every_entry_it_carries() {
         let directory = Directory {
-            participants: vec![DirectoryEntry { id: participant("alice"), label: None }],
+            participants: vec![DirectoryEntry { id: participant("alice"), label: None, sessions: Vec::new() }],
             rooms: vec![RoomEntry { id: RoomId::new("room-1").expect("valid room id"), member: false }],
         };
         directory.validate().expect("a directory of otherwise-valid entries validates");

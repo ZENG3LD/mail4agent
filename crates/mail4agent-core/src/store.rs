@@ -21,7 +21,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use mail4agent_api::{Ack, Address, Message, MessageId, ParticipantId, RoomId};
+use mail4agent_api::{Ack, Address, Message, MessageId, ParticipantId, RoomId, SessionCard, SessionId};
 use thiserror::Error;
 
 /// The SHA-256 digest of a participant's secret. The engine stores only
@@ -98,6 +98,22 @@ pub struct RoomSummary {
     pub members: BTreeSet<ParticipantId>,
 }
 
+/// One live session, as the mailbox's own registry holds it. Carries no
+/// secret and no permission bits of its own -- a session authenticates
+/// through its account's bearer secret plus kernel attestation of the
+/// calling process (`mail4agent-attest`, outside this crate entirely), and
+/// borrows its account's `may_send`/`may_read`/`operator` bits rather than
+/// carrying its own (see `crate::MailboxEngine::resolve_identity`). This is
+/// "a participant record gains a kind" made a type-system fact rather than
+/// a runtime tag: [`ParticipantRecord`] is the account kind, this is the
+/// session kind, and which one a lookup returns says which kind it found.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionRecord {
+    pub account: ParticipantId,
+    pub card: SessionCard,
+    pub last_seen_unix_ms: u64,
+}
+
 /// What [`MailStore::insert_message`] did. Distinguishes a genuinely new
 /// message from a retry recognised by its idempotency key, so the engine can
 /// return the *original* [`mail4agent_api::SendResponse`] without needing a
@@ -153,40 +169,54 @@ pub trait MailStore {
 
     fn get_room(&self, id: &RoomId) -> Result<Option<RoomRecord>, StoreError>;
 
-    /// Stores `message` unless `idempotency` names a (sender, key) pair
-    /// already recorded against an earlier message, in which case nothing
-    /// is created and that earlier message's id is returned. One call, one
-    /// transaction: a SQLite implementation satisfies this with an insert
-    /// under a `UNIQUE (sender, key)` constraint (or an equivalent
-    /// check-and-insert within one transaction), never a separate
-    /// read-then-write pair that could race under concurrent callers.
+    /// Stores `message` unless `idempotency` names a (sender address, key)
+    /// pair already recorded against an earlier message, in which case
+    /// nothing is created and that earlier message's id is returned. One
+    /// call, one transaction: a SQLite implementation satisfies this with
+    /// an insert under a `UNIQUE (sender, key)` constraint (or an
+    /// equivalent check-and-insert within one transaction), never a
+    /// separate read-then-write pair that could race under concurrent
+    /// callers. The sender is an [`Address`] rather than a
+    /// [`ParticipantId`] so that a retry from one specific session is
+    /// deduplicated against that session, not against every session of its
+    /// account.
     fn insert_message(
         &mut self,
         message: Message,
-        idempotency: Option<(ParticipantId, String)>,
+        idempotency: Option<(Address, String)>,
     ) -> Result<InsertMessageOutcome, StoreError>;
 
     fn get_message(&self, id: &MessageId) -> Result<Option<Message>, StoreError>;
 
-    /// Messages addressed directly to `participant`, no older than
-    /// `since_unix_ms`.
-    fn direct_messages_since(&self, participant: &ParticipantId, since_unix_ms: u64) -> Result<Vec<Message>, StoreError>;
+    /// Messages addressed to exactly `to` (a [`Address::Direct`] account
+    /// address or a [`Address::Session`] one), no older than
+    /// `since_unix_ms`. Never `Address::Room` -- room mail is
+    /// [`Self::room_messages_since`], keyed by [`RoomId`] rather than by a
+    /// full address, since it is never gated on the reader's own identity
+    /// the way this method's result is.
+    fn messages_to_since(&self, to: &Address, since_unix_ms: u64) -> Result<Vec<Message>, StoreError>;
 
     /// Messages addressed to `room`, no older than `since_unix_ms`. Not
     /// gated on membership -- the caller (the engine) decides who may see
     /// the result.
     fn room_messages_since(&self, room: &RoomId, since_unix_ms: u64) -> Result<Vec<Message>, StoreError>;
 
-    /// Every room `participant` currently belongs to.
+    /// Every room `participant` currently belongs to. Membership stays on
+    /// the account: a session looks its account's rooms up through this
+    /// same method, it does not have a membership set of its own (see
+    /// [`SessionRecord`]).
     fn rooms_containing(&self, participant: &ParticipantId) -> Result<Vec<RoomId>, StoreError>;
 
     /// Records an acknowledgement, or returns the one already on file for
     /// this `(message_id, reader)` pair unchanged. One call, one
     /// transaction, so two concurrent acks of the same message by the same
-    /// reader cannot both "win" with different timestamps.
+    /// reader cannot both "win" with different timestamps. `reader` is an
+    /// [`Address`] so a session's ack is tracked separately from its
+    /// account's and from its sibling sessions', the way Matrix scopes a
+    /// read marker to a `(user_id, device_id)` pair.
     fn record_ack(&mut self, ack: Ack) -> Result<Ack, StoreError>;
 
-    fn get_ack(&self, message_id: &MessageId, reader: &ParticipantId) -> Result<Option<Ack>, StoreError>;
+    fn get_ack(&self, message_id: &MessageId, reader: &Address) -> Result<Option<Ack>, StoreError>;
 
     /// Every registered participant, for the mailbox's own directory
     /// (`crate::MailboxEngine::directory`). Returns the full set, always
@@ -199,6 +229,25 @@ pub trait MailStore {
     /// Every room the mailbox tracks, with its current membership, for
     /// the same directory. Also the full set, always, for the same reason.
     fn list_rooms(&self) -> Result<Vec<RoomSummary>, StoreError>;
+
+    /// Looks a session up by its id. `None` until
+    /// `crate::MailboxEngine::ensure_session` has registered it at least
+    /// once.
+    fn get_session(&self, session: &SessionId) -> Result<Option<SessionRecord>, StoreError>;
+
+    /// Inserts or wholesale-replaces the record for `session`. The engine,
+    /// not this trait, is responsible for merging a fresh reading into an
+    /// existing record before calling this -- see
+    /// `crate::MailboxEngine::ensure_session` and `::set_declared`, the
+    /// only two callers, and the only two ways a [`SessionRecord`] ever
+    /// changes.
+    fn upsert_session(&mut self, session: SessionId, record: SessionRecord) -> Result<(), StoreError>;
+
+    /// Every session currently registered under `account`, for the
+    /// mailbox's own directory (`crate::MailboxEngine::directory`), which
+    /// nests them under their account the way Matrix nests devices under a
+    /// `user_id`.
+    fn sessions_of(&self, account: &ParticipantId) -> Result<Vec<(SessionId, SessionRecord)>, StoreError>;
 }
 
 /// An in-memory [`MailStore`], used by this crate's own tests. Not meant for
@@ -211,8 +260,9 @@ pub struct InMemoryStore {
     digest_index: HashMap<SecretDigest, ParticipantId>,
     rooms: HashMap<RoomId, RoomRecord>,
     messages: HashMap<MessageId, Message>,
-    idempotency: HashMap<(ParticipantId, String), MessageId>,
-    acks: HashMap<(MessageId, ParticipantId), Ack>,
+    idempotency: HashMap<(Address, String), MessageId>,
+    acks: HashMap<(MessageId, Address), Ack>,
+    sessions: HashMap<SessionId, SessionRecord>,
 }
 
 impl MailStore for InMemoryStore {
@@ -278,7 +328,7 @@ impl MailStore for InMemoryStore {
     fn insert_message(
         &mut self,
         message: Message,
-        idempotency: Option<(ParticipantId, String)>,
+        idempotency: Option<(Address, String)>,
     ) -> Result<InsertMessageOutcome, StoreError> {
         if let Some(key) = &idempotency {
             if let Some(existing) = self.idempotency.get(key) {
@@ -297,14 +347,11 @@ impl MailStore for InMemoryStore {
         Ok(self.messages.get(id).cloned())
     }
 
-    fn direct_messages_since(&self, participant: &ParticipantId, since_unix_ms: u64) -> Result<Vec<Message>, StoreError> {
+    fn messages_to_since(&self, to: &Address, since_unix_ms: u64) -> Result<Vec<Message>, StoreError> {
         Ok(self
             .messages
             .values()
-            .filter(|message| {
-                message.created_at_unix_ms >= since_unix_ms
-                    && matches!(&message.to, Address::Direct { participant: p } if p == participant)
-            })
+            .filter(|message| message.created_at_unix_ms >= since_unix_ms && &message.to == to)
             .cloned()
             .collect())
     }
@@ -334,7 +381,7 @@ impl MailStore for InMemoryStore {
         Ok(self.acks.entry((ack.message_id.clone(), ack.reader.clone())).or_insert(ack).clone())
     }
 
-    fn get_ack(&self, message_id: &MessageId, reader: &ParticipantId) -> Result<Option<Ack>, StoreError> {
+    fn get_ack(&self, message_id: &MessageId, reader: &Address) -> Result<Option<Ack>, StoreError> {
         Ok(self.acks.get(&(message_id.clone(), reader.clone())).cloned())
     }
 
@@ -351,6 +398,24 @@ impl MailStore for InMemoryStore {
             .rooms
             .iter()
             .map(|(id, record)| RoomSummary { id: id.clone(), members: record.members.clone() })
+            .collect())
+    }
+
+    fn get_session(&self, session: &SessionId) -> Result<Option<SessionRecord>, StoreError> {
+        Ok(self.sessions.get(session).cloned())
+    }
+
+    fn upsert_session(&mut self, session: SessionId, record: SessionRecord) -> Result<(), StoreError> {
+        self.sessions.insert(session, record);
+        Ok(())
+    }
+
+    fn sessions_of(&self, account: &ParticipantId) -> Result<Vec<(SessionId, SessionRecord)>, StoreError> {
+        Ok(self
+            .sessions
+            .iter()
+            .filter(|(_, record)| &record.account == account)
+            .map(|(id, record)| (id.clone(), record.clone()))
             .collect())
     }
 }
