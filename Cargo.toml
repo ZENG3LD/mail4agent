@@ -32,5 +32,6 @@ subtle = "2"
 members = [
     "crates/mail4agent-api",
     "crates/mail4agent-core",
+    "crates/mail4agent-store-stk",
     "crates/mail4agent-client",
 ]
