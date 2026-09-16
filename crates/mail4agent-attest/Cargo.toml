@@ -1,0 +1,30 @@
+[package]
+name = "mail4agent-attest"
+version = "0.1.0"
+edition = "2021"
+description = "Attests which OS process is on the other end of a loopback TCP connection: (pid, start-time) resolved from the kernel at call time, never a value the caller can claim."
+license = "MIT"
+
+[dependencies]
+# Cross-platform process-detail lookup for one already-known pid --
+# command line and current working directory only. Refreshing a single pid
+# through `System` is far less unsafe code than hand-rolling the
+# `NtQueryInformationProcess`/PEB walk ourselves, for the same answer; see
+# `declared.rs` for why those two fields (and only those two) are wrapped
+# as `Declared` rather than treated as attested.
+sysinfo = { version = "0.34", default-features = false, features = ["system"] }
+thiserror = "2"
+
+[target.'cfg(windows)'.dependencies]
+# GetExtendedTcpTable (owning PID per loopback TCP row, v4 and v6),
+# GetProcessTimes (kernel-recorded process creation time) and
+# QueryFullProcessImageName (kernel-recorded image path) -- the calls
+# docs/gate4agent/research/local-workload-identity-attestation-2026-09-17.md
+# names as kernel-sourced and, resolved synchronously per connection,
+# TOCTOU-safe against PID reuse.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_Networking_WinSock",
+    "Win32_NetworkManagement_IpHelper",
+] }
