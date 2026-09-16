@@ -67,6 +67,17 @@ pub async fn ensure_bootstrap_operator(service: &MailboxService) -> Result<(), B
         std::fs::create_dir_all(parent).map_err(|err| BootstrapError::CreateDir(parent.to_path_buf(), err))?;
     }
 
+    // Refuse BEFORE minting, not after. Registering first and discovering the
+    // file afterwards would leave an operator in the database whose secret was
+    // never written anywhere: the next start finds it already registered, skips
+    // bootstrap, and the mailbox has an operator nobody can ever authenticate
+    // as. `write_key_file_fresh` still uses `create_new`, which closes the race
+    // between this check and that write; this check closes the far likelier
+    // case of a stale file left behind by an earlier database.
+    if key_path.exists() {
+        return Err(BootstrapError::KeyFileAlreadyExists(key_path));
+    }
+
     let permissions = ParticipantPermissions { may_send: true, may_read: true, operator: true };
     let secret = service
         .register_participant(id, Some("bootstrap operator".to_string()), permissions)
