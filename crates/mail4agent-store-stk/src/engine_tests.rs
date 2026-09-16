@@ -86,4 +86,16 @@ fn full_mailbox_scenario_matches_in_memory_store_outcomes() {
         vec![&direct.message_id]
     );
     assert_eq!(bob_inbox_after_leaving.unread, 0);
+
+    // Reproduces `mail4agent-core`'s own
+    // `directory_reports_room_membership_relative_to_the_caller` against
+    // this crate's store: alice never joined the room, bob just left it,
+    // so neither is reported as a current member even though both are
+    // still registered.
+    let directory = engine.directory(&alice).expect("alice reads the directory");
+    let participant_ids: std::collections::BTreeSet<_> =
+        directory.participants.iter().map(|entry| entry.id.clone()).collect();
+    assert_eq!(participant_ids, std::collections::BTreeSet::from([alice, bob]));
+    let room_entry = directory.rooms.iter().find(|entry| entry.id == room_id).expect("the room is listed");
+    assert!(!room_entry.member, "alice never joined this room");
 }

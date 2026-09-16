@@ -3,8 +3,9 @@
 //! [`crate::MailStore`].
 
 use mail4agent_api::{
-    Ack, Address, InboxPage, MailError, Message, MessageId, Participant, ParticipantId, RoomId,
-    SendRequest, SendResponse, UnreadCount, MESSAGE_ID_HEX_LEN, MESSAGE_ID_PREFIX,
+    Ack, Address, Directory, DirectoryEntry, InboxPage, MailError, Message, MessageId, Participant,
+    ParticipantId, RoomEntry, RoomId, SendRequest, SendResponse, UnreadCount, MESSAGE_ID_HEX_LEN,
+    MESSAGE_ID_PREFIX,
 };
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -354,6 +355,44 @@ impl<S: MailStore> MailboxEngine<S> {
         }
         let unread = self.count_unread(target)?;
         Ok(UnreadCount { participant: target.clone(), unread })
+    }
+
+    /// Returns the mailbox's own directory: every registered participant
+    /// (id and label; never a secret digest or a permission bit -- see
+    /// [`crate::ParticipantSummary`]) and every room the mailbox
+    /// tracks, each marked with whether `caller` currently belongs to it.
+    ///
+    /// Gated on `caller.may_read`, the same capability [`Self::inbox`] and
+    /// [`Self::message_get`] require: seeing who else exists is a read of
+    /// the mailbox, not a distinct capability. **A participant is visible
+    /// to every other participant that may read at all, with no exception
+    /// for a listed participant's own permission bits** -- knowing someone
+    /// exists is not the capability that matters (reading their mail is,
+    /// and that is unaffected by this), so gating the directory's
+    /// completeness on each *target's* `may_read`/`may_send` would only
+    /// make it an unreliable directory for no privacy this mailbox
+    /// actually provides.
+    pub fn directory(&self, caller: &ParticipantId) -> Result<Directory, MailError> {
+        let record = self.require_participant(caller)?;
+        self.require_read_permission(&record)?;
+
+        let participants = self
+            .store
+            .list_participants()
+            .map_err(|err| store_unavailable("list_participants", err))?
+            .into_iter()
+            .map(|summary| DirectoryEntry { id: summary.id, label: summary.label })
+            .collect();
+
+        let rooms = self
+            .store
+            .list_rooms()
+            .map_err(|err| store_unavailable("list_rooms", err))?
+            .into_iter()
+            .map(|summary| RoomEntry { member: summary.members.contains(caller), id: summary.id })
+            .collect();
+
+        Ok(Directory { participants, rooms })
     }
 
     fn require_participant(&self, id: &ParticipantId) -> Result<ParticipantRecord, MailError> {

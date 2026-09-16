@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mail4agent_api::{
-    Ack, InboxPage, MailError, Message, MessageId, ParticipantId, RoomId, SendRequest,
+    Ack, Directory, InboxPage, MailError, Message, MessageId, ParticipantId, RoomId, SendRequest,
     SendResponse, UnreadCount,
 };
 use mail4agent_core::{MailStore, MailboxEngine, ParticipantPermissions, StoreError};
@@ -139,6 +139,18 @@ impl MailboxService {
         run_blocking("unread_count_of", move || {
             let guard = engine.blocking_lock();
             guard.unread_count_of(&caller, &target)
+        })
+        .await
+    }
+
+    /// The mailbox's own directory: every registered participant and every
+    /// room, from `caller`'s point of view (see
+    /// [`mail4agent_core::MailboxEngine::directory`]).
+    pub async fn directory(&self, caller: ParticipantId) -> Result<Directory, MailError> {
+        let engine = self.engine.clone();
+        run_blocking("directory", move || {
+            let guard = engine.blocking_lock();
+            guard.directory(&caller)
         })
         .await
     }

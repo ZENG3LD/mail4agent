@@ -15,7 +15,7 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::Json;
 use mail4agent_api::{
-    Ack, AckRequest, AckResponse, Address, InboxPage, InboxRequest, MailError,
+    Ack, AckRequest, AckResponse, Address, Directory, InboxPage, InboxRequest, MailError,
     Message, MessageGetRequest, ParticipantId, SendRequest, SendResponse, UnreadCount,
     UnreadCountRequest,
 };
@@ -128,6 +128,19 @@ async fn unread_impl(
 ) -> Result<UnreadCount, MailError> {
     request.validate()?;
     service.unread_count_of(caller, request.participant).await
+}
+
+pub async fn directory(
+    State(service): State<Arc<MailboxService>>,
+    headers: HeaderMap,
+) -> Result<Json<Directory>, ApiError> {
+    let caller = resolve_caller(&service, &headers).await?;
+    let directory = directory_impl(&service, caller.id).await?;
+    Ok(Json(directory))
+}
+
+pub(crate) async fn directory_impl(service: &MailboxService, caller: ParticipantId) -> Result<Directory, MailError> {
+    service.directory(caller).await
 }
 
 pub async fn whoami(
