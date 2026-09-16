@@ -19,15 +19,22 @@
 //! The engine and its store stay synchronous throughout (see `service.rs`
 //! for the async facade every handler goes through instead of touching
 //! either directly -- `mail4agent/CLAUDE.md`, "The engine is synchronous;
-//! the daemon is not").
+//! the daemon is not"). Every `/mail/*` and `/mcp` handler additionally
+//! resolves which SESSION of the authenticated account is calling, from
+//! the connection itself (`src/identity.rs`) -- that resolution needs this
+//! server's own bound address, which is why `serve` builds one
+//! [`AppState`] shared by every route rather than handing each route a
+//! bare `Arc<MailboxService>`.
 
 mod auth;
 mod bootstrap;
 mod config;
 mod dto;
 mod error;
+mod identity;
 mod routes;
 mod service;
+mod state;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -36,6 +43,7 @@ use std::time::Duration;
 use axum::routing::{delete, post};
 use config::{Config, ConfigError};
 use service::MailboxService;
+use state::AppState;
 use stk::{AuthChain, Server, TokenTier};
 
 #[derive(Debug, thiserror::Error)]
@@ -84,6 +92,7 @@ async fn serve(service: Arc<MailboxService>, bind: SocketAddr) -> Result<(), Mai
     bootstrap::ensure_bootstrap_operator(&service).await?;
 
     let mailbox_auth = auth::MailboxAuth::new(service.clone());
+    let app = Arc::new(AppState { service: service.clone(), bind_addr: bind });
 
     let server = Server::builder()
         .name("mail4agent")
@@ -93,37 +102,42 @@ async fn serve(service: Arc<MailboxService>, bind: SocketAddr) -> Result<(), Mai
         .with_auth_chain(AuthChain::new().layer(mailbox_auth))
         .post_tier(
             "/mail/send",
-            post(routes::mail::send).with_state(service.clone()),
+            post(routes::mail::send).with_state(app.clone()),
             TokenTier::Authenticated,
         )
         .post_tier(
             "/mail/inbox",
-            post(routes::mail::inbox).with_state(service.clone()),
+            post(routes::mail::inbox).with_state(app.clone()),
             TokenTier::Authenticated,
         )
         .post_tier(
             "/mail/ack",
-            post(routes::mail::ack).with_state(service.clone()),
+            post(routes::mail::ack).with_state(app.clone()),
             TokenTier::Authenticated,
         )
         .post_tier(
             "/mail/get",
-            post(routes::mail::get).with_state(service.clone()),
+            post(routes::mail::get).with_state(app.clone()),
             TokenTier::Authenticated,
         )
         .post_tier(
             "/mail/unread",
-            post(routes::mail::unread).with_state(service.clone()),
+            post(routes::mail::unread).with_state(app.clone()),
             TokenTier::Authenticated,
         )
         .post_tier(
             "/mail/whoami",
-            post(routes::mail::whoami).with_state(service.clone()),
+            post(routes::mail::whoami).with_state(app.clone()),
+            TokenTier::Authenticated,
+        )
+        .post_tier(
+            "/mail/status",
+            post(routes::mail::status).with_state(app.clone()),
             TokenTier::Authenticated,
         )
         .post_tier(
             "/mail/directory",
-            post(routes::mail::directory).with_state(service.clone()),
+            post(routes::mail::directory).with_state(app.clone()),
             TokenTier::Authenticated,
         )
         // MCP door onto the same mail surface -- `mail4agent/CLAUDE.md`,
@@ -131,38 +145,38 @@ async fn serve(service: Arc<MailboxService>, bind: SocketAddr) -> Result<(), Mai
         // operator calling a mail tool is just a participant.
         .post_tier(
             "/mcp",
-            post(routes::mcp::handle_mcp_post).with_state(service.clone()),
+            post(routes::mcp::handle_mcp_post).with_state(app.clone()),
             TokenTier::Authenticated,
         )
         .delete_tier("/mcp", delete(routes::mcp::handle_mcp_delete), TokenTier::Authenticated)
         .post_tier(
             "/admin/participant",
-            post(routes::admin::register_participant).with_state(service.clone()),
+            post(routes::admin::register_participant).with_state(app.clone()),
             TokenTier::Admin,
         )
         .post_tier(
             "/admin/participant/rotate",
-            post(routes::admin::rotate_participant).with_state(service.clone()),
+            post(routes::admin::rotate_participant).with_state(app.clone()),
             TokenTier::Admin,
         )
         .post_tier(
             "/admin/participant/remove",
-            post(routes::admin::remove_participant).with_state(service.clone()),
+            post(routes::admin::remove_participant).with_state(app.clone()),
             TokenTier::Admin,
         )
         .post_tier(
             "/admin/room",
-            post(routes::admin::create_room).with_state(service.clone()),
+            post(routes::admin::create_room).with_state(app.clone()),
             TokenTier::Admin,
         )
         .post_tier(
             "/admin/room/member/add",
-            post(routes::admin::add_room_member).with_state(service.clone()),
+            post(routes::admin::add_room_member).with_state(app.clone()),
             TokenTier::Admin,
         )
         .post_tier(
             "/admin/room/member/remove",
-            post(routes::admin::remove_room_member).with_state(service.clone()),
+            post(routes::admin::remove_room_member).with_state(app.clone()),
             TokenTier::Admin,
         )
         // `GET /health` is the framework's own built-in route (always

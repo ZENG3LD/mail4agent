@@ -7,18 +7,31 @@
 //! contract for mail transport itself; this module is what layers the
 //! registry admin surface on top, entirely inside the daemon that owns it.
 
-use mail4agent_api::{Address, ParticipantId, RoomId};
+use mail4agent_api::{Address, ParticipantId, RoomId, SessionCard};
 use mail4agent_core::ParticipantPermissions;
 use serde::{Deserialize, Serialize};
 
-/// Answers `POST /mail/whoami`: the caller's own address, label and room
-/// memberships -- so a session that has not written yet still knows where
-/// it can be answered.
+/// Answers `POST /mail/whoami`: the caller's own SESSION address, its
+/// account's label, its room memberships, and its own card -- so a session
+/// that has not written yet still knows where it can be answered, and can
+/// see what the mailbox knows about it (which parts are attested and which
+/// are not).
 #[derive(Debug, Serialize)]
 pub struct WhoAmIResponse {
     pub address: Address,
     pub label: Option<String>,
     pub rooms: Vec<RoomId>,
+    /// `None` only if `address` is somehow not a session -- every
+    /// `/mail/*` and `/mcp` caller is session-resolved by construction
+    /// (`crate::identity`), so in practice this is always `Some`.
+    pub card: Option<SessionCard>,
+}
+
+/// Answers `POST /mail/status`: the session's own card after the update,
+/// so the caller can confirm what was recorded.
+#[derive(Debug, Serialize)]
+pub struct StatusResponse {
+    pub card: SessionCard,
 }
 
 /// Body for `POST /admin/participant`.

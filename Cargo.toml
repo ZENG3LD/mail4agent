@@ -16,6 +16,9 @@ path = "src/main.rs"
 mail4agent-api = { path = "crates/mail4agent-api", version = "0.1.0" }
 mail4agent-core = { path = "crates/mail4agent-core", version = "0.1.0" }
 mail4agent-store-stk = { path = "crates/mail4agent-store-stk", version = "0.1.0" }
+# Resolves which OS process is on the other end of a request's connection --
+# see `src/identity.rs`, "Point 1" of the session-identity work.
+mail4agent-attest = { path = "crates/mail4agent-attest", version = "0.1.0" }
 
 # The stk facade -- name/bind/auth-chain/router/manifest/db wiring. Depended
 # on directly rather than the sub-crates it re-exports (see
@@ -39,6 +42,10 @@ async-trait = "0.1"
 directories = "6"
 # Parses `mail4agent.toml`.
 toml = "0.8"
+# Derives a stable SessionId from a `(pid, started_at_unix_ms)` pair --
+# same versions `mail4agent-core` already pins for the same job.
+sha2 = "0.10"
+hex = "0.4"
 
 # Internal workspace; independent from any parent workspace.
 [workspace]
