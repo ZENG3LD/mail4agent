@@ -44,6 +44,7 @@ toml = "0.8"
 [workspace]
 members = [
     "crates/mail4agent-api",
+    "crates/mail4agent-attest",
     "crates/mail4agent-core",
     "crates/mail4agent-store-stk",
     "crates/mail4agent-client",
