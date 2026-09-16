@@ -10,31 +10,36 @@
 //! Two handles share one underlying [`stk::Db`]: `engine` (mutating and
 //! authenticating calls, serialised through a [`tokio::sync::Mutex`]) and
 //! `reader` (plain [`MailStore`] reads -- `get_participant`,
-//! `rooms_containing` -- that [`MailboxEngine`]'s own public surface does
-//! not expose: the operator bit the auth layer needs, and the room
-//! memberships `/mail/whoami` needs). Both are already-public trait
-//! methods on a committed crate ([`mail4agent_core::MailStore`],
-//! implemented by [`SqliteMailStore`]); this facade reads them directly
-//! through a second store handle over the same connection rather than
-//! growing `mail4agent-core`'s own API for two reads.
+//! `rooms_containing`, `get_session` -- that [`MailboxEngine`]'s own public
+//! surface does not expose: the operator bit the auth layer needs, the room
+//! memberships `/mail/whoami` needs, and the session card `/mail/whoami`
+//! and `/mail/status` need back). Both are already-public trait methods on
+//! a committed crate ([`mail4agent_core::MailStore`], implemented by
+//! [`SqliteMailStore`]); this facade reads them directly through a second
+//! store handle over the same connection rather than growing
+//! `mail4agent-core`'s own API for these reads.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mail4agent_api::{
-    Ack, Directory, InboxPage, MailError, Message, MessageId, ParticipantId, RoomId, SendRequest,
-    SendResponse, UnreadCount,
+    Ack, Address, Directory, InboxPage, MailError, Message, MessageId, ParticipantId, RoomId, SendRequest,
+    SendResponse, SessionCard, SessionId, UnreadCount,
 };
 use mail4agent_core::{MailStore, MailboxEngine, ParticipantPermissions, StoreError};
 use mail4agent_store_stk::SqliteMailStore;
 use tokio::sync::Mutex as AsyncMutex;
 
 /// A caller resolved from its bearer secret: everything a handler needs to
-/// know about who it is talking to, from one call to
+/// know about the **account**, from one call to
 /// [`MailboxService::authenticate`]. Carries only what a handler actually
 /// reads (`id`, `label`, `operator`) -- `may_send`/`may_read` are enforced
 /// by the engine itself on every call that cares, so this facade does not
 /// duplicate that check by also surfacing the raw flags here.
+///
+/// This is the account, never the session -- see `crate::identity` for how
+/// a `/mail/*` or `/mcp` handler turns this into the caller's own
+/// [`Address`] before it ever touches the mail surface.
 #[derive(Clone, Debug)]
 pub struct AuthenticatedParticipant {
     pub id: ParticipantId,
@@ -60,15 +65,17 @@ impl MailboxService {
     }
 
     /// Authenticates `token` against the participant registry. This is the
-    /// one place a bearer becomes a [`ParticipantId`] on this facade --
-    /// `MailboxAuth` (the `stk::AuthLayer` impl) calls it to grant tiers,
-    /// and every handler calls it again to learn *who* it is talking to.
-    /// The participant id is never carried in the granted tiers (a
-    /// `TokenTier::Scope` is a capability marker, not a place to smuggle a
-    /// subject), so re-asking this same question, one more indexed digest
-    /// read, is the only way a handler learns it -- deliberate, not an
-    /// oversight (`mail4agent/CLAUDE.md`'s "a sender is never a field the
-    /// caller fills in", applied at the HTTP boundary too).
+    /// one place a bearer becomes a [`ParticipantId`] (an **account**) on
+    /// this facade -- `MailboxAuth` (the `stk::AuthLayer` impl) calls it to
+    /// grant tiers, and every handler calls it again to learn *which
+    /// account* it is talking to, before resolving *which session* of that
+    /// account (`crate::identity::resolve_session`). The participant id is
+    /// never carried in the granted tiers (a `TokenTier::Scope` is a
+    /// capability marker, not a place to smuggle a subject), so re-asking
+    /// this same question, one more indexed digest read, is the only way a
+    /// handler learns it -- deliberate, not an oversight
+    /// (`mail4agent/CLAUDE.md`'s "a sender is never a field the caller
+    /// fills in", applied at the HTTP boundary too).
     pub async fn authenticate(&self, token: &str) -> Result<AuthenticatedParticipant, MailError> {
         let engine = self.engine.clone();
         let reader = self.reader.clone();
@@ -87,7 +94,61 @@ impl MailboxService {
         .await
     }
 
-    pub async fn send(&self, sender: ParticipantId, request: SendRequest) -> Result<SendResponse, MailError> {
+    /// Registers a session, or refreshes an already-registered one --
+    /// see [`mail4agent_core::MailboxEngine::ensure_session`]. The only way
+    /// a session enters the mailbox at all; called from
+    /// `crate::identity::resolve_session` on every `/mail/*` and `/mcp`
+    /// request, never directly from a route handler.
+    pub async fn ensure_session(
+        &self,
+        account: ParticipantId,
+        session_id: SessionId,
+        card: SessionCard,
+        now_unix_ms: u64,
+    ) -> Result<SessionId, MailError> {
+        let engine = self.engine.clone();
+        run_blocking("ensure_session", move || {
+            let mut guard = engine.blocking_lock();
+            guard.ensure_session(account, session_id, card, now_unix_ms)
+        })
+        .await
+    }
+
+    /// Sets a session's declared group -- what it is working on, its role,
+    /// which session spawned it. The only writer of that group (see
+    /// [`mail4agent_core::MailboxEngine::set_declared`]); reached through
+    /// `POST /mail/status` / `m4a_mail_status`.
+    pub async fn set_declared(
+        &self,
+        session: SessionId,
+        working_on: Option<String>,
+        role: Option<String>,
+        parent: Option<SessionId>,
+    ) -> Result<(), MailError> {
+        let engine = self.engine.clone();
+        run_blocking("set_declared", move || {
+            let mut guard = engine.blocking_lock();
+            guard.set_declared(&session, working_on, role, parent)
+        })
+        .await
+    }
+
+    /// The stored card for `session`, or `None` if it has never reached
+    /// [`Self::ensure_session`]. Reads through [`MailStore::get_session`]
+    /// directly on `reader` -- `/mail/whoami` and `/mail/status` are the
+    /// two callers.
+    pub async fn session_card(&self, session: SessionId) -> Result<Option<SessionCard>, MailError> {
+        let reader = self.reader.clone();
+        run_blocking("get_session", move || {
+            reader
+                .get_session(&session)
+                .map(|found| found.map(|record| record.card))
+                .map_err(|err| store_unavailable("get_session", err))
+        })
+        .await
+    }
+
+    pub async fn send(&self, sender: Address, request: SendRequest) -> Result<SendResponse, MailError> {
         let engine = self.engine.clone();
         let now = now_unix_ms();
         run_blocking("send", move || {
@@ -97,44 +158,35 @@ impl MailboxService {
         .await
     }
 
-    pub async fn inbox(
-        &self,
-        reader_id: ParticipantId,
-        since_unix_ms: u64,
-        limit: u16,
-    ) -> Result<InboxPage, MailError> {
+    pub async fn inbox(&self, reader_address: Address, since_unix_ms: u64, limit: u16) -> Result<InboxPage, MailError> {
         let engine = self.engine.clone();
         run_blocking("inbox", move || {
             let guard = engine.blocking_lock();
-            guard.inbox(&reader_id, since_unix_ms, limit)
+            guard.inbox(&reader_address, since_unix_ms, limit)
         })
         .await
     }
 
-    pub async fn ack(&self, reader_id: ParticipantId, message_id: MessageId) -> Result<Ack, MailError> {
+    pub async fn ack(&self, reader_address: Address, message_id: MessageId) -> Result<Ack, MailError> {
         let engine = self.engine.clone();
         let now = now_unix_ms();
         run_blocking("ack", move || {
             let mut guard = engine.blocking_lock();
-            guard.ack(&reader_id, &message_id, now)
+            guard.ack(&reader_address, &message_id, now)
         })
         .await
     }
 
-    pub async fn message_get(&self, reader_id: ParticipantId, message_id: MessageId) -> Result<Message, MailError> {
+    pub async fn message_get(&self, reader_address: Address, message_id: MessageId) -> Result<Message, MailError> {
         let engine = self.engine.clone();
         run_blocking("message_get", move || {
             let guard = engine.blocking_lock();
-            guard.message_get(&reader_id, &message_id)
+            guard.message_get(&reader_address, &message_id)
         })
         .await
     }
 
-    pub async fn unread_count_of(
-        &self,
-        caller: ParticipantId,
-        target: ParticipantId,
-    ) -> Result<UnreadCount, MailError> {
+    pub async fn unread_count_of(&self, caller: Address, target: Address) -> Result<UnreadCount, MailError> {
         let engine = self.engine.clone();
         run_blocking("unread_count_of", move || {
             let guard = engine.blocking_lock();
@@ -143,14 +195,17 @@ impl MailboxService {
         .await
     }
 
-    /// The mailbox's own directory: every registered participant and every
-    /// room, from `caller`'s point of view (see
-    /// [`mail4agent_core::MailboxEngine::directory`]).
-    pub async fn directory(&self, caller: ParticipantId) -> Result<Directory, MailError> {
+    /// The mailbox's own directory: every registered account (with its
+    /// live sessions nested under it) and every room, from `caller`'s point
+    /// of view (see [`mail4agent_core::MailboxEngine::directory`]).
+    /// `mail4agent_attest::is_alive` is the liveness check the engine asks
+    /// for -- `mail4agent-core` learns nothing about processes itself, and
+    /// this facade is exactly the boundary where that fact gets supplied.
+    pub async fn directory(&self, caller: Address) -> Result<Directory, MailError> {
         let engine = self.engine.clone();
         run_blocking("directory", move || {
             let guard = engine.blocking_lock();
-            guard.directory(&caller)
+            guard.directory(&caller, &mail4agent_attest::is_alive)
         })
         .await
     }
@@ -273,7 +328,12 @@ fn store_unavailable(operation: &'static str, err: StoreError) -> MailError {
     MailError::StoreUnavailable { operation: operation.to_string() }
 }
 
-fn now_unix_ms() -> u64 {
+/// The current wall clock, in milliseconds since the Unix epoch. `pub(crate)`
+/// so `crate::identity::resolve_session` -- which needs "now" for
+/// `MailboxService::ensure_session` the same way every mutating method
+/// here does -- reads it from this one place rather than duplicating
+/// `SystemTime::now()` handling.
+pub(crate) fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)

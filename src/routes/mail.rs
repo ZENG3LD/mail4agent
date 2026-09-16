@@ -1,13 +1,13 @@
-//! `/mail/*` -- routes for participants. Every one of these derives the
-//! caller from the presented bearer; none of them accepts a sender
-//! (`mail4agent/CLAUDE.md`, "The rule that defines this service"). Each
-//! axum handler only extracts and renders; the real work lives in the
-//! `*_impl` function beside it, which takes an already-resolved caller and
-//! typed arguments and returns a plain `Result<_, MailError>` -- exactly
-//! the shape a later MCP `tools/call` dispatcher will call directly,
-//! without moving anything (`mail4agent/CLAUDE.md`, "`POST /mcp` ...
-//! dispatching into the very same `*_impl` functions the HTTP routes
-//! call").
+//! `/mail/*` -- routes for sessions. Every one of these derives the caller
+//! from the presented bearer PLUS the connection it arrived on
+//! (`mail4agent/CLAUDE.md`, "The rule that defines this service"; see
+//! `crate::identity` for how); none of them accepts a sender. Each axum
+//! handler only extracts and renders; the real work lives in the `*_impl`
+//! function beside it, which takes an already-resolved caller and typed
+//! arguments and returns a plain `Result<_, MailError>` -- exactly the
+//! shape a later MCP `tools/call` dispatcher will call directly, without
+//! moving anything (`mail4agent/CLAUDE.md`, "`POST /mcp` ... dispatching
+//! into the very same `*_impl` functions the HTTP routes call").
 
 use std::sync::Arc;
 
@@ -16,150 +16,204 @@ use axum::http::HeaderMap;
 use axum::Json;
 use mail4agent_api::{
     Ack, AckRequest, AckResponse, Address, Directory, InboxPage, InboxRequest, MailError,
-    Message, MessageGetRequest, ParticipantId, SendRequest, SendResponse, UnreadCount,
+    Message, MessageGetRequest, SendRequest, SendResponse, SessionDeclared, UnreadCount,
     UnreadCountRequest,
 };
 
 use crate::auth::extract_bearer;
-use crate::dto::WhoAmIResponse;
+use crate::dto::{StatusResponse, WhoAmIResponse};
 use crate::error::{ApiError, ApiJson};
-use crate::service::{AuthenticatedParticipant, MailboxService};
+use crate::identity::{resolve_session, PeerAddr, SessionError};
+use crate::service::{now_unix_ms, AuthenticatedParticipant, MailboxService};
+use crate::state::AppState;
 
-/// Resolves the caller from the request's own bearer, through the same
-/// [`MailboxService::authenticate`] the auth layer already called once to
-/// grant the tier that let this handler run at all. Shared by every
-/// `/mail/*` and `/admin/*` handler (see `auth.rs`'s module doc for why
-/// this second lookup is deliberate rather than redundant).
-pub(crate) async fn resolve_caller(
+/// Authenticates the bearer against the participant registry, resolving
+/// only the **account** -- no session. Shared by `/admin/*` (which acts on
+/// accounts, never sessions) and by [`resolve_caller`] (the first half of
+/// its own resolution).
+pub(crate) async fn authenticate_caller(
     service: &MailboxService,
     headers: &HeaderMap,
 ) -> Result<AuthenticatedParticipant, ApiError> {
     let token = extract_bearer(headers)
-        .ok_or_else(|| ApiError(MailError::PermissionDenied { need: "mail:authenticate".to_string() }))?;
+        .ok_or_else(|| ApiError::Mail(MailError::PermissionDenied { need: "mail:authenticate".to_string() }))?;
     service.authenticate(&token).await.map_err(ApiError::from)
 }
 
+/// Resolves the caller's own **session** address from this request: the
+/// bearer proves the account ([`authenticate_caller`]); the connection
+/// this request arrived on proves which of the account's sessions is
+/// calling (`crate::identity::resolve_session`, kernel attestation under
+/// the hood). Shared by every `/mail/*` and `/mcp` handler -- see
+/// `crate::identity`'s module doc for why there is no fallback to the bare
+/// account on any failure here.
+///
+/// Returns the resolved account alongside the session address because a
+/// caller such as `whoami` needs both, and the account was already paid
+/// for by [`authenticate_caller`] -- no second bearer lookup.
+pub(crate) async fn resolve_caller(
+    app: &AppState,
+    headers: &HeaderMap,
+    peer: PeerAddr,
+) -> Result<(AuthenticatedParticipant, Address), ApiError> {
+    let participant = authenticate_caller(&app.service, headers).await?;
+    let peer_addr = peer.0.ok_or(SessionError::MissingConnectInfo)?;
+    let now = now_unix_ms();
+    let address = resolve_session(&app.service, participant.id.clone(), peer_addr, app.bind_addr, now).await?;
+    Ok((participant, address))
+}
+
 pub async fn send(
-    State(service): State<Arc<MailboxService>>,
+    State(app): State<Arc<AppState>>,
     headers: HeaderMap,
+    peer: PeerAddr,
     ApiJson(request): ApiJson<SendRequest>,
 ) -> Result<Json<SendResponse>, ApiError> {
-    let caller = resolve_caller(&service, &headers).await?;
-    let response = send_impl(&service, caller.id, request).await?;
+    let (_, caller) = resolve_caller(&app, &headers, peer).await?;
+    let response = send_impl(&app.service, caller, request).await?;
     Ok(Json(response))
 }
 
-pub(crate) async fn send_impl(
-    service: &MailboxService,
-    sender: ParticipantId,
-    request: SendRequest,
-) -> Result<SendResponse, MailError> {
+pub(crate) async fn send_impl(service: &MailboxService, sender: Address, request: SendRequest) -> Result<SendResponse, MailError> {
     service.send(sender, request).await
 }
 
 pub async fn inbox(
-    State(service): State<Arc<MailboxService>>,
+    State(app): State<Arc<AppState>>,
     headers: HeaderMap,
+    peer: PeerAddr,
     ApiJson(request): ApiJson<InboxRequest>,
 ) -> Result<Json<InboxPage>, ApiError> {
-    let caller = resolve_caller(&service, &headers).await?;
-    let page = inbox_impl(&service, caller.id, request).await?;
+    let (_, caller) = resolve_caller(&app, &headers, peer).await?;
+    let page = inbox_impl(&app.service, caller, request).await?;
     Ok(Json(page))
 }
 
-pub(crate) async fn inbox_impl(
-    service: &MailboxService,
-    reader: ParticipantId,
-    request: InboxRequest,
-) -> Result<InboxPage, MailError> {
+pub(crate) async fn inbox_impl(service: &MailboxService, reader: Address, request: InboxRequest) -> Result<InboxPage, MailError> {
     request.validate()?;
     let since_unix_ms = request.since_unix_ms.unwrap_or(0);
     service.inbox(reader, since_unix_ms, request.limit).await
 }
 
 pub async fn ack(
-    State(service): State<Arc<MailboxService>>,
+    State(app): State<Arc<AppState>>,
     headers: HeaderMap,
+    peer: PeerAddr,
     ApiJson(request): ApiJson<AckRequest>,
 ) -> Result<Json<AckResponse>, ApiError> {
-    let caller = resolve_caller(&service, &headers).await?;
-    let ack = ack_impl(&service, caller.id, request).await?;
+    let (_, caller) = resolve_caller(&app, &headers, peer).await?;
+    let ack = ack_impl(&app.service, caller, request).await?;
     Ok(Json(AckResponse { ack }))
 }
 
-pub(crate) async fn ack_impl(service: &MailboxService, reader: ParticipantId, request: AckRequest) -> Result<Ack, MailError> {
+pub(crate) async fn ack_impl(service: &MailboxService, reader: Address, request: AckRequest) -> Result<Ack, MailError> {
     request.validate()?;
     service.ack(reader, request.message_id).await
 }
 
 pub async fn get(
-    State(service): State<Arc<MailboxService>>,
+    State(app): State<Arc<AppState>>,
     headers: HeaderMap,
+    peer: PeerAddr,
     ApiJson(request): ApiJson<MessageGetRequest>,
 ) -> Result<Json<Message>, ApiError> {
-    let caller = resolve_caller(&service, &headers).await?;
-    let message = get_impl(&service, caller.id, request).await?;
+    let (_, caller) = resolve_caller(&app, &headers, peer).await?;
+    let message = get_impl(&app.service, caller, request).await?;
     Ok(Json(message))
 }
 
-pub(crate) async fn get_impl(
-    service: &MailboxService,
-    reader: ParticipantId,
-    request: MessageGetRequest,
-) -> Result<Message, MailError> {
+pub(crate) async fn get_impl(service: &MailboxService, reader: Address, request: MessageGetRequest) -> Result<Message, MailError> {
     request.validate()?;
     service.message_get(reader, request.message_id).await
 }
 
 pub async fn unread(
-    State(service): State<Arc<MailboxService>>,
+    State(app): State<Arc<AppState>>,
     headers: HeaderMap,
+    peer: PeerAddr,
     ApiJson(request): ApiJson<UnreadCountRequest>,
 ) -> Result<Json<UnreadCount>, ApiError> {
-    let caller = resolve_caller(&service, &headers).await?;
-    let count = unread_impl(&service, caller.id, request).await?;
+    let (_, caller) = resolve_caller(&app, &headers, peer).await?;
+    let count = unread_impl(&app.service, caller, request).await?;
     Ok(Json(count))
 }
 
-async fn unread_impl(
-    service: &MailboxService,
-    caller: ParticipantId,
-    request: UnreadCountRequest,
-) -> Result<UnreadCount, MailError> {
+pub(crate) async fn unread_impl(service: &MailboxService, caller: Address, request: UnreadCountRequest) -> Result<UnreadCount, MailError> {
     request.validate()?;
-    service.unread_count_of(caller, request.participant).await
+    service.unread_count_of(caller, request.target).await
 }
 
 pub async fn directory(
-    State(service): State<Arc<MailboxService>>,
+    State(app): State<Arc<AppState>>,
     headers: HeaderMap,
+    peer: PeerAddr,
 ) -> Result<Json<Directory>, ApiError> {
-    let caller = resolve_caller(&service, &headers).await?;
-    let directory = directory_impl(&service, caller.id).await?;
+    let (_, caller) = resolve_caller(&app, &headers, peer).await?;
+    let directory = directory_impl(&app.service, caller).await?;
     Ok(Json(directory))
 }
 
-pub(crate) async fn directory_impl(service: &MailboxService, caller: ParticipantId) -> Result<Directory, MailError> {
+pub(crate) async fn directory_impl(service: &MailboxService, caller: Address) -> Result<Directory, MailError> {
     service.directory(caller).await
 }
 
 pub async fn whoami(
-    State(service): State<Arc<MailboxService>>,
+    State(app): State<Arc<AppState>>,
     headers: HeaderMap,
+    peer: PeerAddr,
 ) -> Result<Json<WhoAmIResponse>, ApiError> {
-    let caller = resolve_caller(&service, &headers).await?;
-    let response = whoami_impl(&service, caller).await?;
+    let (participant, caller) = resolve_caller(&app, &headers, peer).await?;
+    let response = whoami_impl(&app.service, participant, caller).await?;
     Ok(Json(response))
 }
 
 pub(crate) async fn whoami_impl(
     service: &MailboxService,
-    caller: AuthenticatedParticipant,
+    participant: AuthenticatedParticipant,
+    caller: Address,
 ) -> Result<WhoAmIResponse, MailError> {
-    let rooms = service.rooms_of(caller.id.clone()).await?;
-    Ok(WhoAmIResponse {
-        address: Address::Direct { participant: caller.id },
-        label: caller.label,
-        rooms,
-    })
+    let rooms = service.rooms_of(participant.id).await?;
+    let card = match &caller {
+        Address::Session { session, .. } => service.session_card(session.clone()).await?,
+        Address::Direct { .. } | Address::Room { .. } => None,
+    };
+    Ok(WhoAmIResponse { address: caller, label: participant.label, rooms, card })
+}
+
+pub async fn status(
+    State(app): State<Arc<AppState>>,
+    headers: HeaderMap,
+    peer: PeerAddr,
+    ApiJson(request): ApiJson<SessionDeclared>,
+) -> Result<Json<StatusResponse>, ApiError> {
+    let (_, caller) = resolve_caller(&app, &headers, peer).await?;
+    let response = status_impl(&app.service, caller, request).await?;
+    Ok(Json(response))
+}
+
+/// The only writer of a session's declared group
+/// (`mail4agent_core::MailboxEngine::set_declared`, reached here). Refuses
+/// `Malformed` if `caller` is not itself a session -- declaring what a
+/// caller is working on makes no sense for a bare account, and every real
+/// `/mail/*`/`/mcp` caller is session-resolved by construction, so this
+/// should not fire in practice.
+pub(crate) async fn status_impl(
+    service: &MailboxService,
+    caller: Address,
+    request: SessionDeclared,
+) -> Result<StatusResponse, MailError> {
+    request.validate()?;
+    let Address::Session { session, .. } = &caller else {
+        return Err(MailError::Malformed {
+            field: "caller".to_string(),
+            reason: "declaring status requires a session address, not a bare account".to_string(),
+        });
+    };
+    let session = session.clone();
+    service.set_declared(session.clone(), request.working_on, request.role, request.parent).await?;
+    let card = service
+        .session_card(session.clone())
+        .await?
+        .ok_or_else(|| MailError::UnknownSession { session })?;
+    Ok(StatusResponse { card })
 }

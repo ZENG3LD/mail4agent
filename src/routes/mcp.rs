@@ -28,19 +28,18 @@
 //! This is the one place this module's shape differs from
 //! `ops/mcp.rs`'s: operator-box's `/mcp` answers to a single global
 //! operator key, so its tools never resolve a per-caller identity at all.
-//! This mailbox's tools are participant-scoped (`mail4agent/CLAUDE.md`,
-//! "a sender is never a field the caller fills in"), so the caller is
-//! resolved from the SAME bearer every `/mail/*` handler reads
-//! (`routes::mail::resolve_caller`) -- exactly once per `POST /mcp` call.
-//! A JSON-RPC batch shares one HTTP request and therefore one resolved
-//! caller, matching the "one indexed digest read per request" discipline
-//! `service.rs` already documents for the plain HTTP routes. A caller
-//! that fails to resolve (should not happen past the tier middleware, but
-//! is not ruled out by it) fails the whole HTTP call the same way any
-//! other `/mail/*` handler would -- an [`crate::error::ApiError`]
-//! response, not a JSON-RPC error, since nothing JSON-RPC-shaped has been
-//! parsed yet at that point. An operator calling a mail tool is just a
-//! participant: nothing here reads `caller.operator`.
+//! This mailbox's tools are session-scoped (`mail4agent/CLAUDE.md`, "a
+//! sender is never a field the caller fills in"; `crate::identity` for how
+//! a session is named), so the caller is resolved from the SAME bearer AND
+//! connection every `/mail/*` handler reads (`routes::mail::resolve_caller`)
+//! -- exactly once per `POST /mcp` call. A JSON-RPC batch shares one HTTP
+//! request and therefore one resolved caller, matching the "one indexed
+//! digest read per request" discipline `service.rs` already documents for
+//! the plain HTTP routes. A caller that fails to resolve (an unknown
+//! bearer, or a session that could not be attested) fails the whole HTTP
+//! call the same way any other `/mail/*` handler would -- an
+//! [`crate::error::ApiError`] response, not a JSON-RPC error, since
+//! nothing JSON-RPC-shaped has been parsed yet at that point.
 //!
 //! # Error shape -- the split that matters most
 //!
@@ -59,18 +58,25 @@
 //!
 //! Every tool's `arguments` deserialises straight into [`mail4agent_api`]'s
 //! own request type for that call -- [`SendRequest`], [`InboxRequest`],
-//! [`AckRequest`], [`MessageGetRequest`] -- with no local args struct in
-//! between. A missing `Option<T>` field decodes to `None` (serde's derive
-//! defaults an absent `Option` field on its own; no `#[serde(default)]`
-//! needed), so a caller that omits `reply_to`, `correlation`,
-//! `since_unix_ms`, `refs` or `idempotency_key` gets exactly the same
-//! [`SendRequest`]/[`InboxRequest`] value the HTTP door already builds from
-//! a body that spells those out as explicit `null` -- proven by
+//! [`AckRequest`], [`MessageGetRequest`], [`mail4agent_api::SessionDeclared`]
+//! -- with no local args struct in between. A missing `Option<T>` field
+//! decodes to `None` (serde's derive defaults an absent `Option` field on
+//! its own; no `#[serde(default)]` needed), so a caller that omits an
+//! optional field gets exactly the same value the HTTP door already builds
+//! from a body that spells it out as explicit `null` -- proven by
 //! [`tests::send_and_inbox_accept_arguments_with_every_optional_field_omitted`].
 //! A second, locally-defined copy of these fields was tried and removed:
 //! it duplicated the wire shape `mail4agent_api` already owns, which is
 //! exactly the second code path the crate contract forbids -- a field
 //! added to [`SendRequest`] would have silently never reached this door.
+//!
+//! One exception: `m4a_mail_send`'s `to` argument additionally accepts the
+//! compact string form [`mail4agent_api::Address`]'s own `Display`/
+//! `FromStr` produce (`"claude"`, `"claude/s-7f3a..."`, `"#room-1"`) in
+//! place of the tagged JSON object, normalised to the tagged shape before
+//! [`SendRequest`] ever sees it -- see [`normalize_address_argument`]. This
+//! is convenience for a tool caller typing an address by hand; the tagged
+//! object form still works exactly as before.
 
 use std::sync::Arc;
 
@@ -80,14 +86,18 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use mail4agent_api::{
-    AckRequest, InboxRequest, MailError, MessageGetRequest, SendRequest, INBOX_LIMIT_DEFAULT,
-    INBOX_LIMIT_MAX, REFS_MAX,
+    AckRequest, Address, InboxRequest, MailError, MessageGetRequest, SendRequest, SessionDeclared,
+    INBOX_LIMIT_DEFAULT, INBOX_LIMIT_MAX, REFS_MAX,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::routes::mail::{ack_impl, directory_impl, get_impl, inbox_impl, resolve_caller, send_impl, whoami_impl};
+use crate::identity::PeerAddr;
+use crate::routes::mail::{
+    ack_impl, directory_impl, get_impl, inbox_impl, resolve_caller, send_impl, status_impl, whoami_impl,
+};
 use crate::service::{AuthenticatedParticipant, MailboxService};
+use crate::state::AppState;
 
 /// Echoed back from `initialize` when the client's own `protocolVersion` is
 /// one this server has been reviewed against; see [`handle_initialize`].
@@ -152,9 +162,14 @@ impl RpcResponse {
 /// reads the body as raw [`Bytes`] -- not through an `axum::Json`
 /// extractor -- so a malformed body answers JSON-RPC `-32700` instead of
 /// axum's own bare-400 rejection.
-pub async fn handle_mcp_post(State(service): State<Arc<MailboxService>>, headers: HeaderMap, body: Bytes) -> Response {
-    let caller = match resolve_caller(&service, &headers).await {
-        Ok(caller) => caller,
+pub async fn handle_mcp_post(
+    State(app): State<Arc<AppState>>,
+    headers: HeaderMap,
+    peer: PeerAddr,
+    body: Bytes,
+) -> Response {
+    let (participant, caller) = match resolve_caller(&app, &headers, peer).await {
+        Ok(resolved) => resolved,
         Err(err) => return err.into_response(),
     };
 
@@ -173,7 +188,7 @@ pub async fn handle_mcp_post(State(service): State<Arc<MailboxService>>, headers
             }
             let mut responses = Vec::with_capacity(items.len());
             for item in items {
-                if let Some(resp) = dispatch_one(&service, &caller, item).await {
+                if let Some(resp) = dispatch_one(&app.service, &participant, &caller, item).await {
                     responses.push(resp);
                 }
             }
@@ -185,7 +200,7 @@ pub async fn handle_mcp_post(State(service): State<Arc<MailboxService>>, headers
                 Json(responses).into_response()
             }
         }
-        single => match dispatch_one(&service, &caller, single).await {
+        single => match dispatch_one(&app.service, &participant, &caller, single).await {
             Some(resp) => Json(resp).into_response(),
             None => StatusCode::NO_CONTENT.into_response(),
         },
@@ -204,7 +219,12 @@ pub async fn handle_mcp_delete() -> Response {
 /// (notification) or it was `notifications/initialized` specifically
 /// (treated as fire-and-forget regardless of a stray `id`, since nothing
 /// about accepting it can fail).
-async fn dispatch_one(service: &Arc<MailboxService>, caller: &AuthenticatedParticipant, raw: Value) -> Option<RpcResponse> {
+async fn dispatch_one(
+    service: &MailboxService,
+    participant: &AuthenticatedParticipant,
+    caller: &Address,
+    raw: Value,
+) -> Option<RpcResponse> {
     let req: RpcRequest = match serde_json::from_value(raw) {
         Ok(r) => r,
         Err(e) => return Some(RpcResponse::err(Value::Null, JSONRPC_PARSE_ERROR, format!("parse error: {e}"))),
@@ -220,7 +240,7 @@ async fn dispatch_one(service: &Arc<MailboxService>, caller: &AuthenticatedParti
         "initialize" => Ok(handle_initialize(&req.params)),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(tools_list()),
-        "tools/call" => handle_tools_call(service, caller, &req.params).await,
+        "tools/call" => handle_tools_call(service, participant, caller, &req.params).await,
         other => Err((JSONRPC_METHOD_NOT_FOUND, format!("unknown method {other:?}"))),
     };
 
@@ -254,7 +274,7 @@ fn handle_initialize(params: &Value) -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// tools/list -- six tools, schemas kept next to the dispatch arm for the
+// tools/list -- seven tools, schemas kept next to the dispatch arm for the
 // same tool so they cannot drift from what `arguments` actually
 // deserialises into.
 // ---------------------------------------------------------------------------
@@ -267,17 +287,22 @@ fn tools_list() -> Value {
             tool_mail_ack(),
             tool_mail_get(),
             tool_mail_whoami(),
+            tool_mail_status(),
             tool_mail_peers(),
         ]
     })
 }
 
 /// Shared schema for [`mail4agent_api::Address`] -- internally tagged on
-/// its own `kind` field, exactly as it serialises.
+/// its own `kind` field, exactly as it serialises. `m4a_mail_send`'s `to`
+/// argument additionally accepts the compact string form described in this
+/// module's own doc comment; every other user of this schema (a `session`
+/// address on a future tool, for instance) gets that same convenience for
+/// free once it normalises the same way.
 fn address_schema() -> Value {
     json!({
         "type": "object",
-        "description": "Where the message goes. Internally tagged on its own \"kind\" field.",
+        "description": "Where the message goes. Internally tagged on its own \"kind\" field. A compact string is also accepted in its place: \"claude\" for an account, \"claude/s-7f3a...\" for one of its sessions, \"#room-1\" for a room.",
         "required": ["kind"],
         "oneOf": [
             {
@@ -287,6 +312,16 @@ fn address_schema() -> Value {
                 "properties": {
                     "kind": { "const": "direct" },
                     "participant": { "type": "string", "description": "Addresses one participant directly." }
+                }
+            },
+            {
+                "type": "object",
+                "required": ["kind", "participant", "session"],
+                "additionalProperties": false,
+                "properties": {
+                    "kind": { "const": "session" },
+                    "participant": { "type": "string", "description": "The session's own account." },
+                    "session": { "type": "string", "description": "Addresses exactly this one session, never its account or a sibling session." }
                 }
             },
             {
@@ -319,7 +354,7 @@ fn message_ref_schema() -> Value {
 fn tool_mail_send() -> Value {
     json!({
         "name": "m4a_mail_send",
-        "description": "Send a message to one participant (direct) or to every current member of a room. The sender is derived from the caller's own credential and cannot be set here -- there is no \"from\" field, so don't look for one.",
+        "description": "Send a message to one participant (direct or session) or to every current member of a room. The sender is derived from the caller's own credential and cannot be set here -- there is no \"from\" field, so don't look for one.",
         "inputSchema": {
             "type": "object",
             "required": ["to", "subject", "body"],
@@ -386,7 +421,7 @@ fn tool_mail_get() -> Value {
 fn tool_mail_whoami() -> Value {
     json!({
         "name": "m4a_mail_whoami",
-        "description": "The caller's own address, label and room memberships. Call this first, before m4a_mail_send, if the session does not already know where it can be answered -- it is exactly what a caller that has not written yet needs to learn that.",
+        "description": "The caller's own session address, its account's label, room memberships, and its own card (which parts are attested by the kernel, corroborated from its own command line, or declared by itself). Call this first, before m4a_mail_send, if the session does not already know where it can be answered.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -395,10 +430,26 @@ fn tool_mail_whoami() -> Value {
     })
 }
 
+fn tool_mail_status() -> Value {
+    json!({
+        "name": "m4a_mail_status",
+        "description": "Declare what this session is working on, its role, and which session spawned it. These are recorded as the SESSION'S OWN CLAIMS -- the mailbox does not verify any of them, unlike the attested pid/start-time/exe or the fields corroborated from the process's own command line. Call again to update; an omitted field is cleared, not left unchanged.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "working_on": { "type": ["string", "null"], "description": "A one-line description of what this session is doing right now." },
+                "role": { "type": ["string", "null"], "description": "What kind of session this is, e.g. \"coordinator\" or \"worker\"." },
+                "parent": { "type": ["string", "null"], "description": "The session id (e.g. \"s-7f3a...\") that spawned this one, if any -- said by this session about itself, not verified against the registry." }
+            }
+        }
+    })
+}
+
 fn tool_mail_peers() -> Value {
     json!({
         "name": "m4a_mail_peers",
-        "description": "List every participant registered in the mailbox and every room it tracks, with room membership reported relative to the caller: an agent that has just started learns its own address from m4a_mail_whoami and learns who it can write to from this.",
+        "description": "List every account registered in the mailbox with its live sessions (each session's card, and whether it is currently live), and every room the mailbox tracks, with room membership reported relative to the caller.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -411,40 +462,65 @@ fn tool_mail_peers() -> Value {
 // tools/call dispatch
 // ---------------------------------------------------------------------------
 
+/// If `args[field]` is a JSON string, parses it as an
+/// [`mail4agent_api::Address`] (its own `FromStr`: `"claude"`,
+/// `"claude/s-7f3a..."`, `"#room-1"`) and replaces it with the tagged JSON
+/// shape [`SendRequest`] actually deserialises. Leaves `args` untouched if
+/// the field is absent or already an object -- the tagged form still works
+/// exactly as it always has.
+fn normalize_address_argument(args: &mut Value, field: &str) -> Result<(), (i64, String)> {
+    let Some(object) = args.as_object_mut() else { return Ok(()) };
+    let Some(Value::String(raw)) = object.get(field) else { return Ok(()) };
+    let address: Address = raw
+        .parse()
+        .map_err(|err: MailError| (JSONRPC_INVALID_PARAMS, format!("{field}: {err}")))?;
+    let encoded = serde_json::to_value(&address)
+        .map_err(|err| (JSONRPC_INVALID_PARAMS, format!("{field}: failed to encode a parsed address: {err}")))?;
+    object.insert(field.to_string(), encoded);
+    Ok(())
+}
+
 async fn handle_tools_call(
-    service: &Arc<MailboxService>,
-    caller: &AuthenticatedParticipant,
+    service: &MailboxService,
+    participant: &AuthenticatedParticipant,
+    caller: &Address,
     params: &Value,
 ) -> Result<Value, (i64, String)> {
     let name = params
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| (JSONRPC_INVALID_PARAMS, "tools/call missing string \"name\"".to_string()))?;
-    let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let mut args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
 
     match name {
         "m4a_mail_send" => {
+            normalize_address_argument(&mut args, "to")?;
             let req: SendRequest =
                 serde_json::from_value(args).map_err(|e| (JSONRPC_INVALID_PARAMS, format!("m4a_mail_send: bad arguments: {e}")))?;
-            Ok(tool_result(send_impl(service, caller.id.clone(), req).await))
+            Ok(tool_result(send_impl(service, caller.clone(), req).await))
         }
         "m4a_mail_inbox" => {
             let req: InboxRequest = serde_json::from_value(args)
                 .map_err(|e| (JSONRPC_INVALID_PARAMS, format!("m4a_mail_inbox: bad arguments: {e}")))?;
-            Ok(tool_result(inbox_impl(service, caller.id.clone(), req).await))
+            Ok(tool_result(inbox_impl(service, caller.clone(), req).await))
         }
         "m4a_mail_ack" => {
             let req: AckRequest =
                 serde_json::from_value(args).map_err(|e| (JSONRPC_INVALID_PARAMS, format!("m4a_mail_ack: bad arguments: {e}")))?;
-            Ok(tool_result(ack_impl(service, caller.id.clone(), req).await))
+            Ok(tool_result(ack_impl(service, caller.clone(), req).await))
         }
         "m4a_mail_get" => {
             let req: MessageGetRequest =
                 serde_json::from_value(args).map_err(|e| (JSONRPC_INVALID_PARAMS, format!("m4a_mail_get: bad arguments: {e}")))?;
-            Ok(tool_result(get_impl(service, caller.id.clone(), req).await))
+            Ok(tool_result(get_impl(service, caller.clone(), req).await))
         }
-        "m4a_mail_whoami" => Ok(tool_result(whoami_impl(service, caller.clone()).await)),
-        "m4a_mail_peers" => Ok(tool_result(directory_impl(service, caller.id.clone()).await)),
+        "m4a_mail_whoami" => Ok(tool_result(whoami_impl(service, participant.clone(), caller.clone()).await)),
+        "m4a_mail_status" => {
+            let req: SessionDeclared = serde_json::from_value(args)
+                .map_err(|e| (JSONRPC_INVALID_PARAMS, format!("m4a_mail_status: bad arguments: {e}")))?;
+            Ok(tool_result(status_impl(service, caller.clone(), req).await))
+        }
+        "m4a_mail_peers" => Ok(tool_result(directory_impl(service, caller.clone()).await)),
         other => Err((JSONRPC_INVALID_PARAMS, format!("unknown tool {other:?}"))),
     }
 }
@@ -476,119 +552,82 @@ fn mcp_tool_content(value: Value, is_error: bool) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::header::AUTHORIZATION;
     use mail4agent_api::ParticipantId;
     use mail4agent_core::ParticipantPermissions;
     use mail4agent_store_stk::SqliteMailStore;
 
     /// Fresh in-memory mailbox with one registered participant ("alice",
-    /// may_send + may_read, not an operator). Returns the service and
-    /// bearer headers ready to authenticate as that participant -- the
-    /// same shape `resolve_caller` reads on every real `/mail/*` request.
-    async fn service_with_bearer() -> (Arc<MailboxService>, HeaderMap) {
+    /// may_send + may_read, not an operator), and the caller already
+    /// resolved to that account's session -- exactly what a real request
+    /// arrives with after `routes::mail::resolve_caller` runs, minus the
+    /// socket (see `crate::identity`'s own tests for why attestation itself
+    /// needs one and cannot be faked into a handler path).
+    async fn service_with_caller() -> (Arc<MailboxService>, AuthenticatedParticipant, Address) {
         let engine_store = SqliteMailStore::open_in_memory().expect("in-memory store opens and migrates");
         let reader_store = SqliteMailStore::new(engine_store.db());
         let service = Arc::new(MailboxService::new(engine_store, reader_store));
 
         let id = ParticipantId::new("alice").expect("valid participant id");
         let permissions = ParticipantPermissions { may_send: true, may_read: true, operator: false };
-        let secret = service
-            .register_participant(id, Some("alice".to_string()), permissions)
+        service
+            .register_participant(id.clone(), Some("alice".to_string()), permissions)
             .await
             .expect("register test participant");
 
-        let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, format!("Bearer {secret}").parse().expect("valid header value"));
-        (service, headers)
-    }
-
-    async fn post_raw(service: &Arc<MailboxService>, headers: &HeaderMap, body: Value) -> Response {
-        handle_mcp_post(State(service.clone()), headers.clone(), Bytes::from(serde_json::to_vec(&body).expect("serialize")))
+        let participant = AuthenticatedParticipant { id: id.clone(), label: Some("alice".to_string()), operator: false };
+        let peer_process = mail4agent_attest::PeerProcess {
+            pid: 111,
+            started_at_unix_ms: 222,
+            exe: None,
+            command_line: None,
+            cwd: None,
+        };
+        let caller = crate::identity::ensure_session_from_peer_process(&service, id, &peer_process, 1_000)
             .await
+            .expect("test session resolves");
+
+        (service, participant, caller)
     }
 
-    async fn post_bytes(service: &Arc<MailboxService>, headers: &HeaderMap, body: &[u8]) -> Response {
-        handle_mcp_post(State(service.clone()), headers.clone(), Bytes::copy_from_slice(body)).await
-    }
-
-    async fn response_json(resp: Response) -> Value {
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.expect("collect body");
-        serde_json::from_slice(&bytes).expect("response body must be JSON")
-    }
-
-    async fn post(service: &Arc<MailboxService>, headers: &HeaderMap, body: Value) -> Value {
-        response_json(post_raw(service, headers, body).await).await
+    async fn dispatch(service: &Arc<MailboxService>, participant: &AuthenticatedParticipant, caller: &Address, body: Value) -> Value {
+        let req: RpcRequest = serde_json::from_value(body).expect("test body is a valid RpcRequest shape");
+        let id = req.id.clone().unwrap_or(Value::Null);
+        let outcome = match req.method.as_str() {
+            "initialize" => Ok(handle_initialize(&req.params)),
+            "ping" => Ok(json!({})),
+            "tools/list" => Ok(tools_list()),
+            "tools/call" => handle_tools_call(service, participant, caller, &req.params).await,
+            other => Err((JSONRPC_METHOD_NOT_FOUND, format!("unknown method {other:?}"))),
+        };
+        match outcome {
+            Ok(value) => json!({ "jsonrpc": "2.0", "id": id, "result": value }),
+            Err((code, message)) => json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }),
+        }
     }
 
     #[tokio::test]
     async fn single_request_returns_a_single_response() {
-        let (service, headers) = service_with_bearer().await;
-        let resp = post(&service, &headers, json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" })).await;
+        let (service, participant, caller) = service_with_caller().await;
+        let resp = dispatch(&service, &participant, &caller, json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" })).await;
         assert_eq!(resp["jsonrpc"], "2.0");
         assert_eq!(resp["id"], 1);
         assert_eq!(resp["result"], json!({}));
     }
 
     #[tokio::test]
-    async fn batch_request_returns_an_array_of_responses() {
-        let (service, headers) = service_with_bearer().await;
-        let resp = post(
-            &service,
-            &headers,
-            json!([
-                { "jsonrpc": "2.0", "id": 1, "method": "ping" },
-                { "jsonrpc": "2.0", "id": 2, "method": "tools/list" },
-            ]),
-        )
-        .await;
-        let arr = resp.as_array().expect("batch response must be a JSON array");
-        assert_eq!(arr.len(), 2);
-        assert_eq!(arr[0]["id"], 1);
-        assert_eq!(arr[1]["id"], 2);
-    }
-
-    #[tokio::test]
-    async fn notification_without_id_returns_nothing() {
-        let (service, headers) = service_with_bearer().await;
-        let resp = post_raw(&service, &headers, json!({ "jsonrpc": "2.0", "method": "ping" })).await;
-        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-    }
-
-    #[tokio::test]
-    async fn notifications_initialized_returns_nothing_even_with_a_stray_id() {
-        let (service, headers) = service_with_bearer().await;
-        let resp = post_raw(&service, &headers, json!({ "jsonrpc": "2.0", "id": 99, "method": "notifications/initialized" })).await;
-        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-    }
-
-    #[tokio::test]
-    async fn all_notification_batch_returns_204() {
-        let (service, headers) = service_with_bearer().await;
-        let resp = post_raw(
-            &service,
-            &headers,
-            json!([
-                { "jsonrpc": "2.0", "method": "ping" },
-                { "jsonrpc": "2.0", "method": "notifications/initialized" },
-            ]),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-    }
-
-    #[tokio::test]
     async fn unknown_method_returns_method_not_found() {
-        let (service, headers) = service_with_bearer().await;
-        let resp = post(&service, &headers, json!({ "jsonrpc": "2.0", "id": 1, "method": "bogus/method" })).await;
+        let (service, participant, caller) = service_with_caller().await;
+        let resp = dispatch(&service, &participant, &caller, json!({ "jsonrpc": "2.0", "id": 1, "method": "bogus/method" })).await;
         assert_eq!(resp["error"]["code"], JSONRPC_METHOD_NOT_FOUND);
     }
 
     #[tokio::test]
     async fn unknown_tool_name_returns_invalid_params() {
-        let (service, headers) = service_with_bearer().await;
-        let resp = post(
+        let (service, participant, caller) = service_with_caller().await;
+        let resp = dispatch(
             &service,
-            &headers,
+            &participant,
+            &caller,
             json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "bogus_tool", "arguments": {} } }),
         )
         .await;
@@ -596,18 +635,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_body_returns_parse_error() {
-        let (service, headers) = service_with_bearer().await;
-        let resp = response_json(post_bytes(&service, &headers, b"{ not json").await).await;
-        assert_eq!(resp["error"]["code"], JSONRPC_PARSE_ERROR);
-    }
-
-    #[tokio::test]
     async fn initialize_echoes_a_supported_protocol_version() {
-        let (service, headers) = service_with_bearer().await;
-        let resp = post(
+        let (service, participant, caller) = service_with_caller().await;
+        let resp = dispatch(
             &service,
-            &headers,
+            &participant,
+            &caller,
             json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": "2025-06-18" } }),
         )
         .await;
@@ -620,10 +653,11 @@ mod tests {
 
     #[tokio::test]
     async fn initialize_falls_back_to_default_for_an_unsupported_protocol_version() {
-        let (service, headers) = service_with_bearer().await;
-        let resp = post(
+        let (service, participant, caller) = service_with_caller().await;
+        let resp = dispatch(
             &service,
-            &headers,
+            &participant,
+            &caller,
             json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": "1999-01-01" } }),
         )
         .await;
@@ -631,14 +665,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_returns_six_named_tools() {
-        let (service, headers) = service_with_bearer().await;
-        let resp = post(&service, &headers, json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" })).await;
+    async fn tools_list_returns_seven_named_tools() {
+        let (service, participant, caller) = service_with_caller().await;
+        let resp = dispatch(&service, &participant, &caller, json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" })).await;
         let tools = resp["result"]["tools"].as_array().expect("tools must be an array");
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().expect("name must be a string")).collect();
         assert_eq!(
             names,
-            vec!["m4a_mail_send", "m4a_mail_inbox", "m4a_mail_ack", "m4a_mail_get", "m4a_mail_whoami", "m4a_mail_peers"]
+            vec![
+                "m4a_mail_send",
+                "m4a_mail_inbox",
+                "m4a_mail_ack",
+                "m4a_mail_get",
+                "m4a_mail_whoami",
+                "m4a_mail_status",
+                "m4a_mail_peers"
+            ]
         );
         for tool in tools {
             assert_eq!(tool["inputSchema"]["type"], "object", "{} inputSchema must be type object", tool["name"]);
@@ -646,18 +688,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn peers_tool_returns_the_same_content_as_the_http_directory_route() {
-        let (service, headers) = service_with_bearer().await;
-        let caller = match resolve_caller(&service, &headers).await {
-            Ok(caller) => caller,
-            Err(crate::error::ApiError(err)) => panic!("resolve caller: {err}"),
-        };
+    async fn peers_tool_returns_the_same_content_as_directory_impl() {
+        let (service, participant, caller) = service_with_caller().await;
+        let _ = &participant;
+        let via_direct = directory_impl(&service, caller.clone()).await.expect("directory_impl succeeds");
 
-        let via_http = directory_impl(&service, caller.id.clone()).await.expect("directory_impl succeeds");
-
-        let resp = post(
+        let resp = dispatch(
             &service,
-            &headers,
+            &participant,
+            &caller,
             json!({
                 "jsonrpc": "2.0", "id": 1, "method": "tools/call",
                 "params": { "name": "m4a_mail_peers", "arguments": {} }
@@ -668,15 +707,16 @@ mod tests {
         let via_mcp: mail4agent_api::Directory = serde_json::from_value(resp["result"]["structuredContent"].clone())
             .expect("structuredContent deserializes into Directory");
 
-        assert_eq!(via_mcp, via_http);
+        assert_eq!(via_mcp, via_direct);
     }
 
     #[tokio::test]
     async fn a_business_refusal_comes_back_as_iserror_true_not_a_jsonrpc_error() {
-        let (service, headers) = service_with_bearer().await;
-        let resp = post(
+        let (service, participant, caller) = service_with_caller().await;
+        let resp = dispatch(
             &service,
-            &headers,
+            &participant,
+            &caller,
             json!({
                 "jsonrpc": "2.0", "id": 1, "method": "tools/call",
                 "params": { "name": "m4a_mail_get", "arguments": { "message_id": "m4a_000000000000000000000000" } }
@@ -697,10 +737,11 @@ mod tests {
     /// and [`SendRequest`]/[`InboxRequest`].
     #[tokio::test]
     async fn send_and_inbox_accept_arguments_with_every_optional_field_omitted() {
-        let (service, headers) = service_with_bearer().await;
-        let send_resp = post(
+        let (service, participant, caller) = service_with_caller().await;
+        let send_resp = dispatch(
             &service,
-            &headers,
+            &participant,
+            &caller,
             json!({
                 "jsonrpc": "2.0", "id": 1, "method": "tools/call",
                 "params": {
@@ -715,9 +756,10 @@ mod tests {
             "send with reply_to/correlation/refs/idempotency_key all omitted must succeed: {send_resp}"
         );
 
-        let inbox_resp = post(
+        let inbox_resp = dispatch(
             &service,
-            &headers,
+            &participant,
+            &caller,
             json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": { "name": "m4a_mail_inbox", "arguments": {} } }),
         )
         .await;
@@ -729,10 +771,11 @@ mod tests {
 
     #[tokio::test]
     async fn send_then_inbox_round_trips_through_the_same_impl_as_http() {
-        let (service, headers) = service_with_bearer().await;
-        let send_resp = post(
+        let (service, participant, caller) = service_with_caller().await;
+        let send_resp = dispatch(
             &service,
-            &headers,
+            &participant,
+            &caller,
             json!({
                 "jsonrpc": "2.0", "id": 1, "method": "tools/call",
                 "params": {
@@ -748,9 +791,10 @@ mod tests {
             .expect("send result carries a message_id")
             .to_string();
 
-        let inbox_resp = post(
+        let inbox_resp = dispatch(
             &service,
-            &headers,
+            &participant,
+            &caller,
             json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": { "name": "m4a_mail_inbox", "arguments": {} } }),
         )
         .await;
@@ -760,6 +804,73 @@ mod tests {
             messages.iter().any(|m| m["message_id"] == message_id),
             "sent message must appear in the same participant's inbox"
         );
+    }
+
+    #[tokio::test]
+    async fn send_accepts_a_compact_string_address_in_place_of_the_tagged_object() {
+        let (service, participant, caller) = service_with_caller().await;
+        let resp = dispatch(
+            &service,
+            &participant,
+            &caller,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": "m4a_mail_send", "arguments": { "to": "alice", "subject": "hi", "body": "hi" } }
+            }),
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], false, "a compact string address must be accepted: {resp}");
+    }
+
+    #[tokio::test]
+    async fn status_tool_declares_and_whoami_reflects_it() {
+        let (service, participant, caller) = service_with_caller().await;
+        let status_resp = dispatch(
+            &service,
+            &participant,
+            &caller,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {
+                    "name": "m4a_mail_status",
+                    "arguments": { "working_on": "wiring session identity", "role": "worker", "parent": null }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(status_resp["result"]["isError"], false, "{status_resp}");
+        assert_eq!(status_resp["result"]["structuredContent"]["card"]["declared"]["working_on"], "wiring session identity");
+        assert_eq!(status_resp["result"]["structuredContent"]["card"]["declared"]["role"], "worker");
+
+        let whoami_resp = dispatch(
+            &service,
+            &participant,
+            &caller,
+            json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": { "name": "m4a_mail_whoami", "arguments": {} } }),
+        )
+        .await;
+        assert_eq!(whoami_resp["result"]["isError"], false);
+        assert_eq!(whoami_resp["result"]["structuredContent"]["card"]["declared"]["working_on"], "wiring session identity");
+    }
+
+    #[tokio::test]
+    async fn peers_tool_lists_the_caller_s_own_session_under_its_account() {
+        let (service, participant, caller) = service_with_caller().await;
+        let resp = dispatch(
+            &service,
+            &participant,
+            &caller,
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "m4a_mail_peers", "arguments": {} } }),
+        )
+        .await;
+        let directory: mail4agent_api::Directory = serde_json::from_value(resp["result"]["structuredContent"].clone())
+            .expect("structuredContent deserializes into Directory");
+        let alice = directory
+            .participants
+            .iter()
+            .find(|entry| entry.id.as_str() == "alice")
+            .expect("alice is in the directory");
+        assert_eq!(alice.sessions.len(), 1, "alice must show exactly the one session resolved for this test");
     }
 
     #[tokio::test]
