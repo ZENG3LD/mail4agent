@@ -351,6 +351,35 @@ fn unread_count_matches_what_inbox_reports() {
 }
 
 #[test]
+fn a_participants_own_room_message_reaches_its_inbox_but_never_counts_as_unread() {
+    let mut engine = engine();
+    let alice = participant("alice");
+    let bob = participant("bob");
+    let crew = room("crew");
+    engine.register_participant(alice.clone(), None, permissions(true, true, false)).expect("alice registers");
+    engine.register_participant(bob.clone(), None, permissions(true, true, false)).expect("bob registers");
+    engine.create_room(crew.clone(), 500).expect("room is created");
+    engine.add_room_member(&crew, alice.clone()).expect("alice joins");
+    engine.add_room_member(&crew, bob.clone()).expect("bob joins");
+
+    engine
+        .send(&alice, send_request(Address::Room { room: crew.clone() }), 1_000)
+        .expect("alice writes to the room");
+
+    let page = engine.inbox(&alice, 0, 50).expect("alice reads her inbox");
+
+    // She sees what she wrote -- a room is a shared log and its author
+    // belongs in it -- but it is not waiting for her.
+    assert_eq!(page.messages.len(), 1);
+    assert_eq!(page.messages[0].from, alice);
+    assert_eq!(page.unread, 0);
+
+    // For the other member it genuinely is unread.
+    let bobs = engine.inbox(&bob, 0, 50).expect("bob reads his inbox");
+    assert_eq!(bobs.unread, 1);
+}
+
+#[test]
 fn authenticate_rejects_unknown_secret() {
     let engine = engine();
     let err = engine.authenticate("not-a-real-secret").expect_err("unknown secret must be refused");

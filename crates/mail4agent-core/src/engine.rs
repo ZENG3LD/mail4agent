@@ -421,10 +421,20 @@ impl<S: MailStore> MailboxEngine<S> {
         Ok(InboxPage { messages, unread })
     }
 
+    /// Counts what `participant` has not yet acknowledged.
+    ///
+    /// A participant's **own** messages never count. They reach its inbox --
+    /// a room is a shared log and its author belongs in it -- but an author
+    /// has by definition read what it wrote, and counting it would invite
+    /// exactly the loop this mailbox exists to avoid: an agent polls, sees
+    /// something unread, and answers itself.
     fn count_unread(&self, participant: &ParticipantId) -> Result<u32, MailError> {
         let messages = self.own_messages(participant, 0)?;
         let mut unread = 0u32;
         for message in messages {
+            if &message.from == participant {
+                continue;
+            }
             let ack = self
                 .store
                 .get_ack(&message.message_id, participant)
