@@ -1025,6 +1025,28 @@ mod tests {
     }
 
     #[test]
+    fn a_send_request_carrying_only_its_required_fields_decodes() {
+        // serde defaults an absent Option field to None, so the optional
+        // fields need no attribute to be omittable. This test exists because
+        // that is easy to doubt, and doubting it invites a second set of
+        // argument structs that can drift from these.
+        let json = r#"{"to":{"kind":"direct","participant":"bob"},"subject":"s","body":"b"}"#;
+        let req: SendRequest = serde_json::from_str(json).expect("minimal send request decodes");
+        assert!(req.reply_to.is_none());
+        assert!(req.correlation.is_none());
+        assert!(req.idempotency_key.is_none());
+        assert!(req.refs.is_empty());
+        req.validate().expect("and it validates");
+    }
+
+    #[test]
+    fn an_inbox_request_carrying_nothing_decodes_with_the_default_limit() {
+        let req: InboxRequest = serde_json::from_str("{}").expect("empty inbox request decodes");
+        assert!(req.since_unix_ms.is_none());
+        assert_eq!(req.limit, INBOX_LIMIT_DEFAULT);
+    }
+
+    #[test]
     fn send_request_old_shape_without_idempotency_key_still_deserializes_and_validates() {
         let json = serde_json::json!({
             "to": {"kind": "direct", "participant": "bob"},
