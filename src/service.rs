@@ -7,7 +7,7 @@
 //! operation, the method belongs here, never a `spawn_blocking` inline in
 //! `routes/`.
 //!
-//! Two handles share one underlying [`stk::Db`]: `engine` (mutating and
+//! Two handles share one underlying [`mail4agent_store_sqlite::Db`]: `engine` (mutating and
 //! authenticating calls, serialised through a [`tokio::sync::Mutex`]) and
 //! `reader` (plain [`MailStore`] reads -- `get_participant`,
 //! `rooms_containing`, `get_session` -- that [`MailboxEngine`]'s own public
@@ -44,7 +44,7 @@ use mail4agent_api::{
     SendRequest, SendResponse, SessionCard, SessionId, UnreadCount,
 };
 use mail4agent_core::{MailStore, MailboxEngine, ParticipantPermissions, StoreError};
-use mail4agent_store_stk::SqliteMailStore;
+use mail4agent_store_sqlite::SqliteMailStore;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 /// A caller resolved from its bearer secret: everything a handler needs to
@@ -79,7 +79,7 @@ pub struct MailboxService {
 
 impl MailboxService {
     /// `engine_store` and `reader_store` must be two [`SqliteMailStore`]
-    /// handles opened over the SAME underlying [`stk::Db`] (clones of one
+    /// handles opened over the SAME underlying [`mail4agent_store_sqlite::Db`] (clones of one
     /// connection -- see [`SqliteMailStore::db`]), so a read through
     /// `reader` always observes what `engine` has already committed.
     pub fn new(engine_store: SqliteMailStore, reader_store: SqliteMailStore) -> Self {
@@ -93,8 +93,8 @@ impl MailboxService {
 
     /// Authenticates `token` against the participant registry. This is the
     /// one place a bearer becomes a [`ParticipantId`] (an **account**) on
-    /// this facade -- `MailboxAuth` (the `stk::AuthLayer` impl) calls it to
-    /// grant tiers, and every handler calls it again to learn *which
+    /// this facade -- `crate::auth::require_tier` calls it to grant tiers,
+    /// and every handler calls it again to learn *which
     /// account* it is talking to, before resolving *which session* of that
     /// account (`crate::identity::resolve_session`). The participant id is
     /// never carried in the granted tiers (a `TokenTier::Scope` is a

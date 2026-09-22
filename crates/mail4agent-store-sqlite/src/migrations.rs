@@ -1,14 +1,14 @@
-//! The mailbox's schema, as versioned [`stk_db::Migration`]s.
+//! The mailbox's schema, as versioned [`crate::db::Migration`]s.
 //!
 //! One migration per line of this file's history: a shipped migration's
 //! `sql` is never edited after it has run anywhere, because
-//! [`stk_db::MigrationRunner`] records completion by version number alone
+//! [`crate::db::MigrationRunner`] records completion by version number alone
 //! -- changing a version's SQL after the fact would leave already-migrated
 //! databases silently out of sync with a fresh one. A schema change is
-//! always a new, higher-numbered [`stk_db::Migration`] appended to
+//! always a new, higher-numbered [`crate::db::Migration`] appended to
 //! [`migrations`], never an edit to an existing entry.
 
-use stk_db::Migration;
+use crate::db::Migration;
 
 /// `v1`: the mailbox's whole schema -- participants, rooms, room
 /// membership, messages, acks, and the idempotency ledger. Six tables,
@@ -173,7 +173,7 @@ CREATE TABLE idempotency (
 ///   `reader`/`sender` columns were always plain `TEXT`, and a v1 row's
 ///   value there was already exactly an account's [`mail4agent_api::Address::Direct`]
 ///   `Display` form (`"claude"`) -- the same string
-///   `mail4agent_store_stk::store::address_text` still writes for a
+///   `mail4agent_store_sqlite::store::address_text` still writes for a
 ///   direct address today. A session's `Display` form (`"claude/s-7f3a..."`)
 ///   is simply a longer string in the same column; the two can never
 ///   collide because neither a participant id's nor a session id's
@@ -242,8 +242,8 @@ const SCHEMA_V3_SQL: &str = "
 ALTER TABLE participants ADD COLUMN listener_url TEXT;
 ";
 
-/// This crate's own migrations, in the order [`stk_db::MigrationRunner`]
-/// must apply them. A daemon runs these once against the [`stk_db::Db`] it
+/// This crate's own migrations, in the order [`crate::db::MigrationRunner`]
+/// must apply them. A daemon runs these once against the [`crate::db::Db`] it
 /// hands to [`crate::SqliteMailStore::new`]; [`crate::SqliteMailStore::open_in_memory`]
 /// runs them itself for tests and small tools.
 pub fn migrations() -> Vec<Migration> {

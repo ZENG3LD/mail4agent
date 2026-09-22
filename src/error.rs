@@ -5,8 +5,6 @@
 //! string (`mail4agent/CLAUDE.md`, "Discipline": "a caller must learn
 //! *what* was refused and *why* from the refusal itself").
 
-use std::future::Future;
-
 use axum::extract::{FromRequest, Request};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -120,15 +118,13 @@ where
 {
     type Rejection = ApiError;
 
-    fn from_request(req: Request, state: &S) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
-        async move {
-            match Json::<T>::from_request(req, state).await {
-                Ok(Json(value)) => Ok(Self(value)),
-                Err(rejection) => Err(ApiError::Mail(MailError::Malformed {
-                    field: "body".to_string(),
-                    reason: rejection.body_text(),
-                })),
-            }
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => Ok(Self(value)),
+            Err(rejection) => Err(ApiError::Mail(MailError::Malformed {
+                field: "body".to_string(),
+                reason: rejection.body_text(),
+            })),
         }
     }
 }

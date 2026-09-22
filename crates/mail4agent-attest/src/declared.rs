@@ -25,7 +25,7 @@ use std::fmt;
 /// [`crate::PeerProcess::command_line`] or [`crate::PeerProcess::cwd`] off
 /// a struct field and treat it with the same weight as `pid` by accident:
 /// getting the inner value means calling [`Declared::into_inner`] or
-/// [`Declared::as_ref`], not a plain field read, so the caller has to
+/// [`Declared::inner_ref`], not a plain field read, so the caller has to
 /// spell out that what they are holding is a declaration, not a fact the
 /// kernel attested.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,8 +44,11 @@ impl<T> Declared<T> {
         self.0
     }
 
-    /// Borrows the declared value without consuming the wrapper.
-    pub fn as_ref(&self) -> &T {
+    /// Borrows the declared value without consuming the wrapper. Named
+    /// `inner_ref` rather than `as_ref` so it cannot be confused for
+    /// `std::convert::AsRef::as_ref` (this type deliberately does not
+    /// implement that trait).
+    pub fn inner_ref(&self) -> &T {
         &self.0
     }
 }

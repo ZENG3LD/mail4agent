@@ -1,0 +1,26 @@
+[package]
+name = "mail4agent-store-sqlite"
+version = "0.1.0"
+edition = "2021"
+description = "A MailStore backed by plain SQLite (rusqlite, bundled): versioned migrations, WAL, one transaction per mutation."
+license = "MIT"
+
+[dependencies]
+mail4agent-api = { path = "../mail4agent-api", version = "0.1.0" }
+mail4agent-core = { path = "../mail4agent-core", version = "0.1.0" }
+
+# The connection this crate's own `db` module owns: WAL + foreign_keys
+# pragmas, versioned migrations, blocking read/write helpers. No longer
+# borrowed from an internal build-framework dependency (see `db.rs`'s own
+# module doc comment) -- `bundled` so a consumer needs no system SQLite.
+rusqlite = { version = "0.32", features = ["bundled"] }
+# `Db`'s single connection is guarded by a `tokio::sync::Mutex` so
+# `read_blocking`/`write_blocking` can wait on it from a plain sync thread
+# (the daemon reaches them through `tokio::task::spawn_blocking`) without
+# ever panicking the way a `std::sync::Mutex` held across an await would.
+tokio = { version = "1", features = ["sync"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"

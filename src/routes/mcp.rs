@@ -555,7 +555,7 @@ mod tests {
     use super::*;
     use mail4agent_api::ParticipantId;
     use mail4agent_core::ParticipantPermissions;
-    use mail4agent_store_stk::SqliteMailStore;
+    use mail4agent_store_sqlite::SqliteMailStore;
 
     /// Fresh in-memory mailbox with one registered participant ("alice",
     /// may_send + may_read, not an operator), and the caller already

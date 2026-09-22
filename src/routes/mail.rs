@@ -222,10 +222,7 @@ pub(crate) async fn status_impl(
     };
     let session = session.clone();
     service.set_declared(session.clone(), request.working_on, request.role, request.parent).await?;
-    let card = service
-        .session_card(session.clone())
-        .await?
-        .ok_or_else(|| MailError::UnknownSession { session })?;
+    let card = service.session_card(session.clone()).await?.ok_or(MailError::UnknownSession { session })?;
     Ok(StatusResponse { card })
 }
 

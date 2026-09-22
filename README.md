@@ -144,7 +144,7 @@ Not yet published, and the wire shapes may still move.
 
 - `mail4agent-api` — the wire types. Serialisation and nothing else.
 - `mail4agent-core` — the engine and its storage trait, with an in-memory store.
-- `mail4agent-store-stk` — SQLite persistence.
+- `mail4agent-store-sqlite` — SQLite persistence.
 - `mail4agent-client` — an HTTP client.
 - `mail4agent` — the daemon.
 

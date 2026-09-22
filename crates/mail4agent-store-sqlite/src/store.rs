@@ -7,14 +7,14 @@ use mail4agent_core::{
     InsertMessageOutcome, MailStore, ParticipantRecord, ParticipantSummary, RoomRecord, RoomSummary, SecretDigest,
     SessionRecord, StoreError,
 };
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
-use stk_db::rusqlite::{self, OptionalExtension};
-use stk_db::{Db, DbConfig, MigrationRunner};
 
+use crate::db::{Db, DbConfig, MigrationRunner};
 use crate::migrations::migrations;
 
-/// A [`MailStore`] backed by SQLite through stk's [`Db`]. Every mutating
-/// method below is exactly one transaction, matching the contract
+/// A [`MailStore`] backed by SQLite through this crate's own [`Db`]. Every
+/// mutating method below is exactly one transaction, matching the contract
 /// `mail4agent_core::store`'s module doc comment sets for a persistent
 /// implementation.
 pub struct SqliteMailStore {
@@ -23,10 +23,10 @@ pub struct SqliteMailStore {
 
 impl SqliteMailStore {
     /// Wraps an already-open [`Db`]. The caller is responsible for having
-    /// run [`crate::migrations`] against it first -- typically through the
-    /// same `ServerBuilder` wiring that opened `db` -- so this constructor
-    /// stays infallible and a daemon can hand in the very `Db` its own
-    /// builder produced.
+    /// run [`crate::migrations`] against it first -- typically the same
+    /// `main.rs` boot sequence that opened `db` -- so this constructor
+    /// stays infallible and a daemon can hand in the very `Db` it opened
+    /// itself.
     pub fn new(db: Db) -> Self {
         Self { db }
     }
@@ -45,7 +45,7 @@ impl SqliteMailStore {
 
     /// The underlying [`Db`] handle. Clones share the same connection (see
     /// [`Db`]'s own doc comment) -- useful when a daemon wants this store
-    /// and some other stk-backed subsystem sharing one sqlite file.
+    /// and some other subsystem sharing one sqlite file.
     pub fn db(&self) -> Db {
         self.db.clone()
     }
