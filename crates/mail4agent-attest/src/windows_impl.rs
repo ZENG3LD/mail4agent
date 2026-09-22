@@ -4,7 +4,6 @@
 use std::mem;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
-use sysinfo::{Pid as SysPid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, FILETIME, HANDLE};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     GetExtendedTcpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID, MIB_TCPROW_OWNER_PID,
@@ -16,7 +15,7 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
-use crate::{AttestError, Declared, PeerProcess};
+use crate::{AttestError, PeerProcess};
 
 /// FILETIME ticks (100 ns each) between the Windows epoch (1601-01-01) and
 /// the Unix epoch (1970-01-01): 11_644_473_600 seconds, in 100 ns units.
@@ -27,7 +26,7 @@ pub(crate) fn attest(peer: SocketAddr, local: SocketAddr) -> Result<PeerProcess,
     let started_at_unix_ms =
         process_creation_time_ms(pid).map_err(|detail| AttestError::ProcessGone { pid, detail })?;
     let exe = query_full_process_image_name(pid);
-    let (command_line, cwd) = process_command_line_and_cwd(pid);
+    let (command_line, cwd) = crate::common::process_command_line_and_cwd(pid);
     Ok(PeerProcess {
         pid,
         started_at_unix_ms,
@@ -241,30 +240,4 @@ fn query_full_process_image_name(pid: u32) -> Option<String> {
         return None;
     }
     Some(String::from_utf16_lossy(&buf[..len as usize]))
-}
-
-fn process_command_line_and_cwd(pid: u32) -> (Option<Declared<String>>, Option<Declared<String>>) {
-    let sys_pid = SysPid::from_u32(pid);
-    let mut system = System::new();
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[sys_pid]),
-        false,
-        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always).with_cwd(UpdateKind::Always),
-    );
-
-    let Some(process) = system.process(sys_pid) else {
-        return (None, None);
-    };
-
-    let command_line = {
-        let parts: Vec<String> = process.cmd().iter().map(|s| s.to_string_lossy().into_owned()).collect();
-        if parts.is_empty() {
-            None
-        } else {
-            Some(Declared::new(parts.join(" ")))
-        }
-    };
-    let cwd = process.cwd().map(|p| Declared::new(p.display().to_string()));
-
-    (command_line, cwd)
 }

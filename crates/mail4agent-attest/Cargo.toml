@@ -28,3 +28,13 @@ windows-sys = { version = "0.59", features = [
     "Win32_Networking_WinSock",
     "Win32_NetworkManagement_IpHelper",
 ] }
+
+[target.'cfg(unix)'.dependencies]
+# Linux: `sysconf(_SC_CLK_TCK)` for `/proc/<pid>/stat`'s clock-tick start
+# time. macOS: the `<libproc.h>` calls (`proc_listpids`, `proc_pidinfo`,
+# `proc_pidfdinfo`, `proc_pidpath`) and the plain scalar structs they fill
+# for a whole process (`proc_bsdinfo`, `proc_fdinfo`, `vinfo_stat`) --
+# `macos_impl.rs` hand-declares only the small number of socket-detail
+# structs `libc` does not carry (see that module's doc comment for why not
+# a bindgen-based crate instead).
+libc = "0.2"

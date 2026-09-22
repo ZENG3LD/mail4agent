@@ -1,7 +1,11 @@
-//! Windows-only: see `lib.rs`'s `#[cfg(all(test, windows))]` on this
-//! module. Every test here drives a real loopback TCP connection through
-//! this crate's own `attest`/`is_alive` -- no mocked OS state, because the
-//! whole point of the crate is what the kernel actually reports.
+//! Shared across every platform this crate has a real attestation
+//! implementation for -- see `lib.rs`'s
+//! `#[cfg(all(test, any(windows, target_os = "linux", target_os = "macos")))]`
+//! on this module. Every test here drives a real loopback TCP connection
+//! through this crate's own `attest`/`is_alive` -- no mocked OS state,
+//! because the whole point of the crate is what the kernel actually
+//! reports, and that differs enough between Windows/Linux/macOS that a
+//! mock would prove nothing about any of them.
 
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;

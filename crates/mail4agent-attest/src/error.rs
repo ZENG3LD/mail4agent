@@ -12,8 +12,9 @@ use thiserror::Error;
 pub enum AttestError {
     /// This crate has no attestation implementation for the running
     /// target. It still compiles and links everywhere -- an MIT crate
-    /// ships cross-platform -- but only Windows has a real implementation
-    /// today. See the module doc comment and
+    /// ships cross-platform -- but Windows, Linux and macOS are the only
+    /// targets with a real implementation today. See the module doc comment
+    /// and
     /// `docs/gate4agent/research/local-workload-identity-attestation-2026-09-17.md`.
     #[error("process attestation is not implemented on this platform")]
     UnsupportedPlatform,
@@ -24,9 +25,11 @@ pub enum AttestError {
     #[error("local {local} and peer {peer} are different address families")]
     AddressFamilyMismatch { local: SocketAddr, peer: SocketAddr },
 
-    /// The OS TCP connection table itself could not be read -- a call
-    /// against `GetExtendedTcpTable` failed before any row was even
-    /// considered. Carries the Win32 error detail.
+    /// The OS's own view of TCP connections or processes could not even be
+    /// read -- `GetExtendedTcpTable` on Windows, `/proc/net/tcp[6]` on
+    /// Linux, `proc_listpids`/`proc_pidinfo(PROC_PIDLISTFDS)` on macOS --
+    /// before any row or fd was even considered. Carries the platform's own
+    /// error detail.
     #[error("reading the OS TCP connection table failed: {detail}")]
     TableQueryFailed { detail: String },
 
@@ -38,8 +41,13 @@ pub enum AttestError {
     ConnectionNotFound { local: SocketAddr, peer: SocketAddr },
 
     /// A matching row was found, but the OS reports no owning process for
-    /// it -- documented Windows behaviour for a connection that has moved
-    /// into `TIME_WAIT`, which can outlive the process that created it.
+    /// it: documented Windows behaviour for a connection that has moved
+    /// into `TIME_WAIT`, which can outlive the process that created it: the
+    /// same state on Linux shows up as a `/proc/net/tcp[6]` row whose inode
+    /// no process's `/proc/<pid>/fd` table holds any longer. macOS has no
+    /// equivalent (see `macos_impl`'s own doc comment): a connection with no
+    /// remaining owner surfaces there as [`AttestError::ConnectionNotFound`]
+    /// instead, never this variant.
     #[error("connection between local {local} and peer {peer} has no owning process (likely TIME_WAIT)")]
     NoOwningProcess { local: SocketAddr, peer: SocketAddr },
 
