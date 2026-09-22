@@ -85,8 +85,8 @@ const DERIVED_SESSION_ID_HEX_LEN: usize = 32;
 pub enum SessionError {
     /// `ConnectInfo<SocketAddr>` was absent from the request. A wiring
     /// failure, not a caller mistake: this daemon's `serve()` call must
-    /// supply it (`servertoolkit`'s `into_make_service_with_connect_info`
-    /// fix is what this feature depends on).
+    /// supply it (axum's `into_make_service_with_connect_info` is what this
+    /// feature depends on -- see `src/main.rs`'s own module doc comment).
     MissingConnectInfo,
     /// Attestation failed for an ordinary reason -- the connection already
     /// closed between accept and this call, the platform has no
@@ -185,14 +185,14 @@ pub fn session_card_from_peer_process(peer: &PeerProcess) -> SessionCard {
     let parsed = peer
         .command_line
         .as_ref()
-        .map(|declared| parse_claude_command_line(declared.as_ref()))
+        .map(|declared| parse_claude_command_line(declared.inner_ref()))
         .unwrap_or_default();
     SessionCard {
         attested: SessionAttested { pid: peer.pid, started_at_unix_ms: peer.started_at_unix_ms, exe: peer.exe.clone() },
         corroborated: SessionCorroborated {
             provider_session_id: parsed.provider_session_id.map(Declared::new),
             model: parsed.model.map(Declared::new),
-            cwd: peer.cwd.as_ref().map(|declared| Declared::new(declared.as_ref().clone())),
+            cwd: peer.cwd.as_ref().map(|declared| Declared::new(declared.inner_ref().clone())),
         },
         declared: Default::default(),
     }
@@ -239,7 +239,7 @@ pub async fn resolve_session(
 mod tests {
     use super::*;
     use mail4agent_core::ParticipantPermissions;
-    use mail4agent_store_stk::SqliteMailStore;
+    use mail4agent_store_sqlite::SqliteMailStore;
 
     /// A minimal [`PeerProcess`] for tests. `command_line`/`cwd` stay
     /// `None`: `mail4agent_attest::Declared::new` is `pub(crate)` to that

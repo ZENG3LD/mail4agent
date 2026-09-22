@@ -15,15 +15,10 @@ path = "src/main.rs"
 [dependencies]
 mail4agent-api = { path = "crates/mail4agent-api", version = "0.1.0" }
 mail4agent-core = { path = "crates/mail4agent-core", version = "0.1.0" }
-mail4agent-store-stk = { path = "crates/mail4agent-store-stk", version = "0.1.0" }
+mail4agent-store-sqlite = { path = "crates/mail4agent-store-sqlite", version = "0.1.0" }
 # Resolves which OS process is on the other end of a request's connection --
 # see `src/identity.rs`, "Point 1" of the session-identity work.
 mail4agent-attest = { path = "crates/mail4agent-attest", version = "0.1.0" }
-
-# The stk facade -- name/bind/auth-chain/router/manifest/db wiring. Depended
-# on directly rather than the sub-crates it re-exports (see
-# `mail4agent-store-stk`'s own comment on the same choice for `stk_db`).
-stk = { package = "servertoolkit", path = "../servertoolkit/crates/servertoolkit", version = "0.1.0" }
 
 axum = { version = "0.8", features = ["json"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net"] }
@@ -39,17 +34,22 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 subtle = "2"
-# Implements `stk::AuthLayer` (`#[async_trait]`-shaped) for `MailboxAuth`.
-async-trait = "0.1"
 # Per-user data directory for the sqlite default path, and the home
 # directory for the bootstrap operator key file (smm8mail's own pattern).
 directories = "6"
 # Parses `mail4agent.toml`.
 toml = "0.8"
-# Derives a stable SessionId from a `(pid, started_at_unix_ms)` pair --
-# same versions `mail4agent-core` already pins for the same job.
+# Derives a stable SessionId from a `(pid, started_at_unix_ms)` pair, and
+# mints an `X-Request-Id` for `src/request_id.rs` -- same versions
+# `mail4agent-core` already pins for the same job.
 sha2 = "0.10"
 hex = "0.4"
+
+[dev-dependencies]
+# `tower::ServiceExt::oneshot` for `src/request_id.rs`'s own tests. Already
+# in the dependency graph transitively (axum/tower-http depend on it), so
+# this adds no new crate, only the `util` feature's extension trait.
+tower = { version = "0.5", features = ["util"] }
 
 # Internal workspace; independent from any parent workspace.
 [workspace]
@@ -57,6 +57,6 @@ members = [
     "crates/mail4agent-api",
     "crates/mail4agent-attest",
     "crates/mail4agent-core",
-    "crates/mail4agent-store-stk",
+    "crates/mail4agent-store-sqlite",
     "crates/mail4agent-client",
 ]

@@ -3,18 +3,13 @@
 //! Boot sequence, deliberately split across two phases:
 //!
 //! 1. **Outside any tokio runtime** (plain `fn main`): load config, open
-//!    the sqlite [`stk::Db`], and run this crate's schema migrations via
-//!    [`stk::Db::run_migrations_blocking`] -- the crate contract's own
-//!    words for why: "the daemon is outside the runtime at that point, so
-//!    `run_migrations_blocking` is the correct one" (`mail4agent/CLAUDE.md`,
-//!    "Wire it with `Server::builder()`"). Doing this before a runtime
-//!    exists at all, rather than relying on `try_lock()`'s non-panicking
-//!    behaviour inside an already-running one, keeps that discipline
-//!    literal rather than load-bearing on an implementation detail of
-//!    `tokio::sync::Mutex`.
+//!    the sqlite [`mail4agent_store_sqlite::Db`], and run this crate's
+//!    schema migrations via [`mail4agent_store_sqlite::Db::run_migrations_blocking`]
+//!    -- the daemon is outside the runtime at that point, so the blocking
+//!    entry point is the correct one, rather than relying on `try_lock()`'s
+//!    non-panicking behaviour inside an already-running one.
 //! 2. **Inside a manually-built tokio runtime**: bootstrap the first
-//!    operator participant if none exists yet, then hand everything to
-//!    `stk::Server::builder()`.
+//!    operator participant if none exists yet, then serve.
 //!
 //! The engine and its store stay synchronous throughout (see `service.rs`
 //! for the async facade every handler goes through instead of touching
@@ -25,41 +20,52 @@
 //! server's own bound address, which is why `serve` builds one
 //! [`AppState`] shared by every route rather than handing each route a
 //! bare `Arc<MailboxService>`.
+//!
+//! Serves via `into_make_service_with_connect_info::<SocketAddr>()`, never
+//! plain `into_make_service()` -- the latter never inserts a
+//! `ConnectInfo<SocketAddr>` extension, which is exactly the fact
+//! `src/identity.rs`'s whole session-resolution mechanism depends on.
 
 mod auth;
 mod bootstrap;
 mod config;
 mod dto;
 mod error;
+mod health;
 mod identity;
+mod request_id;
 mod routes;
 mod service;
+mod shutdown;
 mod state;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::routing::{delete, post};
+use axum::middleware;
+use axum::routing::{get, post};
+use axum::Router;
+
 use config::{Config, ConfigError};
+use mail4agent_store_sqlite::{migrations, Db, DbConfig, DbError, MigrationRunner, SqliteMailStore};
 use service::MailboxService;
 use state::AppState;
-use stk::{AuthChain, Server, TokenTier};
 
 #[derive(Debug, thiserror::Error)]
 enum MainError {
     #[error("config: {0}")]
     Config(#[from] ConfigError),
     #[error("database: {0}")]
-    Db(#[from] stk::DbError),
+    Db(#[from] DbError),
     #[error("build tokio runtime: {0}")]
     Runtime(std::io::Error),
     #[error("bootstrap: {0}")]
     Bootstrap(#[from] bootstrap::BootstrapError),
-    #[error("build server: {0}")]
-    Build(#[from] stk::BuildError),
-    #[error("run server: {0}")]
-    Run(#[from] stk::RunError),
+    #[error("bind {0}: {1}")]
+    Bind(SocketAddr, std::io::Error),
+    #[error("serve: {0}")]
+    Serve(std::io::Error),
 }
 
 fn main() -> Result<(), MainError> {
@@ -74,14 +80,14 @@ fn main() -> Result<(), MainError> {
     let db_path = config.resolve_db_path()?;
     tracing::info!(db = %db_path.display(), bind = %config.bind, "mail4agent starting");
 
-    let db_config = stk::DbConfig::new(db_path);
-    let db = stk::Db::open(&db_config)?;
-    db.run_migrations_blocking(stk::MigrationRunner::new(mail4agent_store_stk::migrations()))?;
+    let db_config = DbConfig::new(db_path);
+    let db = Db::open(&db_config)?;
+    db.run_migrations_blocking(MigrationRunner::new(migrations()))?;
 
     // Two handles over the SAME connection -- see `service.rs`'s module
     // doc comment for why the facade needs both.
-    let engine_store = mail4agent_store_stk::SqliteMailStore::new(db.clone());
-    let reader_store = mail4agent_store_stk::SqliteMailStore::new(db);
+    let engine_store = SqliteMailStore::new(db.clone());
+    let reader_store = SqliteMailStore::new(db);
     let service = Arc::new(MailboxService::new(engine_store, reader_store));
 
     let runtime = tokio::runtime::Runtime::new().map_err(MainError::Runtime)?;
@@ -91,121 +97,80 @@ fn main() -> Result<(), MainError> {
 async fn serve(service: Arc<MailboxService>, bind: SocketAddr) -> Result<(), MainError> {
     bootstrap::ensure_bootstrap_operator(&service).await?;
 
-    let mailbox_auth = auth::MailboxAuth::new(service.clone());
     let app = Arc::new(AppState { service: service.clone(), bind_addr: bind });
 
-    let server = Server::builder()
-        .name("mail4agent")
-        .with_service_kind("http_api")
-        .with_version(env!("CARGO_PKG_VERSION"))
-        .bind(bind.to_string())
-        .with_auth_chain(AuthChain::new().layer(mailbox_auth))
-        .post_tier(
-            "/mail/send",
-            post(routes::mail::send).with_state(app.clone()),
-            TokenTier::Authenticated,
-        )
-        .post_tier(
-            "/mail/inbox",
-            post(routes::mail::inbox).with_state(app.clone()),
-            TokenTier::Authenticated,
-        )
-        .post_tier(
-            "/mail/ack",
-            post(routes::mail::ack).with_state(app.clone()),
-            TokenTier::Authenticated,
-        )
-        .post_tier(
-            "/mail/get",
-            post(routes::mail::get).with_state(app.clone()),
-            TokenTier::Authenticated,
-        )
-        .post_tier(
-            "/mail/unread",
-            post(routes::mail::unread).with_state(app.clone()),
-            TokenTier::Authenticated,
-        )
-        .post_tier(
-            "/mail/whoami",
-            post(routes::mail::whoami).with_state(app.clone()),
-            TokenTier::Authenticated,
-        )
-        .post_tier(
-            "/mail/status",
-            post(routes::mail::status).with_state(app.clone()),
-            TokenTier::Authenticated,
-        )
-        .post_tier(
-            "/mail/directory",
-            post(routes::mail::directory).with_state(app.clone()),
-            TokenTier::Authenticated,
-        )
+    // `/mail/*` and `/mcp` -- every one of these derives the caller from
+    // the presented credential; none of them accepts a sender.
+    let authenticated_guard =
+        auth::TierGuard { service: service.clone(), required: auth::Tier::Authenticated };
+    let authenticated_router = Router::new()
+        .route("/mail/send", post(routes::mail::send))
+        .route("/mail/inbox", post(routes::mail::inbox))
+        .route("/mail/ack", post(routes::mail::ack))
+        .route("/mail/get", post(routes::mail::get))
+        .route("/mail/unread", post(routes::mail::unread))
+        .route("/mail/whoami", post(routes::mail::whoami))
+        .route("/mail/status", post(routes::mail::status))
+        .route("/mail/directory", post(routes::mail::directory))
         // MCP door onto the same mail surface -- `mail4agent/CLAUDE.md`,
         // "one implementation, two doors". Same tier as `/mail/*`: an
         // operator calling a mail tool is just a participant.
-        .post_tier(
-            "/mcp",
-            post(routes::mcp::handle_mcp_post).with_state(app.clone()),
-            TokenTier::Authenticated,
-        )
-        .delete_tier("/mcp", delete(routes::mcp::handle_mcp_delete), TokenTier::Authenticated)
-        .post_tier(
-            "/admin/participant",
-            post(routes::admin::register_participant).with_state(app.clone()),
-            TokenTier::Admin,
-        )
-        .post_tier(
-            "/admin/participant/rotate",
-            post(routes::admin::rotate_participant).with_state(app.clone()),
-            TokenTier::Admin,
-        )
-        .post_tier(
-            "/admin/participant/remove",
-            post(routes::admin::remove_participant).with_state(app.clone()),
-            TokenTier::Admin,
-        )
-        .post_tier(
-            "/admin/room",
-            post(routes::admin::create_room).with_state(app.clone()),
-            TokenTier::Admin,
-        )
-        .post_tier(
-            "/admin/room/member/add",
-            post(routes::admin::add_room_member).with_state(app.clone()),
-            TokenTier::Admin,
-        )
-        .post_tier(
-            "/admin/room/member/remove",
-            post(routes::admin::remove_room_member).with_state(app.clone()),
-            TokenTier::Admin,
-        )
-        .post_tier(
-            "/admin/listener",
-            post(routes::admin::set_listener).with_state(app.clone()),
-            TokenTier::Admin,
-        )
-        .post_tier(
-            "/admin/listener/remove",
-            post(routes::admin::remove_listener).with_state(app.clone()),
-            TokenTier::Admin,
-        )
-        // `GET /health` is the framework's own built-in route (always
-        // mounted; a user route at the same path would panic the router at
-        // build time on the overlapping method). `.with_detail_health()`
-        // is the closest available fit to the crate contract's requested
-        // `{"status":"ok","version":<crate version>}`: stk's shape is
-        // `{"ok":true,"service":...,"version":...,"uptime_s":...,
-        // "dependencies":[],"background_tasks":[]}` -- `ok` rather than
-        // `status`, but it is the version-carrying health shape every
-        // other stk daemon in this workspace already answers with. See
-        // the handoff note on this exact mismatch.
-        .with_detail_health()
-        .with_manifest_auto()
-        .with_request_id()
-        .with_shutdown_timeout(Duration::from_secs(30))
-        .build()
-        .await?;
+        .route("/mcp", post(routes::mcp::handle_mcp_post).delete(routes::mcp::handle_mcp_delete))
+        .route_layer(middleware::from_fn_with_state(authenticated_guard, auth::require_tier))
+        .with_state(app.clone());
 
-    server.run().await?;
+    // `/admin/*` -- the operator-only registry surface.
+    let admin_guard = auth::TierGuard { service: service.clone(), required: auth::Tier::Admin };
+    let admin_router = Router::new()
+        .route("/admin/participant", post(routes::admin::register_participant))
+        .route("/admin/participant/rotate", post(routes::admin::rotate_participant))
+        .route("/admin/participant/remove", post(routes::admin::remove_participant))
+        .route("/admin/room", post(routes::admin::create_room))
+        .route("/admin/room/member/add", post(routes::admin::add_room_member))
+        .route("/admin/room/member/remove", post(routes::admin::remove_room_member))
+        .route("/admin/listener", post(routes::admin::set_listener))
+        .route("/admin/listener/remove", post(routes::admin::remove_listener))
+        .route_layer(middleware::from_fn_with_state(admin_guard, auth::require_tier))
+        .with_state(app.clone());
+
+    // `GET /health` -- the only route without authentication, mounted
+    // outside every gated router entirely.
+    let health_state = Arc::new(health::HealthState::new("mail4agent", env!("CARGO_PKG_VERSION")));
+    let health_router = Router::new().route(
+        "/health",
+        get(move || {
+            let health_state = health_state.clone();
+            async move { health::handle(health_state).await }
+        }),
+    );
+
+    let router = Router::new()
+        .merge(authenticated_router)
+        .merge(admin_router)
+        .merge(health_router)
+        .layer(middleware::from_fn(request_id::request_id_layer));
+
+    let listener = tokio::net::TcpListener::bind(bind).await.map_err(|e| MainError::Bind(bind, e))?;
+    tracing::info!(addr = %bind, "mail4agent listening");
+
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let serve_handle = tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.changed().await;
+            })
+            .await
+    });
+
+    shutdown::graceful_shutdown_signal().await;
+    tracing::info!("shutdown signal received");
+    let _ = shutdown_tx.send(true);
+
+    match tokio::time::timeout(Duration::from_secs(30), serve_handle).await {
+        Ok(Ok(Ok(()))) => tracing::info!("mail4agent stopped"),
+        Ok(Ok(Err(err))) => return Err(MainError::Serve(err)),
+        Ok(Err(join_err)) => tracing::error!(error = %join_err, "serve task panicked"),
+        Err(_) => tracing::warn!("shutdown drain exceeded 30s -- exiting anyway"),
+    }
     Ok(())
 }

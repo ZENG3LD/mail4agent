@@ -621,7 +621,7 @@ fn ensure_session_is_idempotent_and_refreshes_corroborated_fields_without_touchi
     let session_entry = &entry.sessions[0];
     assert_eq!(session_entry.last_seen_unix_ms, 2_000, "last_seen advances on refresh");
     assert_eq!(
-        session_entry.card.corroborated.model.as_ref().map(mail4agent_api::Declared::as_ref),
+        session_entry.card.corroborated.model.as_ref().map(mail4agent_api::Declared::inner_ref),
         Some(&"opus".to_string()),
         "corroborated fields update on refresh"
     );

@@ -730,7 +730,7 @@ impl Ack {
 /// cannot depend on directly: `mail4agent/CLAUDE.md` keeps this crate's
 /// dependency list empty of everything that is not serialisation, and that
 /// crate links Windows process APIs to do its job. Getting the inner value
-/// means calling [`Declared::into_inner`] or [`Declared::as_ref`], never a
+/// means calling [`Declared::into_inner`] or [`Declared::inner_ref`], never a
 /// plain field read, so a caller cannot treat a corroborated fact with the
 /// same weight as an attested one by accident. See [`SessionCard`] for
 /// where the split this type exists to preserve actually matters.
@@ -748,8 +748,11 @@ impl<T> Declared<T> {
         self.0
     }
 
-    /// Borrows the declared value without consuming the wrapper.
-    pub fn as_ref(&self) -> &T {
+    /// Borrows the declared value without consuming the wrapper. Named
+    /// `inner_ref` rather than `as_ref` so it cannot be confused for
+    /// `std::convert::AsRef::as_ref` (this type deliberately does not
+    /// implement that trait).
+    pub fn inner_ref(&self) -> &T {
         &self.0
     }
 }
@@ -799,13 +802,13 @@ pub struct SessionCorroborated {
 impl SessionCorroborated {
     pub fn validate(&self) -> Result<(), MailError> {
         if let Some(value) = &self.provider_session_id {
-            validate_bounded_text("corroborated provider_session_id", value.as_ref())?;
+            validate_bounded_text("corroborated provider_session_id", value.inner_ref())?;
         }
         if let Some(value) = &self.model {
-            validate_bounded_text("corroborated model", value.as_ref())?;
+            validate_bounded_text("corroborated model", value.inner_ref())?;
         }
         if let Some(value) = &self.cwd {
-            validate_bounded_text("corroborated cwd", value.as_ref())?;
+            validate_bounded_text("corroborated cwd", value.inner_ref())?;
         }
         Ok(())
     }
@@ -1348,7 +1351,7 @@ mod tests {
     #[test]
     fn subject_byte_limit_counts_bytes_not_chars_for_multi_byte_utf8() {
         // U+1F600 is 4 bytes in UTF-8 but a single `char`.
-        let subject: String = std::iter::repeat('\u{1F600}').take(200).collect();
+        let subject: String = "\u{1F600}".repeat(200);
         assert!(subject.chars().count() < SUBJECT_MAX_BYTES, "under the byte bound counted as chars");
         assert!(subject.len() > SUBJECT_MAX_BYTES, "over the byte bound counted as bytes");
         let err = validate_subject(&subject).expect_err("byte length must govern, not char count");
@@ -1371,7 +1374,7 @@ mod tests {
 
     #[test]
     fn body_byte_limit_counts_bytes_not_chars_for_multi_byte_utf8() {
-        let body: String = std::iter::repeat('\u{1F600}').take(20_000).collect();
+        let body: String = "\u{1F600}".repeat(20_000);
         assert!(body.chars().count() < BODY_MAX_BYTES, "under the byte bound counted as chars");
         assert!(body.len() > BODY_MAX_BYTES, "over the byte bound counted as bytes");
         let err = validate_body(&body).expect_err("byte length must govern, not char count");

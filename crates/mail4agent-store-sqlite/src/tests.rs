@@ -1,5 +1,5 @@
 //! `SqliteMailStore` exercised directly through [`MailStore`], against an
-//! in-memory [`stk_db::Db`]. `mail4agent-core`'s own engine-level
+//! in-memory [`crate::db::Db`]. `mail4agent-core`'s own engine-level
 //! properties are proven again, end to end, in `engine_tests.rs`; these
 //! tests are about the store's own contract -- what each method persists,
 //! and the SQL each read query is built on.
@@ -11,9 +11,8 @@ use mail4agent_api::{
     SessionCorroborated, SessionDeclared, SessionId,
 };
 use mail4agent_core::{InsertMessageOutcome, MailStore, ParticipantRecord, SecretDigest, SessionRecord};
-use stk_db::{rusqlite, Db, DbConfig, MigrationRunner};
 
-use crate::{migrations, SqliteMailStore};
+use crate::{migrations, Db, DbConfig, MigrationRunner, SqliteMailStore};
 
 fn store() -> SqliteMailStore {
     SqliteMailStore::open_in_memory().expect("in-memory store opens and migrates")

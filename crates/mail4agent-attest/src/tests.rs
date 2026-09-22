@@ -130,8 +130,8 @@ fn command_line_contains_a_known_argument() {
     let exe_name = exe.file_name().and_then(|name| name.to_str()).expect("exe file name");
 
     assert!(
-        command_line.as_ref().to_lowercase().contains(&exe_name.to_lowercase()),
+        command_line.inner_ref().to_lowercase().contains(&exe_name.to_lowercase()),
         "command line {:?} does not contain the running exe's name {exe_name:?}",
-        command_line.as_ref()
+        command_line.inner_ref()
     );
 }

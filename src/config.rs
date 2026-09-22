@@ -43,7 +43,11 @@ pub enum ConfigError {
     #[error("read {0}: {1}")]
     Read(PathBuf, std::io::Error),
     #[error("parse {0}: {1}")]
-    Parse(PathBuf, toml::de::Error),
+    // Boxed so this variant does not blow up `ConfigError`'s own size --
+    // `toml::de::Error` alone is over a hundred bytes, which every
+    // `Result<_, ConfigError>` in this crate would otherwise carry by
+    // value even on the common, error-free path.
+    Parse(PathBuf, Box<toml::de::Error>),
     #[error(
         "no home/data directory available to place the default mailbox database -- \
          set {DB_PATH_ENV} explicitly"
@@ -61,7 +65,7 @@ impl Config {
             return Ok(Self::default());
         }
         let raw = std::fs::read_to_string(&path).map_err(|err| ConfigError::Read(path.clone(), err))?;
-        toml::from_str(&raw).map_err(|err| ConfigError::Parse(path, err))
+        toml::from_str(&raw).map_err(|err| ConfigError::Parse(path, Box::new(err)))
     }
 
     /// Resolves the sqlite path: [`DB_PATH_ENV`] wins unconditionally over
