@@ -13,6 +13,11 @@ name = "mail4agent"
 path = "src/main.rs"
 
 [dependencies]
+# Sibling submodule, not a crates.io crate -- path dependency, not
+# published alongside this crate. `mcp` (shared JSON-RPC-over-HTTP MCP
+# server) plus the default `axum`/`client` features (`DocRouter`,
+# `register::spawn`) -- see nemo-service's own feature doc comment.
+nemo-service = { path = "../nemo-service", features = ["mcp"] }
 mail4agent-api = { path = "crates/mail4agent-api", version = "0.1.0" }
 mail4agent-core = { path = "crates/mail4agent-core", version = "0.1.0" }
 mail4agent-store-sqlite = { path = "crates/mail4agent-store-sqlite", version = "0.1.0" }
