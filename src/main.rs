@@ -33,6 +33,7 @@ mod dto;
 mod error;
 mod health;
 mod identity;
+mod registration;
 mod request_id;
 mod routes;
 mod service;
@@ -44,8 +45,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::middleware;
-use axum::routing::{get, post};
 use axum::Router;
+use nemo_service::register;
+use nemo_service::router::{DocRouter, RouteDoc};
 
 use config::{Config, ConfigError};
 use mail4agent_store_sqlite::{migrations, Db, DbConfig, DbError, MigrationRunner, SqliteMailStore};
@@ -99,59 +101,138 @@ async fn serve(service: Arc<MailboxService>, bind: SocketAddr) -> Result<(), Mai
 
     let app = Arc::new(AppState { service: service.clone(), bind_addr: bind });
 
-    // `/mail/*` and `/mcp` -- every one of these derives the caller from
-    // the presented credential; none of them accepts a sender.
+    // `GET /health` -- the only route without authentication.
+    let health_state = Arc::new(health::HealthState::new("mail4agent", env!("CARGO_PKG_VERSION")));
+    let (health_router, health_endpoints) = DocRouter::<Arc<AppState>>::new()
+        .get(
+            "/health",
+            move || {
+                let health_state = health_state.clone();
+                async move { health::handle(health_state).await }
+            },
+            RouteDoc::new(
+                "Liveness, service name, version and uptime: {\"ok\":true,\"service\":\"mail4agent\",\"version\":...,\"started_at\":...,\"uptime_secs\":...,\"dependencies\":[],\"background_tasks\":[]}. The watchdog only reads the status code.",
+            )
+            .public(),
+        )
+        .into_parts();
+
+    // `/mail/*` -- every one of these derives the caller from the
+    // presented credential; none of them accepts a sender.
+    let (mail_router, mail_endpoints) = DocRouter::<Arc<AppState>>::new()
+        .post(
+            "/mail/send",
+            routes::mail::send,
+            RouteDoc::bearer("Send a message to a participant or a room. The sender is derived from the credential and cannot be supplied. Returns the new message id and the sender's own address."),
+        )
+        .post(
+            "/mail/inbox",
+            routes::mail::inbox,
+            RouteDoc::bearer("Read messages addressed to the caller directly, plus messages to rooms the caller currently belongs to. Takes since_unix_ms and limit, plus wait_secs: long-polls (clamped to 60s, never refused for asking longer) when the inbox would otherwise answer empty, returning an empty page rather than an error on expiry."),
+        )
+        .post("/mail/ack", routes::mail::ack, RouteDoc::bearer("Acknowledge one message the caller may read. Idempotent per (message, reader)."))
+        .post("/mail/get", routes::mail::get, RouteDoc::bearer("Read one message by id, if the caller may read it."))
+        .post(
+            "/mail/unread",
+            routes::mail::unread,
+            RouteDoc::bearer("Unread count for the caller, or for another participant when the caller is an operator."),
+        )
+        .post(
+            "/mail/whoami",
+            routes::mail::whoami,
+            RouteDoc::bearer("The caller's own SESSION address (resolved from the connection, never declared), its account's label, room memberships, and its own card -- attested (kernel), corroborated (its own command line) and declared (its own claims) kept apart."),
+        )
+        .post(
+            "/mail/status",
+            routes::mail::status,
+            RouteDoc::bearer("The session declares what it is working on, its role, and which session spawned it. The only writer of that group; recorded as the session's own claim, never verified."),
+        )
+        .post(
+            "/mail/directory",
+            routes::mail::directory,
+            RouteDoc::bearer("Every registered account (id, label) with its live sessions nested under it (card, whether it is live), and every room the mailbox tracks (id, whether the caller is a member). Never returns a secret digest."),
+        )
+        .into_parts();
+
+    // MCP door onto the same mail surface -- `mail4agent/CLAUDE.md`, "one
+    // implementation, two doors". Same tier as `/mail/*`: an operator
+    // calling a mail tool is just a participant. `resolve_caller_middleware`
+    // is mounted INSIDE this router (see `routes::mcp`'s own doc comment)
+    // so `auth::require_tier`, applied below to the merged authenticated
+    // router, still runs first on every call.
+    let mcp_server = routes::mcp::build();
+    let mcp_endpoints = mcp_server.route_docs();
+    let mcp_router: Router<Arc<AppState>> = mcp_server
+        .into_router()
+        .route_layer(middleware::from_fn_with_state(app.clone(), routes::mcp::resolve_caller_middleware));
+
     let authenticated_guard =
         auth::TierGuard { service: service.clone(), required: auth::Tier::Authenticated };
-    let authenticated_router = Router::new()
-        .route("/mail/send", post(routes::mail::send))
-        .route("/mail/inbox", post(routes::mail::inbox))
-        .route("/mail/ack", post(routes::mail::ack))
-        .route("/mail/get", post(routes::mail::get))
-        .route("/mail/unread", post(routes::mail::unread))
-        .route("/mail/whoami", post(routes::mail::whoami))
-        .route("/mail/status", post(routes::mail::status))
-        .route("/mail/directory", post(routes::mail::directory))
-        // MCP door onto the same mail surface -- `mail4agent/CLAUDE.md`,
-        // "one implementation, two doors". Same tier as `/mail/*`: an
-        // operator calling a mail tool is just a participant.
-        .route("/mcp", post(routes::mcp::handle_mcp_post).delete(routes::mcp::handle_mcp_delete))
-        .route_layer(middleware::from_fn_with_state(authenticated_guard, auth::require_tier))
-        .with_state(app.clone());
+    let authenticated_router: Router<Arc<AppState>> = mail_router
+        .merge(mcp_router)
+        .route_layer(middleware::from_fn_with_state(authenticated_guard, auth::require_tier));
 
     // `/admin/*` -- the operator-only registry surface.
+    let (admin_router, admin_endpoints) = DocRouter::<Arc<AppState>>::new()
+        .post(
+            "/admin/participant",
+            routes::admin::register_participant,
+            RouteDoc::bearer("Register a participant and return its secret ONCE. Only the digest is kept. Operator only."),
+        )
+        .post(
+            "/admin/participant/rotate",
+            routes::admin::rotate_participant,
+            RouteDoc::bearer("Issue a new secret for a participant and invalidate the old one. Operator only."),
+        )
+        .post(
+            "/admin/participant/remove",
+            routes::admin::remove_participant,
+            RouteDoc::bearer("Deregister a participant. Its messages are kept; it can no longer authenticate. Operator only."),
+        )
+        .post("/admin/room", routes::admin::create_room, RouteDoc::bearer("Create a room. Operator only."))
+        .post(
+            "/admin/room/member/add",
+            routes::admin::add_room_member,
+            RouteDoc::bearer("Add a participant to a room, which is what grants it read access to that room. Operator only."),
+        )
+        .post(
+            "/admin/room/member/remove",
+            routes::admin::remove_room_member,
+            RouteDoc::bearer("Remove a participant from a room. It stops reading that room from then on. Operator only."),
+        )
+        .post(
+            "/admin/listener",
+            routes::admin::set_listener,
+            RouteDoc::bearer("Register (or replace) the URL the mailbox POSTs a delivery notification to when mail arrives for an account or any of its sessions. Loopback only. Never carries the subject or body. Best-effort. Operator only."),
+        )
+        .post(
+            "/admin/listener/remove",
+            routes::admin::remove_listener,
+            RouteDoc::bearer("Remove an account's registered delivery listener, if any. Idempotent. Operator only."),
+        )
+        .into_parts();
     let admin_guard = auth::TierGuard { service: service.clone(), required: auth::Tier::Admin };
-    let admin_router = Router::new()
-        .route("/admin/participant", post(routes::admin::register_participant))
-        .route("/admin/participant/rotate", post(routes::admin::rotate_participant))
-        .route("/admin/participant/remove", post(routes::admin::remove_participant))
-        .route("/admin/room", post(routes::admin::create_room))
-        .route("/admin/room/member/add", post(routes::admin::add_room_member))
-        .route("/admin/room/member/remove", post(routes::admin::remove_room_member))
-        .route("/admin/listener", post(routes::admin::set_listener))
-        .route("/admin/listener/remove", post(routes::admin::remove_listener))
-        .route_layer(middleware::from_fn_with_state(admin_guard, auth::require_tier))
-        .with_state(app.clone());
+    let admin_router: Router<Arc<AppState>> =
+        admin_router.route_layer(middleware::from_fn_with_state(admin_guard, auth::require_tier));
 
-    // `GET /health` -- the only route without authentication, mounted
-    // outside every gated router entirely.
-    let health_state = Arc::new(health::HealthState::new("mail4agent", env!("CARGO_PKG_VERSION")));
-    let health_router = Router::new().route(
-        "/health",
-        get(move || {
-            let health_state = health_state.clone();
-            async move { health::handle(health_state).await }
-        }),
-    );
+    let mut endpoints = health_endpoints;
+    endpoints.extend(mail_endpoints);
+    endpoints.extend(mcp_endpoints);
+    endpoints.extend(admin_endpoints);
 
-    let router = Router::new()
+    let router = health_router
         .merge(authenticated_router)
         .merge(admin_router)
-        .merge(health_router)
+        .with_state(app.clone())
         .layer(middleware::from_fn(request_id::request_id_layer));
 
     let listener = tokio::net::TcpListener::bind(bind).await.map_err(|e| MainError::Bind(bind, e))?;
     tracing::info!(addr = %bind, "mail4agent listening");
+
+    // Self-registration (`nemo-service/CLAUDE.md`'s contract: this can
+    // never fail or delay startup) -- fire-and-forget, once the socket is
+    // live.
+    let _reassert = register::spawn(registration::service_manifest(endpoints, bind.port()), register::DEFAULT_REASSERT_INTERVAL);
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let serve_handle = tokio::spawn(async move {
