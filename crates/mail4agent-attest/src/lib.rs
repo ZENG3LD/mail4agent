@@ -13,11 +13,11 @@
 //! anything this crate returns as more than an audit trail. The research
 //! this crate implements is
 //! `docs/gate4agent/research/local-workload-identity-attestation-2026-09-17.md`;
-//! its bottom line, in one sentence: Windows has no cryptographic
-//! peer-credential mechanism on a loopback TCP socket, so the honest
-//! ceiling is *"resolve `(pid, start-time)` from the kernel at connection
-//! time and treat that as the identity, instead of trusting anything the
-//! client claims."* [`PeerProcess::pid`] and
+//! its bottom line, in one sentence: none of Windows, Linux or macOS has a
+//! cryptographic peer-credential mechanism on a loopback TCP socket, so the
+//! honest ceiling on every one of them is *"resolve `(pid, start-time)` from
+//! the kernel at connection time and treat that as the identity, instead of
+//! trusting anything the client claims."* [`PeerProcess::pid`] and
 //! [`PeerProcess::started_at_unix_ms`] are exactly that pair; [`is_alive`]
 //! is the check that makes the pair, not the bare PID, do the work -- a PID
 //! alone is reused the moment its process exits.
@@ -39,11 +39,18 @@
 //! connection it was asked about, so there is nothing left to go stale
 //! between steps.
 
+mod common;
 mod declared;
 mod error;
 
 #[cfg(windows)]
 mod windows_impl;
+
+#[cfg(target_os = "linux")]
+mod linux_impl;
+
+#[cfg(target_os = "macos")]
+mod macos_impl;
 
 use std::net::SocketAddr;
 
@@ -59,19 +66,23 @@ pub use error::AttestError;
 /// `cwd` come from that process's own memory and can be.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerProcess {
-    /// Kernel-attested: the PID `GetExtendedTcpTable` reports as owning the
-    /// connection's peer-side socket, at resolution time.
+    /// Kernel-attested: the PID the OS reports as owning the connection's
+    /// peer-side socket, at resolution time (`GetExtendedTcpTable` on
+    /// Windows; `/proc/net/tcp[6]` plus an fd-table scan on Linux;
+    /// `proc_listpids`/`proc_pidfdinfo` on macOS).
     pub pid: u32,
-    /// Kernel-attested: `pid`'s creation time from `GetProcessTimes`, as
-    /// milliseconds since the Unix epoch. `(pid, started_at_unix_ms)`
-    /// together are the identity -- see [`is_alive`] for why `pid` alone is
-    /// not.
+    /// Kernel-attested: `pid`'s creation time (`GetProcessTimes` on
+    /// Windows; `/proc/<pid>/stat` plus boot time on Linux;
+    /// `proc_pidinfo(PROC_PIDTBSDINFO)` on macOS), as milliseconds since the
+    /// Unix epoch. `(pid, started_at_unix_ms)` together are the identity --
+    /// see [`is_alive`] for why `pid` alone is not.
     pub started_at_unix_ms: u64,
-    /// Kernel-attested: `pid`'s executable image path, from
-    /// `QueryFullProcessImageName` -- the kernel's own record of which file
-    /// backs the process's image, not something the process can rewrite
-    /// about itself. `None` if the process was already gone, or otherwise
-    /// inaccessible, by the time this was read.
+    /// Kernel-attested: `pid`'s executable image path (`QueryFullProcessImageName`
+    /// on Windows; the `/proc/<pid>/exe` symlink on Linux; `proc_pidpath` on
+    /// macOS) -- the kernel's own record of which file backs the process's
+    /// image, not something the process can rewrite about itself. `None` if
+    /// the process was already gone, or otherwise inaccessible, by the time
+    /// this was read.
     pub exe: Option<String>,
     /// **Declared, not attested.** Read out of the process's own memory;
     /// see [`Declared`] before using this for anything beyond an audit
@@ -109,7 +120,15 @@ pub fn attest(peer: SocketAddr, local: SocketAddr) -> Result<PeerProcess, Attest
     {
         windows_impl::attest(peer, local)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        linux_impl::attest(peer, local)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_impl::attest(peer, local)
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
         let _ = (peer, local);
         Err(AttestError::UnsupportedPlatform)
@@ -140,12 +159,20 @@ pub fn is_alive(pid: u32, started_at_unix_ms: u64) -> bool {
     {
         windows_impl::is_alive(pid, started_at_unix_ms)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        linux_impl::is_alive(pid, started_at_unix_ms)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_impl::is_alive(pid, started_at_unix_ms)
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
         let _ = (pid, started_at_unix_ms);
         false
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(all(test, any(windows, target_os = "linux", target_os = "macos")))]
 mod tests;

@@ -50,6 +50,23 @@ launched it), and **declared** (what it is working on, its role, which
 session spawned it — said by the session about itself, the only group it can
 write, through `POST /mail/status` / `m4a_mail_status`).
 
+### Platform support
+
+Attestation — the whole mechanism above — is implemented natively on every
+platform this daemon ships for, each resolving the same `(pid, start time)`
+pair from its own kernel rather than falling back to anything weaker:
+
+| Platform | Connection → owning pid | Process start time | Executable path |
+|---|---|---|---|
+| Windows | `GetExtendedTcpTable` | `GetProcessTimes` | `QueryFullProcessImageName` |
+| Linux | `/proc/net/tcp[6]` matched to an inode, then an fd-table scan under `/proc/<pid>/fd` | `/proc/<pid>/stat` field 22 (clock ticks since boot) + `/proc/stat`'s `btime` | the `/proc/<pid>/exe` symlink |
+| macOS | `proc_listpids` + `proc_pidinfo(PROC_PIDLISTFDS)` + `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)` | `proc_pidinfo(PROC_PIDTBSDINFO)`'s `pbi_start_tvsec`/`pbi_start_tvusec` | `proc_pidpath` |
+
+Any other target still compiles and links — this is an MIT crate, and it
+should not refuse to build somewhere unusual — but has no attestation
+implementation: every `/mail/*` and `/mcp` call is refused by name on that
+target, `GET /health` remains the only route that answers.
+
 ## Addressing
 
 Three kinds of address, and no others:
