@@ -1,7 +1,7 @@
 //! `POST /mcp` / `DELETE /mcp` -- the MCP (Model Context Protocol) door onto
 //! the SAME mail surface `/mail/*` serves, built on the shared
-//! `mcp_service4agent::mcp` server (`nemo/docs/architecture/nemo-hq-scope-and-agent-surface.md`
-//! §4 L5, §5) instead of hand-writing the JSON-RPC protocol here. Every tool
+//! `mcp_service4agent::mcp` server instead of hand-writing the JSON-RPC
+//! protocol here. Every tool
 //! below still dispatches into the exact `*_impl` function its HTTP sibling
 //! in `routes::mail` already calls -- never a second copy of the mailbox
 //! logic (`mail4agent/CLAUDE.md`, "one implementation, two doors").
