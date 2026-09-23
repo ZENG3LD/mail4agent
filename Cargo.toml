@@ -12,12 +12,20 @@ categories = ["development-tools", "network-programming"]
 name = "mail4agent"
 path = "src/main.rs"
 
+[features]
+default = []
+# Optional self-registration with a local process supervisor (d-watchdog):
+# push-asserts this daemon's own manifest against its registry endpoint.
+# Off by default -- see `src/registration.rs` and `mcp-service4agent`'s own
+# `nemo` feature doc comment.
+nemo = ["mcp-service4agent/nemo"]
+
 [dependencies]
-# Sibling submodule, not a crates.io crate -- path dependency, not
-# published alongside this crate. `mcp` (shared JSON-RPC-over-HTTP MCP
-# server) plus the default `axum`/`client` features (`DocRouter`,
-# `register::spawn`) -- see nemo-service's own feature doc comment.
-nemo-service = { path = "../nemo-service", features = ["mcp"] }
+# Path dependency for local development inside the nemo workspace; `cargo
+# publish` strips the `path` and resolves the crates.io release instead.
+# core (always on) gives `McpServer`/`Budget`/`Tool`/`DocRouter`; the `nemo`
+# feature above turns on its own `nemo` feature (manifest + register).
+mcp-service4agent = { version = "0.1.0", path = "../mcp-service4agent" }
 mail4agent-api = { path = "crates/mail4agent-api", version = "0.1.0" }
 mail4agent-core = { path = "crates/mail4agent-core", version = "0.1.0" }
 mail4agent-store-sqlite = { path = "crates/mail4agent-store-sqlite", version = "0.1.0" }
