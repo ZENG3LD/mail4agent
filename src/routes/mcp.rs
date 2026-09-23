@@ -1,6 +1,6 @@
 //! `POST /mcp` / `DELETE /mcp` -- the MCP (Model Context Protocol) door onto
 //! the SAME mail surface `/mail/*` serves, built on the shared
-//! `nemo_service::mcp` server (`nemo/docs/architecture/nemo-hq-scope-and-agent-surface.md`
+//! `mcp_service4agent::mcp` server (`nemo/docs/architecture/nemo-hq-scope-and-agent-surface.md`
 //! §4 L5, §5) instead of hand-writing the JSON-RPC protocol here. Every tool
 //! below still dispatches into the exact `*_impl` function its HTTP sibling
 //! in `routes::mail` already calls -- never a second copy of the mailbox
@@ -8,9 +8,9 @@
 //!
 //! # Caller resolution -- once per HTTP call, via a middleware seam
 //!
-//! `nemo_service::mcp::McpServer` invokes a tool handler once per
+//! `mcp_service4agent::mcp::McpServer` invokes a tool handler once per
 //! `tools/call` item in a JSON-RPC batch, handing it only
-//! [`nemo_service::mcp::CallContext`] (headers plus an optional client
+//! [`mcp_service4agent::mcp::CallContext`] (headers plus an optional client
 //! name) -- it has no notion of this crate's own session identity, which
 //! needs the request's `ConnectInfo<SocketAddr>` (`crate::identity`). So
 //! the caller is resolved exactly ONCE per `POST /mcp` HTTP call in
@@ -28,19 +28,19 @@
 //! parsed yet at that point. `DELETE /mcp` is exempted: this server is
 //! stateless, so a session end always answers 204 regardless of whether the
 //! caller's session can still be resolved (see
-//! [`nemo_service::mcp`]'s own `handle_delete`).
+//! [`mcp_service4agent::mcp`]'s own `handle_delete`).
 //!
 //! # Error shape -- the split that matters most
 //!
 //! A tool that could not be invoked at all (unknown tool name, arguments
 //! that do not deserialise into that tool's own shape) is
-//! [`nemo_service::mcp::ToolOutcome::invalid_argument`], a JSON-RPC error
-//! for an unknown tool name (handled by `nemo_service::mcp` itself) or an
+//! [`mcp_service4agent::mcp::ToolOutcome::invalid_argument`], a JSON-RPC error
+//! for an unknown tool name (handled by `mcp_service4agent::mcp` itself) or an
 //! `isError: true` result naming the offending field for a malformed
 //! argument. A tool that ran and refused -- `PermissionDenied`,
 //! `UnknownParticipant`, `NotAddressedToYou`, any other named
 //! [`mail4agent_api::MailError`] -- is a normal
-//! [`nemo_service::mcp::ToolOutcome::ok`]-shaped result carrying `isError:
+//! [`mcp_service4agent::mcp::ToolOutcome::ok`]-shaped result carrying `isError:
 //! true` and the refusal (serialised with its `kind` tag, compact) as
 //! `content[0].text`. Getting this backwards makes every business refusal
 //! look like a broken server.
@@ -67,7 +67,7 @@ use mail4agent_api::{
     AckRequest, Address, InboxRequest, MailError, MessageGetRequest, SendRequest, SessionDeclared,
     INBOX_LIMIT_DEFAULT, INBOX_LIMIT_MAX, INBOX_WAIT_SECS_MAX, REFS_MAX,
 };
-use nemo_service::mcp::{CallContext, McpServer, Tool, ToolOutcome};
+use mcp_service4agent::mcp::{CallContext, McpServer, Tool, ToolOutcome};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -180,7 +180,7 @@ fn normalize_address_argument(args: &mut Value, field: &str) -> Result<(), ToolO
 }
 
 // ---------------------------------------------------------------------------
-// Schemas -- trimmed to fit `nemo_service::mcp::Budget::WORKSPACE` (no tool
+// Schemas -- trimmed to fit `mcp_service4agent::mcp::Budget::WORKSPACE` (no tool
 // over 1.5 KB, total tools/list at most 8 KB). Per-argument prose rules a
 // schema cannot express are enforced as named refusals in the dispatch
 // closures below instead of spelled out here -- an agent learns them on the
@@ -397,7 +397,7 @@ mod tests {
     use mail4agent_attest::PeerProcess;
     use mail4agent_core::ParticipantPermissions;
     use mail4agent_store_sqlite::SqliteMailStore;
-    use nemo_service::mcp::Budget;
+    use mcp_service4agent::mcp::Budget;
     use std::net::SocketAddr;
     use tower::ServiceExt;
 

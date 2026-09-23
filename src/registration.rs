@@ -1,12 +1,15 @@
-//! Builds the `nemo_service::manifest::ServiceManifest` mail4agent asserts
-//! about itself via `PUT /registry/mail4agent` (see `crate::main`'s call to
-//! `nemo_service::register::spawn`). `endpoints` is the list `crate::main`
-//! recorded while building the real router via `nemo_service::router::DocRouter`
-//! -- there is exactly one place a route is described. Replaces the
-//! hand-written `.nemo-service.toml`, deleted in the same commit as this
-//! module.
+//! Builds the `mcp_service4agent::manifest::ServiceManifest` mail4agent
+//! asserts about itself via `PUT /registry/mail4agent` (see `crate::main`'s
+//! call to `mcp_service4agent::register::spawn`). `endpoints` is the list
+//! `crate::main` recorded while building the real router via
+//! `mcp_service4agent::router::DocRouter` -- there is exactly one place a
+//! route is described. Replaces the hand-written per-service manifest TOML
+//! file, deleted in the same commit as this module. Compiled only under this
+//! crate's own `nemo` feature -- see `Cargo.toml` and `main.rs`'s `mod
+//! registration` declaration.
 
-use nemo_service::manifest::{Dependencies, Endpoint, HealthInfo, Links, ServiceManifest, ServiceMeta};
+use mcp_service4agent::manifest::{Dependencies, HealthInfo, Links, ServiceManifest, ServiceMeta};
+use mcp_service4agent::router::Endpoint as RouteEndpoint;
 
 /// `mail4agent/CLAUDE.md`'s own first line, plus what it deliberately does
 /// not know.
@@ -22,12 +25,15 @@ const SERVICE_DESCRIPTION: &str = "A mailbox for agent sessions: addresses, mess
 const KEY_REF: &str = "~/.mail4agent/operator-key.raw (bootstrap operator only -- every other participant authenticates with its own secret, minted via POST /admin/participant)";
 
 /// Build the manifest mail4agent asserts about itself. `endpoints` is the
-/// list `crate::main` recorded while building the real router -- passed in
-/// rather than rebuilt here so there is exactly one place a route is
-/// described. `port` is the bind port actually in `mail4agent.toml` (or its
-/// default), read back rather than hardcoded so `links.local_url` can never
-/// drift from what the daemon actually bound to.
-pub fn service_manifest(endpoints: Vec<Endpoint>, port: u16) -> ServiceManifest {
+/// list `crate::main` recorded while building the real router --
+/// `mcp_service4agent::router::Endpoint`, the same type both `DocRouter::into_parts`
+/// and `McpServer::route_docs` hand back, converted here (field-for-field,
+/// via `From`) into this crate's own wire type -- passed in rather than
+/// rebuilt here so there is exactly one place a route is described. `port`
+/// is the bind port actually in `mail4agent.toml` (or its default), read
+/// back rather than hardcoded so `links.local_url` can never drift from what
+/// the daemon actually bound to.
+pub fn service_manifest(endpoints: Vec<RouteEndpoint>, port: u16) -> ServiceManifest {
     ServiceManifest {
         service: ServiceMeta {
             name: "mail4agent".to_string(),
@@ -44,7 +50,7 @@ pub fn service_manifest(endpoints: Vec<Endpoint>, port: u16) -> ServiceManifest 
             docs: Some("mail4agent/CLAUDE.md".to_string()),
             repo: Some("mail4agent".to_string()),
         },
-        endpoints,
+        endpoints: endpoints.into_iter().map(Into::into).collect(),
         manage_actions: Vec::new(),
         dependencies: Dependencies { upstream: Vec::new(), downstream: vec!["gate4agent".to_string()], external: Vec::new() },
         health: Some(HealthInfo { endpoint: "/health".to_string(), expected_status: 200, interval_secs: 30 }),

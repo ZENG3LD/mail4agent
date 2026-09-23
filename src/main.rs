@@ -33,6 +33,7 @@ mod dto;
 mod error;
 mod health;
 mod identity;
+#[cfg(feature = "nemo")]
 mod registration;
 mod request_id;
 mod routes;
@@ -46,8 +47,9 @@ use std::time::Duration;
 
 use axum::middleware;
 use axum::Router;
-use nemo_service::register;
-use nemo_service::router::{DocRouter, RouteDoc};
+#[cfg(feature = "nemo")]
+use mcp_service4agent::register;
+use mcp_service4agent::router::{DocRouter, RouteDoc};
 
 use config::{Config, ConfigError};
 use mail4agent_store_sqlite::{migrations, Db, DbConfig, DbError, MigrationRunner, SqliteMailStore};
@@ -229,10 +231,20 @@ async fn serve(service: Arc<MailboxService>, bind: SocketAddr) -> Result<(), Mai
     let listener = tokio::net::TcpListener::bind(bind).await.map_err(|e| MainError::Bind(bind, e))?;
     tracing::info!(addr = %bind, "mail4agent listening");
 
-    // Self-registration (`nemo-service/CLAUDE.md`'s contract: this can
+    // Self-registration (`mcp-service4agent/CLAUDE.md`'s contract: this can
     // never fail or delay startup) -- fire-and-forget, once the socket is
-    // live.
-    let _reassert = register::spawn(registration::service_manifest(endpoints, bind.port()), register::DEFAULT_REASSERT_INTERVAL);
+    // live. Only wired in when this daemon is built with the `nemo` feature
+    // (see `Cargo.toml`); with default features there is no watchdog code
+    // in the binary at all.
+    #[cfg(feature = "nemo")]
+    {
+        let _reassert =
+            register::spawn(registration::service_manifest(endpoints, bind.port()), register::DEFAULT_REASSERT_INTERVAL);
+    }
+    #[cfg(not(feature = "nemo"))]
+    {
+        let _ = endpoints;
+    }
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let serve_handle = tokio::spawn(async move {
