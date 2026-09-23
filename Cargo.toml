@@ -25,7 +25,7 @@ nemo = ["mcp-service4agent/nemo"]
 # publish` strips the `path` and resolves the crates.io release instead.
 # core (always on) gives `McpServer`/`Budget`/`Tool`/`DocRouter`; the `nemo`
 # feature above turns on its own `nemo` feature (manifest + register).
-mcp-service4agent = { version = "0.1.0", path = "../mcp-service4agent" }
+mcp-service4agent = "0.1.0"
 mail4agent-api = { path = "crates/mail4agent-api", version = "0.1.0" }
 mail4agent-core = { path = "crates/mail4agent-core", version = "0.1.0" }
 mail4agent-store-sqlite = { path = "crates/mail4agent-store-sqlite", version = "0.1.0" }
