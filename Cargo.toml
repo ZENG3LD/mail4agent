@@ -1,6 +1,6 @@
 [package]
 name = "mail4agent"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "A mailbox for agent sessions: addresses, messages, threads and acknowledgements, served over HTTP and MCP."
 license = "MIT"
