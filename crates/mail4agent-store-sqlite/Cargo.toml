@@ -1,13 +1,13 @@
 [package]
 name = "mail4agent-store-sqlite"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
 description = "A MailStore backed by plain SQLite (rusqlite, bundled): versioned migrations, WAL, one transaction per mutation."
 license = "MIT"
 
 [dependencies]
-mail4agent-api = { path = "../mail4agent-api", version = "0.1.0" }
-mail4agent-core = { path = "../mail4agent-core", version = "0.1.0" }
+mail4agent-api = { path = "../mail4agent-api", version = "0.1.2" }
+mail4agent-core = { path = "../mail4agent-core", version = "0.1.2" }
 
 # The connection this crate's own `db` module owns: WAL + foreign_keys
 # pragmas, versioned migrations, blocking read/write helpers. No longer

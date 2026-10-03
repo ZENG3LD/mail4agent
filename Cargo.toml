@@ -1,6 +1,6 @@
 [package]
 name = "mail4agent"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "A mailbox for agent sessions: addresses, messages, threads and acknowledgements, served over HTTP and MCP."
 license = "MIT"
@@ -26,12 +26,12 @@ nemo = ["mcp-service4agent/nemo"]
 # core (always on) gives `McpServer`/`Budget`/`Tool`/`DocRouter`; the `nemo`
 # feature above turns on its own `nemo` feature (manifest + register).
 mcp-service4agent = "0.1.0"
-mail4agent-api = { path = "crates/mail4agent-api", version = "0.1.0" }
-mail4agent-core = { path = "crates/mail4agent-core", version = "0.1.0" }
-mail4agent-store-sqlite = { path = "crates/mail4agent-store-sqlite", version = "0.1.0" }
+mail4agent-api = { path = "crates/mail4agent-api", version = "0.1.2" }
+mail4agent-core = { path = "crates/mail4agent-core", version = "0.1.2" }
+mail4agent-store-sqlite = { path = "crates/mail4agent-store-sqlite", version = "0.1.2" }
 # Resolves which OS process is on the other end of a request's connection --
 # see `src/identity.rs`, "Point 1" of the session-identity work.
-mail4agent-attest = { path = "crates/mail4agent-attest", version = "0.1.0" }
+mail4agent-attest = { path = "crates/mail4agent-attest", version = "0.1.2" }
 
 axum = { version = "0.8", features = ["json"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net"] }

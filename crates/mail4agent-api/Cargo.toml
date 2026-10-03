@@ -1,6 +1,6 @@
 [package]
 name = "mail4agent-api"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
 description = "Wire types for the mail4agent mailbox: addresses, messages, requests and named refusals."
 license = "MIT"

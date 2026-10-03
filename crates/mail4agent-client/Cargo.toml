@@ -1,6 +1,6 @@
 [package]
 name = "mail4agent-client"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
 description = "HTTP client for a mail4agent mailbox."
 license = "MIT"
@@ -9,7 +9,7 @@ keywords = ["agent", "mailbox", "http", "client"]
 categories = ["network-programming", "web-programming::http-client"]
 
 [dependencies]
-mail4agent-api = { path = "../mail4agent-api", version = "0.1.0" }
+mail4agent-api = { path = "../mail4agent-api", version = "0.1.2" }
 
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
