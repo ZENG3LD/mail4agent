@@ -7,8 +7,10 @@
 //! only when the operator has already turned `[cli] use_leader` on and the
 //! destination process was started after that config was written. The web
 //! path POSTs the same letter once to the webhook bound to that session id
-//! in `mail4agent-webhooks.toml`. It does not start `grok`. Room and direct
-//! mail are dropped before either path runs.
+//! in `mail4agent-webhooks.toml`. When that file or `MAIL4AGENT_WEBHOOK_BEARER`
+//! has a local key, the POST carries `Authorization: Bearer`. No key sends
+//! the same POST with no Authorization header. It does not start `grok`.
+//! Room and direct mail are dropped before either path runs.
 
 mod acp;
 mod frame;
@@ -20,11 +22,16 @@ mod web;
 
 pub use acp::{acp_request, classify_inbound, register_message, registered_is_ready, Inbound};
 pub use frame::{encode_frame, MAX_FRAME_BYTES};
-pub use gate::{process_may_use_leader, prompt_text, screen, screen_session, use_leader_enabled, Screen};
-pub use index::{config_mtime_unix_ms, locate, parse_active_sessions, ActiveSession, LocateError, Target};
+pub use gate::{
+    process_may_use_leader, prompt_text, screen, screen_session, use_leader_enabled, Screen,
+};
+pub use index::{
+    config_mtime_unix_ms, locate, parse_active_sessions, ActiveSession, LocateError, Target,
+};
 pub use leader::push_into_session;
 pub use pipe::{grok_home, leader_is_listening, leader_pipe_name, leader_socket, PushError};
 pub use web::{
-    choose_route, parse_webhooks, post_letter, validate_webhook_url, webhook_for, webhooks_path, DeliveryRoute,
-    WebPostError, WebhookError, WEBHOOKS_FILE,
+    choose_route, effective_bearer, parse_webhooks, post_letter, validate_webhook_url, webhook_for,
+    webhooks_path, DeliveryRoute, WebPostError, WebhookBinding, WebhookError, WEBHOOKS_FILE,
+    WEBHOOK_BEARER_ENV,
 };

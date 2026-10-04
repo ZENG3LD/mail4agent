@@ -173,14 +173,29 @@ The other way is a webhook, not a second mailbox and not a listener URL.
 s-01234567 = "https://example.invalid/hook"
 ```
 
-The key is the mailbox session id on the letter (`s-` plus hex), not the
-Grok process session id. When that id is present, the
+The key under `[sessions]` is the mailbox session id on the letter (`s-` plus
+hex), not the Grok process session id. When that id is present, the
 courier POSTs the letter text once to that URL and does not also push the
 leader pipe. The URL is whatever the operator pastes for that session. It is
 not stored as a participant `listener_url`, and `validate_listener_url` is
 unchanged: a mailbox listener is still only `http://127.0.0.1` or
 `http://localhost`. The webhook URL is not written to the log. Until the
 operator pastes one, a real web bot is not woken.
+
+That POST includes `Authorization: Bearer <key>` only when a local key is
+configured. The key is an optional `bearer` string in the same file — one
+value beside `[sessions]`, or `bearer` next to `url` on a session table — or
+the environment variable `MAIL4AGENT_WEBHOOK_BEARER` when the file does not
+set one. The file value wins. A missing or blank key is the previous POST:
+no Authorization header, and not an empty Bearer. A session table that sets
+`bearer` to blank does not inherit the file-level value. The key is not a
+mailbox credential, it is not written to the log, and it does not belong in
+this repo.
+
+```toml
+[sessions.s-01234567]
+url = "https://example.invalid/hook"
+```
 
 ## Status
 
