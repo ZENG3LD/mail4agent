@@ -11,3 +11,7 @@ mail4agent-messenger = { path = "../mail4agent-messenger", version = "0.1.0" }
 sha2 = "0.10"
 zeroize = "1"
 thiserror = "2"
+serde_json = "1"
+# Blocking client: the shell is synchronous, same as the engine it drives.
+# rustls so https routine posts do not depend on the process CA store.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }

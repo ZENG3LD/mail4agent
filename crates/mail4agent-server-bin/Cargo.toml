@@ -21,4 +21,5 @@ chrono = { version = "0.4", features = ["clock"] }
 
 [dev-dependencies]
 mail4agent-server = { path = "../mail4agent-server", version = "0.1.0", features = ["sqlcipher"] }
+mail4agent-messenger-shell = { path = "../mail4agent-messenger-shell", version = "0.1.0" }
 serde_json = "1"
