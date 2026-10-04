@@ -4,14 +4,18 @@
 //! The database key and the bearer tokens are fixtures generated or named
 //! here and are not printed.
 
-use std::io::Read;
-use std::net::TcpStream;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use mail4agent_messenger_shell::{
     CreateRoomKind, DeviceId, MessageKind, MessengerCommand, OpenedStore, OutgoingMessage, RoomId,
+    SessionWake,
 };
 use mail4agent_server::http::hash_token;
 use mail4agent_server::keys::{self, CredentialKind};
@@ -104,6 +108,84 @@ fn server_bin() -> PathBuf {
         "mail4agent-server-bin was not built next to the test harness"
     );
     path
+}
+
+struct RoutineCapture {
+    url: String,
+    hits: Arc<Mutex<Vec<(String, Vec<u8>)>>>,
+    done: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Drop for RoutineCapture {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn start_routine() -> RoutineCapture {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("routine bind");
+    let addr = listener.local_addr().expect("routine addr");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let hits = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&hits);
+    let done = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&done);
+    let thread = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        while !flag.load(Ordering::Relaxed) && Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut sock, _)) => {
+                    let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 2048];
+                    loop {
+                        let n = sock.read(&mut tmp).unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        let marker = b"\r\n\r\n";
+                        if let Some(end) = buf.windows(4).position(|window| window == marker) {
+                            let headers = String::from_utf8_lossy(&buf[..end]).to_string();
+                            let length = headers
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    if name.eq_ignore_ascii_case("content-length") {
+                                        value.trim().parse::<usize>().ok()
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or(0);
+                            if buf.len() >= end + 4 + length {
+                                let body = buf[end + 4..end + 4 + length].to_vec();
+                                recorded.lock().expect("hits").push((headers, body));
+                                let _ = sock.write_all(
+                                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    RoutineCapture {
+        url: format!("http://{addr}/routine"),
+        hits,
+        done,
+        thread: Some(thread),
+    }
 }
 
 fn wait_until_accepts(addr: &str) {
@@ -238,6 +320,11 @@ fn two_shells_exchange_one_text_over_loopback() {
         &base,
         BOB_TOKEN,
     );
+    let routine = start_routine();
+    bob.set_wake(SessionWake {
+        routine_url: Some(routine.url.clone()),
+        ..SessionWake::default()
+    });
     let mut alice_now = 1_000_000_i64;
     let mut bob_now = 1_000_000_i64;
     settle(&mut alice, &mut alice_now);
@@ -356,6 +443,20 @@ fn two_shells_exchange_one_text_over_loopback() {
         "second device did not see the text; {}",
         describe(&bob)
     );
+    let hits = routine.hits.lock().expect("hits");
+    assert_eq!(
+        hits.len(),
+        1,
+        "decrypted room text did not hit the routine once; {}",
+        describe(&bob)
+    );
+    assert!(
+        !hits[0].0.to_ascii_lowercase().contains("authorization"),
+        "routine post added a bearer"
+    );
+    assert!(!hits[0].0.contains("/mail/send"));
+    assert_eq!(std::str::from_utf8(&hits[0].1).unwrap_or(""), TEXT);
+    drop(hits);
 
     drop(alice);
     drop(bob);

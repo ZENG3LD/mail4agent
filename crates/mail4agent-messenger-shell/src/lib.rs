@@ -13,11 +13,24 @@
 //! Outbound mail to other agents is `MessengerCommand::SendMessage` and
 //! `/sync`, not `POST /mail/send` and not `POST /admin/listener`.
 //!
+//! Inbound wake is not a second mailbox. After the engine has a readable
+//! room text from someone else, this shell posts that plaintext to the
+//! one routine URL ([`ROUTINE_URL_ENV`], or [`OpenedStore::set_wake`])
+//! through [`post_decrypted`]. A local session is the existing leader
+//! push ([`LEADER_SOCK_ENV`] -> `wake_decrypted_room`). Missing either
+//! target skips that trigger. It does not drop the message and it is not
+//! an error. Texts already in the store when it opens are not woken.
+//!
 //! The device bearer stays in memory on [`OpenedStore`]. It is sent as
 //! `Authorization: Bearer` and is not written next to the sealed records.
+//! The register response `access_token` is that bearer. A host keychain
+//! injects it into the process environment from outside, the way
+//! box-secrets works, and the caller passes it to [`OpenedStore::open`].
+//! Nothing here reads or writes a secrets file.
 //! Paths the engine builds under `/_matrix` are sent without that prefix:
 //! `mail4agent-server-bin` mounts the Client-Server router at `/client/v3`.
 
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
@@ -53,16 +66,93 @@ pub struct RoutineWake {
     pub url: String,
 }
 
+/// Routine POST target. Unset or empty: no POST. There is no default URL.
+pub const ROUTINE_URL_ENV: &str = "M4A_ROUTINE_URL";
+
+/// Optional `Authorization: Bearer` for [`ROUTINE_URL_ENV`]. Sent only when
+/// that URL is also set. A host keychain injects this into the process
+/// environment from outside. It is never written to disk and never read
+/// from source.
+pub const ROUTINE_BEARER_ENV: &str = "M4A_ROUTINE_BEARER";
+
+/// Leader socket for a local session (`leader.sock`). Unset: no ACP push.
+pub const LEADER_SOCK_ENV: &str = "M4A_LEADER_SOCK";
+
+/// `session/load` working directory when [`LEADER_SOCK_ENV`] is set.
+/// Unset uses the process current directory.
+pub const LEADER_CWD_ENV: &str = "M4A_LEADER_CWD";
+
+/// Wake targets for one shell. Empty fields mean that trigger is off.
+/// `routine_bearer` is kept only in memory and only attached when
+/// `routine_url` is set. The caller fills it from the environment, never
+/// from a literal in source.
+pub struct SessionWake {
+    /// Routine URL. `None` or empty skips the POST.
+    pub routine_url: Option<String>,
+    /// Bearer for the routine POST. `None` or empty sends no
+    /// `Authorization` header.
+    pub routine_bearer: Option<String>,
+    /// Path of an already-running `leader.sock`. `None` skips ACP.
+    pub leader_sock: Option<PathBuf>,
+    /// Working directory for `session/load`. `None` uses the env or cwd.
+    pub leader_cwd: Option<String>,
+}
+
+impl Default for SessionWake {
+    fn default() -> Self {
+        Self {
+            routine_url: None,
+            routine_bearer: None,
+            leader_sock: None,
+            leader_cwd: None,
+        }
+    }
+}
+
+impl SessionWake {
+    /// Reads the documented environment variables. Unset stays `None`.
+    pub fn from_env() -> Self {
+        Self {
+            routine_url: nonempty_var(ROUTINE_URL_ENV),
+            routine_bearer: nonempty_var(ROUTINE_BEARER_ENV),
+            leader_sock: std::env::var_os(LEADER_SOCK_ENV)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
+            leader_cwd: nonempty_var(LEADER_CWD_ENV),
+        }
+    }
+}
+
+fn nonempty_var(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
 /// POSTs `text` once, as the raw body, to `url`. No mailbox path and no
-/// extra bearer. `url` is the bot's already-configured routine. `http` and
-/// `https` are both followed; anything else is refused before a socket
-/// is opened.
+/// `Authorization` header. `url` is the bot's already-configured routine.
+/// `http` and `https` are both followed; anything else is refused before
+/// a socket is opened.
 pub fn post_decrypted(url: &str, text: &str) -> Result<(), ShellError> {
+    post_decrypted_with_bearer(url, text, None)
+}
+
+/// [`post_decrypted`] plus an optional bearer. `bearer` is attached as
+/// `Authorization: Bearer` only when it is `Some` and non-empty. The
+/// value must come from the process environment, not from source. It is
+/// not included in errors.
+pub fn post_decrypted_with_bearer(
+    url: &str,
+    text: &str,
+    bearer: Option<&str>,
+) -> Result<(), ShellError> {
     let target = parse_routine_url(url)?;
     let client = routine_client()?;
-    let response = client
+    let mut builder = client
         .post(target)
-        .header(reqwest::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(reqwest::header::CONTENT_TYPE, "text/plain; charset=utf-8");
+    if let Some(token) = bearer.filter(|token| !token.is_empty()) {
+        builder = builder.header(reqwest::header::AUTHORIZATION, bearer_header(token)?);
+    }
+    let response = builder
         .body(text.to_string())
         .send()
         .map_err(|err| ShellError::RoutineTransport(public_reqwest(&err)))?;
@@ -71,6 +161,19 @@ pub fn post_decrypted(url: &str, text: &str) -> Result<(), ShellError> {
         return Err(ShellError::RoutineStatus(status));
     }
     Ok(())
+}
+
+fn bearer_header(token: &str) -> Result<reqwest::header::HeaderValue, ShellError> {
+    if token
+        .bytes()
+        .any(|byte| byte.is_ascii_whitespace() || !byte.is_ascii())
+    {
+        return Err(ShellError::RoutineBearer);
+    }
+    let mut header = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+        .map_err(|_| ShellError::RoutineBearer)?;
+    header.set_sensitive(true);
+    Ok(header)
 }
 
 fn routine_client() -> Result<reqwest::blocking::Client, ShellError> {
@@ -124,6 +227,19 @@ pub struct OpenedStore {
     sync_flight: Option<SyncFlight>,
     /// Kind and HTTP status of calls this store performed. No bodies.
     http_trace: Vec<(OutgoingRequestKind, u16)>,
+    /// Session id this store was opened with. Also the ACP `sessionId`
+    /// when a leader socket is configured. Not a secret.
+    session_id: String,
+    routine_url: Option<String>,
+    routine_bearer: Option<Zeroizing<String>>,
+    leader_sock: Option<PathBuf>,
+    leader_cwd: Option<String>,
+    /// Inbound event keys whose routine POST already succeeded.
+    routine_sent: HashSet<String>,
+    /// Inbound event keys whose leader prompt already succeeded.
+    leader_sent: HashSet<String>,
+    /// Last wake failure, clipped. No bearer and no message body.
+    wake_note: Option<String>,
 }
 
 struct SyncFlight {
@@ -171,7 +287,14 @@ impl OpenedStore {
     ///
     /// `base_url` is the homeserver origin (`http://127.0.0.1:port` or
     /// `https://...`) with no `/_matrix` prefix. `device_token` is the raw
-    /// bearer. It is held in memory and not written to `dir`.
+    /// bearer from the register response (`access_token`). It is held in
+    /// [`Zeroizing`] memory and not written to `dir`. A host keychain —
+    /// process environment injected from outside, the way box-secrets
+    /// works — is what should pass that bearer in. This function does not
+    /// read a secrets file and does not derive the bearer.
+    ///
+    /// Wake targets are taken from [`SessionWake::from_env`] (default
+    /// unset). [`Self::set_wake`] replaces them.
     pub fn open(
         dir: &Path,
         session_id: &str,
@@ -216,7 +339,7 @@ impl OpenedStore {
             .http1_only()
             .build()
             .map_err(|err| ShellError::Http(clip_public(err.to_string())))?;
-        Ok(Self {
+        let mut opened = Self {
             dir: dir.to_path_buf(),
             core,
             base_url,
@@ -224,7 +347,39 @@ impl OpenedStore {
             client,
             sync_flight: None,
             http_trace: Vec::new(),
-        })
+            session_id: session_id.to_string(),
+            routine_url: None,
+            routine_bearer: None,
+            leader_sock: None,
+            leader_cwd: None,
+            routine_sent: HashSet::new(),
+            leader_sent: HashSet::new(),
+            wake_note: None,
+        };
+        opened.set_wake(SessionWake::from_env());
+        // History already on disk is not a new inbound text.
+        opened.note_already_present();
+        Ok(opened)
+    }
+
+    /// Replaces the wake targets, including ones read from the environment
+    /// at [`Self::open`]. `None` or empty turns that trigger off. The
+    /// bearer is stored in [`Zeroizing`] memory and is not written to disk.
+    pub fn set_wake(&mut self, wake: SessionWake) {
+        self.routine_url = wake.routine_url.filter(|url| !url.is_empty());
+        self.routine_bearer = wake
+            .routine_bearer
+            .filter(|token| !token.is_empty())
+            .map(Zeroizing::new);
+        self.leader_sock = wake.leader_sock.filter(|path| !path.as_os_str().is_empty());
+        self.leader_cwd = wake.leader_cwd.filter(|cwd| !cwd.is_empty());
+    }
+
+    /// Last wake failure that did not drop the room text. `None` if the
+    /// last attempt worked or nothing has been attempted. The bearer and
+    /// the plaintext are not included.
+    pub fn wake_note(&self) -> Option<&str> {
+        self.wake_note.as_deref()
     }
 
     /// Queues `command` on the engine. It does not perform HTTP; [`Self::drive`]
@@ -293,6 +448,7 @@ impl OpenedStore {
         } else {
             self.harvest_sync(now_ms, false)?;
         }
+        self.wake_inbound();
         for _ in 0..24 {
             let released = self.release_after_flush(now_ms)?;
             if released.is_empty() {
@@ -322,6 +478,7 @@ impl OpenedStore {
             if let Some(err) = self.core.take_ingest_error() {
                 return Err(ShellError::Ingest(clip_public(err)));
             }
+            self.wake_inbound();
         }
         Ok(())
     }
@@ -520,6 +677,100 @@ impl OpenedStore {
         }
         Ok(blocked)
     }
+
+    fn inbound_plaintexts(&self) -> Vec<(String, String)> {
+        let me = self.core.user_id();
+        let mut out = Vec::new();
+        for room_id in self.core.room_ids() {
+            let Some(timeline) = self.core.timeline(room_id) else {
+                continue;
+            };
+            for item in timeline.items() {
+                if item.redacted || &item.sender == me || item.send_state != SendState::Sent {
+                    continue;
+                }
+                let body = match &item.content {
+                    ItemContent::Text(text)
+                    | ItemContent::Notice(text)
+                    | ItemContent::Emote(text) => text.body.clone(),
+                    _ => continue,
+                };
+                let Some(event_id) = item.event_id.as_ref() else {
+                    continue;
+                };
+                let key = format!("{}\n{}", room_id.as_str(), event_id.as_str());
+                out.push((key, body));
+            }
+        }
+        out
+    }
+
+    fn note_already_present(&mut self) {
+        for (key, _) in self.inbound_plaintexts() {
+            self.routine_sent.insert(key.clone());
+            self.leader_sent.insert(key);
+        }
+    }
+
+    /// Posts and/or prompts each new inbound plaintext. A missing URL or
+    /// socket skips that trigger. A failed trigger is remembered on
+    /// [`Self::wake_note`] and retried on a later [`Self::drive`]. The
+    /// timeline row stays either way.
+    fn wake_inbound(&mut self) {
+        if self.routine_url.is_none() && self.leader_sock.is_none() {
+            return;
+        }
+        let url = self.routine_url.clone();
+        let bearer = self.routine_bearer.clone();
+        let sock = self.leader_sock.clone();
+        let cwd = self.leader_cwd.clone();
+        let session_id = self.session_id.clone();
+        let items = self.inbound_plaintexts();
+        for (key, body) in items {
+            if let Some(url) = url.as_deref() {
+                if !self.routine_sent.contains(&key) {
+                    match post_decrypted_with_bearer(
+                        url,
+                        &body,
+                        bearer.as_ref().map(|token| token.as_str()),
+                    ) {
+                        Ok(()) => {
+                            self.routine_sent.insert(key.clone());
+                        }
+                        Err(err) => {
+                            self.wake_note = Some(clip_public(err.to_string()));
+                        }
+                    }
+                }
+            }
+            if let Some(sock) = sock.as_deref() {
+                if !self.leader_sent.contains(&key) {
+                    let cwd = cwd.clone().or_else(|| {
+                        std::env::current_dir()
+                            .ok()
+                            .map(|path| path.display().to_string())
+                    });
+                    let Some(cwd) = cwd.filter(|cwd| !cwd.is_empty()) else {
+                        self.wake_note = Some("leader cwd is empty".to_string());
+                        continue;
+                    };
+                    match mail4agent_grok::wake_decrypted_room_blocking(
+                        sock,
+                        &session_id,
+                        &cwd,
+                        &body,
+                    ) {
+                        Ok(()) => {
+                            self.leader_sent.insert(key.clone());
+                        }
+                        Err(err) => {
+                            self.wake_note = Some(clip_public(err.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn membership_name(membership: &Membership) -> &'static str {
@@ -675,6 +926,9 @@ pub enum ShellError {
     /// The routine URL is not an `http` or `https` URL this shell can post to.
     #[error("routine url is not an http or https url")]
     RoutineUrl,
+    /// The routine bearer is not a single header value. The value is not included.
+    #[error("routine bearer is empty or not a single header value")]
+    RoutineBearer,
     /// The routine answered once and was not a success. The body is not included.
     #[error("routine status {0}")]
     RoutineStatus(u16),
@@ -777,7 +1031,9 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Instant;
 
     struct TempDir(PathBuf);
 
@@ -1135,6 +1391,397 @@ mod tests {
         assert!(
             seen.iter().all(|line| !line.contains("/_matrix")),
             "prefix was not stripped: {seen:?}"
+        );
+    }
+
+    struct Hit {
+        headers: String,
+        body: Vec<u8>,
+    }
+
+    fn read_http(sock: &mut std::net::TcpStream) -> Option<(String, Vec<u8>)> {
+        let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 2048];
+        loop {
+            let n = sock.read(&mut tmp).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(header_end) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        if name.eq_ignore_ascii_case("content-length") {
+                            value.trim().parse::<usize>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                if buf.len() >= header_end + 4 + length {
+                    let body = buf[header_end + 4..header_end + 4 + length].to_vec();
+                    return Some((headers, body));
+                }
+            }
+        }
+        None
+    }
+
+    fn write_http(sock: &mut std::net::TcpStream, status: &str, body: &[u8]) {
+        let head = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = sock.write_all(head.as_bytes());
+        let _ = sock.write_all(body);
+    }
+
+    fn sync_with_text(body: &str) -> Vec<u8> {
+        serde_json::json!({
+            "next_batch": "s1",
+            "rooms": {
+                "join": {
+                    "!r:localhost": {
+                        "state": { "events": [] },
+                        "timeline": {
+                            "events": [{
+                                "event_id": "$m1:localhost",
+                                "type": "m.room.message",
+                                "sender": "@bob:localhost",
+                                "origin_server_ts": 10,
+                                "content": { "msgtype": "m.text", "body": body }
+                            }]
+                        }
+                    }
+                }
+            },
+            "device_one_time_keys_count": { "signed_curve25519": 50 },
+            "device_unused_fallback_key_types": ["signed_curve25519"]
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    fn sync_empty() -> Vec<u8> {
+        serde_json::json!({
+            "next_batch": "s2",
+            "device_one_time_keys_count": { "signed_curve25519": 50 },
+            "device_unused_fallback_key_types": ["signed_curve25519"]
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    fn spawn_homeserver(text: &'static str) -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&done);
+        let handle = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            while !flag.load(Ordering::Relaxed) && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut sock, _)) => {
+                        let _ = sock.set_nonblocking(false);
+                        let Some((headers, _)) = read_http(&mut sock) else {
+                            continue;
+                        };
+                        let line = headers.lines().next().unwrap_or("");
+                        let resp = if line.contains("/sync") && line.contains("since=") {
+                            sync_empty()
+                        } else if line.contains("/sync") {
+                            sync_with_text(text)
+                        } else if line.contains("/keys/") {
+                            br#"{"one_time_key_counts":{"signed_curve25519":50}}"#.to_vec()
+                        } else {
+                            b"{}".to_vec()
+                        };
+                        write_http(&mut sock, "200 OK", &resp);
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(15));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (format!("http://{addr}"), done, handle)
+    }
+
+    fn spawn_routine() -> (
+        String,
+        Arc<Mutex<Vec<Hit>>>,
+        Arc<AtomicBool>,
+        thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&hits);
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&done);
+        let handle = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            while !flag.load(Ordering::Relaxed) && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut sock, _)) => {
+                        let _ = sock.set_nonblocking(false);
+                        if let Some((headers, body)) = read_http(&mut sock) {
+                            recorded.lock().expect("hits").push(Hit { headers, body });
+                            let _ = sock.write_all(
+                                b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            );
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(15));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (format!("http://{addr}/routine"), hits, done, handle)
+    }
+
+    fn stop(flag: &AtomicBool, handle: thread::JoinHandle<()>) {
+        flag.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+    }
+
+    fn open_against(base: &str, dir: &Path, session: &str) -> OpenedStore {
+        let device = DeviceId::parse("DEVICE1").expect("device id");
+        OpenedStore::open(
+            dir,
+            session,
+            device,
+            "@alice:localhost",
+            "localhost",
+            base,
+            "fake-token",
+        )
+        .expect("open")
+    }
+
+    #[test]
+    fn inbound_room_text_hits_the_routine_once() {
+        let (base, home_done, home) = spawn_homeserver("wake-plain");
+        let (routine, hits, routine_done, routine_thread) = spawn_routine();
+        let dir = temp_dir("wake-once");
+        let mut store = open_against(&base, &dir.0, "session-a");
+        store.set_wake(SessionWake {
+            routine_url: Some(routine),
+            ..SessionWake::default()
+        });
+        store.drive(1_000, false).expect("drive");
+        store.drive(3_000, false).expect("drive again");
+        let note = store.wake_note().unwrap_or("").to_string();
+        let saw_text = store.texts().iter().any(|text| text.body == "wake-plain");
+        let trace = store.http_trace();
+        drop(store);
+        stop(&routine_done, routine_thread);
+        stop(&home_done, home);
+        assert!(
+            saw_text,
+            "engine did not surface the inbound text; http={trace:?} note={note}"
+        );
+        let hits = hits.lock().expect("hits");
+        assert_eq!(
+            hits.len(),
+            1,
+            "routine was not hit exactly once; note={note}"
+        );
+        let hit = &hits[0];
+        assert!(
+            hit.headers.starts_with("POST /routine HTTP/1.1"),
+            "{}",
+            hit.headers.lines().next().unwrap_or("")
+        );
+        assert!(
+            !hit.headers.to_ascii_lowercase().contains("authorization"),
+            "no bearer was passed, so the routine post must not send one"
+        );
+        assert!(!hit.headers.contains("/mail/send"));
+        assert!(!hit.headers.contains("/admin/listener"));
+        assert_eq!(String::from_utf8_lossy(&hit.body), "wake-plain");
+    }
+
+    #[test]
+    fn no_routine_url_posts_nothing() {
+        let (base, home_done, home) = spawn_homeserver("wake-plain");
+        let (_routine, hits, routine_done, routine_thread) = spawn_routine();
+        let dir = temp_dir("wake-none");
+        let mut store = open_against(&base, &dir.0, "session-a");
+        store.set_wake(SessionWake::default());
+        store.drive(1_000, false).expect("drive");
+        let saw_text = store.texts().iter().any(|text| text.body == "wake-plain");
+        let trace = store.http_trace();
+        drop(store);
+        stop(&routine_done, routine_thread);
+        stop(&home_done, home);
+        assert!(
+            saw_text,
+            "missing routine url dropped the inbound text; http={trace:?}"
+        );
+        let hits = hits.lock().expect("hits");
+        assert!(hits.is_empty(), "a post happened with no routine url");
+    }
+
+    #[test]
+    fn routine_bearer_header_is_sent_only_when_the_caller_passed_one() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let (headers, body) = read_http(&mut sock).expect("request");
+            let _ = sock.write_all(
+                b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+            (headers, body)
+        });
+        let bearer = "env-bearer";
+        post_decrypted_with_bearer(&format!("http://{addr}/routine"), "letter", Some(bearer))
+            .expect("post");
+        let (headers, body) = server.join().expect("server");
+        let line = headers
+            .lines()
+            .find(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+            .expect("authorization header");
+        let (name, value) = line.split_once(':').expect("header");
+        assert!(name.eq_ignore_ascii_case("authorization"));
+        assert_eq!(value.trim(), format!("Bearer {bearer}"));
+        assert_eq!(String::from_utf8_lossy(&body), "letter");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inbound_room_text_prompts_the_leader_socket_once() {
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        fn frame_read(sock: &mut UnixStream) -> Option<Vec<u8>> {
+            let _ = sock.set_read_timeout(Some(Duration::from_secs(3)));
+            let mut len_buf = [0u8; 4];
+            sock.read_exact(&mut len_buf).ok()?;
+            let len = u32::from_be_bytes(len_buf) as usize;
+            if len > 1_000_000 {
+                return None;
+            }
+            let mut buf = vec![0u8; len];
+            sock.read_exact(&mut buf).ok()?;
+            Some(buf)
+        }
+
+        fn frame_write(sock: &mut UnixStream, value: &serde_json::Value) {
+            let bytes = serde_json::to_vec(value).expect("json");
+            let mut out = (bytes.len() as u32).to_be_bytes().to_vec();
+            out.extend_from_slice(&bytes);
+            sock.write_all(&out).expect("write");
+            sock.flush().expect("flush");
+        }
+
+        fn serve_one(sock: &mut UnixStream, prompts: &Mutex<Vec<String>>) {
+            let Some(bytes) = frame_read(sock) else {
+                return;
+            };
+            let register: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+            assert_eq!(register["type"], "register");
+            frame_write(
+                sock,
+                &serde_json::json!({"type": "registered", "ready": true}),
+            );
+            loop {
+                let Some(bytes) = frame_read(sock) else {
+                    break;
+                };
+                let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+                    Ok(value) => value,
+                    Err(_) => break,
+                };
+                if value.get("type").and_then(|item| item.as_str()) == Some("disconnect") {
+                    break;
+                }
+                if value.get("type").and_then(|item| item.as_str()) != Some("acp") {
+                    continue;
+                }
+                let payload = value
+                    .get("payload")
+                    .and_then(|item| item.as_str())
+                    .unwrap_or("");
+                let inner: serde_json::Value = serde_json::from_str(payload).unwrap_or_default();
+                if inner.get("method").and_then(|item| item.as_str()) == Some("session/prompt") {
+                    let text = inner["params"]["prompt"][0]["text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+                    let session = inner["params"]["sessionId"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+                    prompts
+                        .lock()
+                        .expect("prompts")
+                        .push(format!("{session} {text}"));
+                }
+                let id = inner.get("id").cloned().unwrap_or(serde_json::json!(null));
+                let body = serde_json::json!({"jsonrpc":"2.0","id": id, "result": {}}).to_string();
+                frame_write(sock, &serde_json::json!({"type":"acp","payload": body}));
+            }
+        }
+
+        let dir = temp_dir("leader");
+        let sock_dir = dir.0.join("sock");
+        std::fs::create_dir_all(&sock_dir).expect("dir");
+        let path = sock_dir.join("leader.sock");
+        let listener = UnixListener::bind(&path).expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let prompts = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recorded = Arc::clone(&prompts);
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&done);
+        let leader = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            while !flag.load(Ordering::Relaxed) && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut sock, _)) => {
+                        let _ = sock.set_nonblocking(false);
+                        serve_one(&mut sock, &recorded);
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(15));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let (base, home_done, home) = spawn_homeserver("wake-leader");
+        let mut store = open_against(&base, &dir.0.join("store"), "session-a");
+        store.set_wake(SessionWake {
+            leader_sock: Some(path),
+            leader_cwd: Some("/tmp".to_string()),
+            ..SessionWake::default()
+        });
+        store.drive(1_000, false).expect("drive");
+        store.drive(3_000, false).expect("drive again");
+        let note = store.wake_note().unwrap_or("").to_string();
+        let saw_text = store.texts().iter().any(|text| text.body == "wake-leader");
+        drop(store);
+        stop(&done, leader);
+        stop(&home_done, home);
+        assert!(
+            saw_text,
+            "engine did not surface the inbound text; note={note}"
+        );
+        let prompts = prompts.lock().expect("prompts");
+        assert_eq!(
+            prompts.as_slice(),
+            ["session-a wake-leader"],
+            "leader prompt was not the decrypted text once; note={note}"
         );
     }
 }
