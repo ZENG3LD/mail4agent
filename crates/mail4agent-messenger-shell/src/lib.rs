@@ -59,6 +59,51 @@ pub fn store_seal_key(session_id: &str) -> [u8; 32] {
     key
 }
 
+/// Shared store root on this machine. The caller supplies it. Unset is not
+/// a shared fallback outside tests.
+pub const STORE_ROOT_ENV: &str = "M4A_STORE_ROOT";
+
+/// Directory for `session_id` under `root`.
+///
+/// The final component is the lowercase hex of [`store_seal_key`]. Different
+/// session ids get different directories. The same id gets the same directory
+/// again. The component is only hex, so it cannot leave `root`. Callers stop
+/// pointing two processes at one path by hand. The device bearer is not an
+/// input and is not written into the directory.
+pub fn session_store_dir(root: &Path, session_id: &str) -> PathBuf {
+    root.join(hex_encode(&store_seal_key(session_id)))
+}
+
+/// [`STORE_ROOT_ENV`] when set and non-empty. Tests with it unset get one
+/// temp directory for this process. Other builds return [`ShellError::StoreRoot`]
+/// and do not invent a path two agents would share.
+pub fn store_root() -> Result<PathBuf, ShellError> {
+    if let Some(root) = nonempty_var(STORE_ROOT_ENV) {
+        return Ok(PathBuf::from(root));
+    }
+    #[cfg(test)]
+    {
+        return Ok(std::env::temp_dir().join(format!(
+            "mail4agent-messenger-shell-root-{}",
+            std::process::id()
+        )));
+    }
+    #[cfg(not(test))]
+    {
+        Err(ShellError::StoreRoot)
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
 /// One URL per bot, already created. Neighbors are addressed by nick or mxid
 /// on the server.
 pub struct RoutineWake {
@@ -281,20 +326,12 @@ pub struct TextView {
 
 impl OpenedStore {
     /// Derives the seal key from `session_id`, reads `dir`, and opens the
-    /// core. That calls [`OlmAccountState::load_or_create`] inside
-    /// [`MessengerCore::open_sealed`]. A different session id cannot open
-    /// records this session sealed.
+    /// core. A different session id cannot open records this session sealed.
     ///
-    /// `base_url` is the homeserver origin (`http://127.0.0.1:port` or
-    /// `https://...`) with no `/_matrix` prefix. `device_token` is the raw
-    /// bearer from the register response (`access_token`). It is held in
-    /// [`Zeroizing`] memory and not written to `dir`. A host keychain —
-    /// process environment injected from outside, the way box-secrets
-    /// works — is what should pass that bearer in. This function does not
-    /// read a secrets file and does not derive the bearer.
-    ///
-    /// Wake targets are taken from [`SessionWake::from_env`] (default
-    /// unset). [`Self::set_wake`] replaces them.
+    /// The host keychain injects `device_token`. [`STORE_ROOT_ENV`] plus
+    /// `session_id` ([`session_store_dir`]) picks `dir`. Inbound text wakes
+    /// [`ROUTINE_URL_ENV`] rather than a side channel. The bearer stays in
+    /// memory and is not written under `dir`.
     pub fn open(
         dir: &Path,
         session_id: &str,
@@ -914,6 +951,9 @@ pub enum ShellError {
     /// No session id, so there is nothing to hash.
     #[error("session id is empty")]
     EmptySession,
+    /// [`STORE_ROOT_ENV`] is unset outside tests.
+    #[error("store root is unset")]
+    StoreRoot,
     /// The bearer is empty or not a single header value.
     #[error("device token is empty or not a single header value")]
     DeviceToken,
@@ -1086,6 +1126,77 @@ mod tests {
             Ok(_) => panic!("different session opened the sealed store"),
             Err(err) => panic!("expected seal auth failure, got {err}"),
         }
+    }
+
+    #[test]
+    fn two_sessions_under_one_root_seal_and_reopen_only_with_their_own_id() {
+        let root = temp_dir("isolate");
+        let dir_a = session_store_dir(&root.0, "session-a");
+        let dir_b = session_store_dir(&root.0, "session-b");
+        assert_ne!(dir_a, dir_b);
+        assert_eq!(dir_a.parent(), Some(root.0.as_path()));
+        assert_eq!(dir_b.parent(), Some(root.0.as_path()));
+        assert_eq!(session_store_dir(&root.0, "session-a"), dir_a);
+        let slipped = session_store_dir(&root.0, "../session-a");
+        assert_eq!(slipped.parent(), Some(root.0.as_path()));
+        let name = slipped.file_name().expect("name").to_string_lossy();
+        assert_eq!(name.len(), 64);
+        assert!(name.chars().all(|ch| ch.is_ascii_hexdigit()));
+
+        let bearer = "isolation-bearer-7c2e";
+        let device = DeviceId::parse("DEVICE1").expect("device id");
+        let open_with = |dir: &Path, session: &str| {
+            OpenedStore::open(
+                dir,
+                session,
+                device.clone(),
+                "@alice:localhost",
+                "localhost",
+                "http://127.0.0.1:9",
+                bearer,
+            )
+        };
+        open_with(&dir_a, "session-a").expect("seal a");
+        open_with(&dir_b, "session-b").expect("seal b");
+        open_with(&dir_a, "session-a").expect("reopen a");
+        open_with(&dir_b, "session-b").expect("reopen b");
+
+        for (dir, session) in [(&dir_a, "session-b"), (&dir_b, "session-a")] {
+            match open_with(dir, session) {
+                Err(ShellError::Store(StoreError::CodecOpen { .. })) => {}
+                Ok(_) => panic!("{session} opened the other sealed store"),
+                Err(err) => panic!("expected seal auth failure, got {err}"),
+            }
+        }
+
+        fn contains_bearer(dir: &Path, needle: &str) -> bool {
+            if !dir.exists() {
+                return false;
+            }
+            for entry in std::fs::read_dir(dir).expect("read") {
+                let entry = entry.expect("entry");
+                let path = entry.path();
+                if path.to_string_lossy().contains(needle) {
+                    return true;
+                }
+                if path.is_dir() {
+                    if contains_bearer(&path, needle) {
+                        return true;
+                    }
+                } else if std::fs::read(&path)
+                    .expect("file")
+                    .windows(needle.len())
+                    .any(|window| window == needle.as_bytes())
+                {
+                    return true;
+                }
+            }
+            false
+        }
+        assert!(
+            !contains_bearer(&root.0, bearer),
+            "raw bearer was written under the store root"
+        );
     }
 
     #[test]
