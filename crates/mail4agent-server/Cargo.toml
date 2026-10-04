@@ -1,0 +1,28 @@
+[package]
+name = "mail4agent-server"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Abstract Matrix-subset homeserver decisions over an open SQLCipher connection. No HTTP, no accounts, no billing. A builder supplies those."
+
+[lib]
+name = "mail4agent_server"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Turns `PRAGMA key` into real SQLCipher. Off by default so a workspace
+# build of the mailbox daemon does not link OpenSSL. The builder enables
+# this on the binary that opens `init_messenger_db`.
+sqlcipher = ["rusqlite/bundled-sqlcipher"]
+
+[dependencies]
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+rand = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+ed25519-dalek = { version = "2", features = ["std"] }
+tracing = "0.1"

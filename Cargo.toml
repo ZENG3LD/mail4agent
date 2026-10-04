@@ -75,4 +75,5 @@ members = [
     "crates/mail4agent-grok",
     "crates/mail4agent-vodozemac",
     "crates/mail4agent-messenger",
+    "crates/mail4agent-server",
 ]
