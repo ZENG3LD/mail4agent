@@ -14,12 +14,15 @@
 //! `/sync`, not `POST /mail/send` and not `POST /admin/listener`.
 //!
 //! Inbound wake is not a second mailbox. After the engine has a readable
-//! room text from someone else, this shell posts that plaintext to the
-//! one routine URL ([`ROUTINE_URL_ENV`], or [`OpenedStore::set_wake`])
-//! through [`post_decrypted`]. A local session is the existing leader
-//! push ([`LEADER_SOCK_ENV`] -> `wake_decrypted_room`). Missing either
-//! target skips that trigger. It does not drop the message and it is not
-//! an error. Texts already in the store when it opens are not woken.
+//! room text from someone else, this shell posts a small JSON object to
+//! the one routine URL ([`ROUTINE_URL_ENV`], or [`OpenedStore::set_wake`])
+//! through [`post_decrypted`]. The plaintext stays in `body`. `from` is
+//! the sender mxid, `event_id` is the Matrix event id, and `nick` is the
+//! sender's display name only when this shell already has one. A local
+//! session is the existing leader push ([`LEADER_SOCK_ENV`] ->
+//! `wake_decrypted_room`). Missing either target skips that trigger. It
+//! does not drop the message and it is not an error. Texts already in
+//! the store when it opens are not woken.
 //!
 //! The device bearer stays in memory on [`OpenedStore`]. It is sent as
 //! `Authorization: Bearer` and is not written next to the sealed records.
@@ -172,12 +175,29 @@ fn nonempty_var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
-/// POSTs `text` once, as the raw body, to `url`. No mailbox path and no
+/// One decrypted room text the routine should learn about.
+///
+/// Serialized as a JSON object. `body` is the plaintext a routine that
+/// only reads the message still finds. `from` is the sender mxid.
+/// `event_id` is the Matrix event id. `nick` is omitted when this shell
+/// does not already know a display name; it is never invented.
+pub struct DecryptedWake<'a> {
+    /// Plaintext body.
+    pub body: &'a str,
+    /// Sender mxid.
+    pub from: &'a str,
+    /// Sender display name, if the room state already has one.
+    pub nick: Option<&'a str>,
+    /// Matrix event id.
+    pub event_id: &'a str,
+}
+
+/// POSTs `wake` once, as a JSON object, to `url`. No mailbox path and no
 /// `Authorization` header. `url` is the bot's already-configured routine.
 /// `http` and `https` are both followed; anything else is refused before
 /// a socket is opened.
-pub fn post_decrypted(url: &str, text: &str) -> Result<(), ShellError> {
-    post_decrypted_with_bearer(url, text, None)
+pub fn post_decrypted(url: &str, wake: &DecryptedWake<'_>) -> Result<(), ShellError> {
+    post_decrypted_with_bearer(url, wake, None)
 }
 
 /// [`post_decrypted`] plus an optional bearer. `bearer` is attached as
@@ -186,19 +206,20 @@ pub fn post_decrypted(url: &str, text: &str) -> Result<(), ShellError> {
 /// not included in errors.
 pub fn post_decrypted_with_bearer(
     url: &str,
-    text: &str,
+    wake: &DecryptedWake<'_>,
     bearer: Option<&str>,
 ) -> Result<(), ShellError> {
     let target = parse_routine_url(url)?;
     let client = routine_client()?;
+    let bytes = routine_json(wake)?;
     let mut builder = client
         .post(target)
-        .header(reqwest::header::CONTENT_TYPE, "text/plain; charset=utf-8");
+        .header(reqwest::header::CONTENT_TYPE, "application/json");
     if let Some(token) = bearer.filter(|token| !token.is_empty()) {
         builder = builder.header(reqwest::header::AUTHORIZATION, bearer_header(token)?);
     }
     let response = builder
-        .body(text.to_string())
+        .body(bytes)
         .send()
         .map_err(|err| ShellError::RoutineTransport(public_reqwest(&err)))?;
     let status = response.status().as_u16();
@@ -206,6 +227,30 @@ pub fn post_decrypted_with_bearer(
         return Err(ShellError::RoutineStatus(status));
     }
     Ok(())
+}
+
+fn routine_json(wake: &DecryptedWake<'_>) -> Result<Vec<u8>, ShellError> {
+    let mut object = serde_json::Map::new();
+    object.insert(
+        "body".to_string(),
+        serde_json::Value::String(wake.body.to_string()),
+    );
+    object.insert(
+        "from".to_string(),
+        serde_json::Value::String(wake.from.to_string()),
+    );
+    object.insert(
+        "event_id".to_string(),
+        serde_json::Value::String(wake.event_id.to_string()),
+    );
+    if let Some(nick) = wake.nick.map(str::trim).filter(|nick| !nick.is_empty()) {
+        object.insert(
+            "nick".to_string(),
+            serde_json::Value::String(nick.to_string()),
+        );
+    }
+    serde_json::to_vec(&object)
+        .map_err(|err| ShellError::RoutineTransport(clip_public(err.to_string())))
 }
 
 fn bearer_header(token: &str) -> Result<reqwest::header::HeaderValue, ShellError> {
@@ -715,7 +760,7 @@ impl OpenedStore {
         Ok(blocked)
     }
 
-    fn inbound_plaintexts(&self) -> Vec<(String, String)> {
+    fn inbound_plaintexts(&self) -> Vec<InboundPlaintext> {
         let me = self.core.user_id();
         let mut out = Vec::new();
         for room_id in self.core.room_ids() {
@@ -736,16 +781,41 @@ impl OpenedStore {
                     continue;
                 };
                 let key = format!("{}\n{}", room_id.as_str(), event_id.as_str());
-                out.push((key, body));
+                out.push(InboundPlaintext {
+                    key,
+                    body,
+                    from: item.sender.as_str().to_string(),
+                    nick: self.sender_nick(room_id, &item.sender),
+                    event_id: event_id.as_str().to_string(),
+                });
             }
         }
         out
     }
 
+    /// Display name already stored for `sender` in this room. Empty and
+    /// missing names stay `None`. This does not query the network and
+    /// does not invent a nick from the mxid.
+    fn sender_nick(&self, room_id: &RoomId, sender: &UserId) -> Option<String> {
+        let name = self
+            .core
+            .room_state(room_id)?
+            .members
+            .get(sender)?
+            .displayname
+            .as_deref()?
+            .trim();
+        if name.is_empty() {
+            None
+        } else {
+            Some(name.to_string())
+        }
+    }
+
     fn note_already_present(&mut self) {
-        for (key, _) in self.inbound_plaintexts() {
-            self.routine_sent.insert(key.clone());
-            self.leader_sent.insert(key);
+        for item in self.inbound_plaintexts() {
+            self.routine_sent.insert(item.key.clone());
+            self.leader_sent.insert(item.key);
         }
     }
 
@@ -763,16 +833,22 @@ impl OpenedStore {
         let cwd = self.leader_cwd.clone();
         let session_id = self.session_id.clone();
         let items = self.inbound_plaintexts();
-        for (key, body) in items {
+        for item in items {
             if let Some(url) = url.as_deref() {
-                if !self.routine_sent.contains(&key) {
+                if !self.routine_sent.contains(&item.key) {
+                    let wake = DecryptedWake {
+                        body: &item.body,
+                        from: &item.from,
+                        nick: item.nick.as_deref(),
+                        event_id: &item.event_id,
+                    };
                     match post_decrypted_with_bearer(
                         url,
-                        &body,
+                        &wake,
                         bearer.as_ref().map(|token| token.as_str()),
                     ) {
                         Ok(()) => {
-                            self.routine_sent.insert(key.clone());
+                            self.routine_sent.insert(item.key.clone());
                         }
                         Err(err) => {
                             self.wake_note = Some(clip_public(err.to_string()));
@@ -781,7 +857,7 @@ impl OpenedStore {
                 }
             }
             if let Some(sock) = sock.as_deref() {
-                if !self.leader_sent.contains(&key) {
+                if !self.leader_sent.contains(&item.key) {
                     let cwd = cwd.clone().or_else(|| {
                         std::env::current_dir()
                             .ok()
@@ -795,10 +871,10 @@ impl OpenedStore {
                         sock,
                         &session_id,
                         &cwd,
-                        &body,
+                        &item.body,
                     ) {
                         Ok(()) => {
-                            self.leader_sent.insert(key.clone());
+                            self.leader_sent.insert(item.key.clone());
                         }
                         Err(err) => {
                             self.wake_note = Some(clip_public(err.to_string()));
@@ -808,6 +884,14 @@ impl OpenedStore {
             }
         }
     }
+}
+
+struct InboundPlaintext {
+    key: String,
+    body: String,
+    from: String,
+    nick: Option<String>,
+    event_id: String,
 }
 
 fn membership_name(membership: &Membership) -> &'static str {
@@ -1243,15 +1327,36 @@ mod tests {
         let wake = RoutineWake {
             url: format!("http://{addr}/routine"),
         };
-        post_decrypted(&wake.url, "hello-from-room").expect("post");
+        post_decrypted(
+            &wake.url,
+            &DecryptedWake {
+                body: "hello-from-room",
+                from: "@bob:localhost",
+                nick: None,
+                event_id: "$m1:localhost",
+            },
+        )
+        .expect("post");
         let (headers, body) = server.join().expect("listener stopped");
         assert!(headers.starts_with("POST /routine HTTP/1.1"), "{headers}");
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("content-type: application/json"),
+            "{headers}"
+        );
         assert!(
             !headers.to_ascii_lowercase().contains("authorization"),
             "routine post must not add a bearer"
         );
         assert!(!headers.contains("/mail/send"), "{headers}");
-        assert_eq!(String::from_utf8_lossy(&body), "hello-from-room");
+        assert_wake_json(
+            &body,
+            "hello-from-room",
+            "@bob:localhost",
+            "$m1:localhost",
+            None,
+        );
     }
 
     #[test]
@@ -1308,8 +1413,16 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
 
-        let err = post_decrypted(&format!("https://127.0.0.1:{port}/hook"), "hello-https")
-            .expect_err("a self-signed cert must not verify");
+        let err = post_decrypted(
+            &format!("https://127.0.0.1:{port}/hook"),
+            &DecryptedWake {
+                body: "hello-https",
+                from: "@bob:localhost",
+                nick: None,
+                event_id: "$m1:localhost",
+            },
+        )
+        .expect_err("a self-signed cert must not verify");
         let _ = server.kill();
         let _ = server.wait();
         assert!(
@@ -1551,13 +1664,38 @@ mod tests {
         let _ = sock.write_all(body);
     }
 
-    fn sync_with_text(body: &str) -> Vec<u8> {
+    fn assert_wake_json(bytes: &[u8], body: &str, from: &str, event_id: &str, nick: Option<&str>) {
+        let parsed: serde_json::Value = serde_json::from_slice(bytes).expect("json wake");
+        assert_eq!(parsed["body"], body);
+        assert_eq!(parsed["from"], from);
+        assert_eq!(parsed["event_id"], event_id);
+        match nick {
+            Some(nick) => assert_eq!(parsed["nick"], nick),
+            None => assert!(
+                parsed.get("nick").is_none() || parsed["nick"].is_null(),
+                "unknown nick must be omitted or null, not invented: {parsed}"
+            ),
+        }
+    }
+
+    fn sync_with_text_nick(body: &str, nick: Option<&str>) -> Vec<u8> {
+        let mut state = Vec::new();
+        if let Some(nick) = nick {
+            state.push(serde_json::json!({
+                "event_id": "$mem:localhost",
+                "type": "m.room.member",
+                "state_key": "@bob:localhost",
+                "sender": "@bob:localhost",
+                "origin_server_ts": 1,
+                "content": { "membership": "join", "displayname": nick }
+            }));
+        }
         serde_json::json!({
             "next_batch": "s1",
             "rooms": {
                 "join": {
                     "!r:localhost": {
-                        "state": { "events": [] },
+                        "state": { "events": state },
                         "timeline": {
                             "events": [{
                                 "event_id": "$m1:localhost",
@@ -1588,6 +1726,13 @@ mod tests {
     }
 
     fn spawn_homeserver(text: &'static str) -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        spawn_homeserver_nick(text, None)
+    }
+
+    fn spawn_homeserver_nick(
+        text: &'static str,
+        nick: Option<&'static str>,
+    ) -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
         listener.set_nonblocking(true).expect("nonblocking");
@@ -1606,7 +1751,7 @@ mod tests {
                         let resp = if line.contains("/sync") && line.contains("since=") {
                             sync_empty()
                         } else if line.contains("/sync") {
-                            sync_with_text(text)
+                            sync_with_text_nick(text, nick)
                         } else if line.contains("/keys/") {
                             br#"{"one_time_key_counts":{"signed_curve25519":50}}"#.to_vec()
                         } else {
@@ -1719,7 +1864,57 @@ mod tests {
         );
         assert!(!hit.headers.contains("/mail/send"));
         assert!(!hit.headers.contains("/admin/listener"));
-        assert_eq!(String::from_utf8_lossy(&hit.body), "wake-plain");
+        assert!(
+            hit.headers
+                .to_ascii_lowercase()
+                .contains("content-type: application/json"),
+            "{}",
+            hit.headers
+        );
+        assert_wake_json(
+            &hit.body,
+            "wake-plain",
+            "@bob:localhost",
+            "$m1:localhost",
+            None,
+        );
+    }
+
+    #[test]
+    fn inbound_room_text_posts_the_sender_nick_the_shell_already_has() {
+        let (base, home_done, home) = spawn_homeserver_nick("wake-named", Some("Hostbot"));
+        let (routine, hits, routine_done, routine_thread) = spawn_routine();
+        let dir = temp_dir("wake-nick");
+        let mut store = open_against(&base, &dir.0, "session-a");
+        store.set_wake(SessionWake {
+            routine_url: Some(routine),
+            ..SessionWake::default()
+        });
+        store.drive(1_000, false).expect("drive");
+        let note = store.wake_note().unwrap_or("").to_string();
+        drop(store);
+        stop(&routine_done, routine_thread);
+        stop(&home_done, home);
+        let hits = hits.lock().expect("hits");
+        assert_eq!(
+            hits.len(),
+            1,
+            "routine was not hit exactly once; note={note}"
+        );
+        assert!(
+            !hits[0]
+                .headers
+                .to_ascii_lowercase()
+                .contains("authorization"),
+            "no bearer was passed"
+        );
+        assert_wake_json(
+            &hits[0].body,
+            "wake-named",
+            "@bob:localhost",
+            "$m1:localhost",
+            Some("Hostbot"),
+        );
     }
 
     #[test]
@@ -1756,8 +1951,17 @@ mod tests {
             (headers, body)
         });
         let bearer = "env-bearer";
-        post_decrypted_with_bearer(&format!("http://{addr}/routine"), "letter", Some(bearer))
-            .expect("post");
+        post_decrypted_with_bearer(
+            &format!("http://{addr}/routine"),
+            &DecryptedWake {
+                body: "letter",
+                from: "@bob:localhost",
+                nick: Some("Bob"),
+                event_id: "$m1:localhost",
+            },
+            Some(bearer),
+        )
+        .expect("post");
         let (headers, body) = server.join().expect("server");
         let line = headers
             .lines()
@@ -1766,7 +1970,67 @@ mod tests {
         let (name, value) = line.split_once(':').expect("header");
         assert!(name.eq_ignore_ascii_case("authorization"));
         assert_eq!(value.trim(), format!("Bearer {bearer}"));
-        assert_eq!(String::from_utf8_lossy(&body), "letter");
+        assert_eq!(
+            headers
+                .lines()
+                .filter(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+                .count(),
+            1
+        );
+        assert_wake_json(
+            &body,
+            "letter",
+            "@bob:localhost",
+            "$m1:localhost",
+            Some("Bob"),
+        );
+    }
+
+    #[test]
+    fn post_decrypted_omits_a_missing_or_blank_nick() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = thread::spawn(move || {
+            let mut bodies = Vec::new();
+            for _ in 0..2 {
+                let (mut sock, _) = listener.accept().expect("accept");
+                let (headers, body) = read_http(&mut sock).expect("request");
+                assert!(
+                    !headers.to_ascii_lowercase().contains("authorization"),
+                    "no bearer was passed"
+                );
+                let _ = sock.write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                bodies.push(body);
+            }
+            bodies
+        });
+        let url = format!("http://{addr}/routine");
+        post_decrypted(
+            &url,
+            &DecryptedWake {
+                body: "plain",
+                from: "@bob:localhost",
+                nick: None,
+                event_id: "$m1:localhost",
+            },
+        )
+        .expect("missing nick");
+        post_decrypted(
+            &url,
+            &DecryptedWake {
+                body: "plain",
+                from: "@bob:localhost",
+                nick: Some("   "),
+                event_id: "$m1:localhost",
+            },
+        )
+        .expect("blank nick");
+        let bodies = server.join().expect("server");
+        for body in &bodies {
+            assert_wake_json(body, "plain", "@bob:localhost", "$m1:localhost", None);
+        }
     }
 
     #[cfg(unix)]
