@@ -1303,6 +1303,7 @@ dependencies = [
  "chrono",
  "mail4agent-server",
  "rusqlite",
+ "serde_json",
  "tokio",
 ]
 

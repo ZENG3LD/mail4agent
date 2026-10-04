@@ -18,3 +18,7 @@ rusqlite = "0.32"
 axum = { version = "0.8", features = ["json"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
 chrono = { version = "0.4", features = ["clock"] }
+
+[dev-dependencies]
+mail4agent-server = { path = "../mail4agent-server", version = "0.1.0", features = ["sqlcipher"] }
+serde_json = "1"
