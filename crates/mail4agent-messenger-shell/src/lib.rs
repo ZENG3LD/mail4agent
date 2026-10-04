@@ -26,12 +26,19 @@
 //!
 //! The device bearer stays in memory on [`OpenedStore`]. It is sent as
 //! `Authorization: Bearer` and is not written next to the sealed records.
-//! The register response `access_token` is that bearer. A host keychain
-//! injects it into the process environment from outside, the way
-//! box-secrets works, and the caller passes it to [`OpenedStore::open`].
-//! Nothing here reads or writes a secrets file.
+//! The register response `access_token` is that bearer, and only when this
+//! call created the device. A later process for the same session gets it
+//! from the host keychain via [`DEVICE_TOKEN_ENV`], the way box-secrets
+//! works. Nothing here reads or writes a secrets file, and the bearer is
+//! not logged.
 //! Paths the engine builds under `/_matrix` are sent without that prefix:
 //! `mail4agent-server-bin` mounts the Client-Server router at `/client/v3`.
+//!
+//! A Grok Bot web session registers itself with [`OpenedStore::connect`].
+//! The nick is derived from the bot display name ([`BOT_NAME_ENV`]), not
+//! from a slug. This path is not the local grok CLI.
+
+mod nick;
 
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
@@ -50,8 +57,10 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 pub use mail4agent_messenger::{
-    CreateRoomKind, DeviceId, MessageKind, MessengerCommand, OutgoingMessage, RoomId, UserId,
+    CreateRoomKind, DeviceId, MessageKind, MessengerCommand, OutgoingMessage, RoomId, RoomKind,
+    UserId,
 };
+pub use nick::nick_from_display_name;
 
 /// SHA-256 of `session_id`'s UTF-8 bytes. That digest is the check that this
 /// session may open the store. The bytes are not written to disk.
@@ -65,6 +74,29 @@ pub fn store_seal_key(session_id: &str) -> [u8; 32] {
 /// Shared store root on this machine. The caller supplies it. Unset is not
 /// a shared fallback outside tests.
 pub const STORE_ROOT_ENV: &str = "M4A_STORE_ROOT";
+
+/// Homeserver origin for a Grok Bot web session, for example
+/// `http://127.0.0.1:8741`. Wins over [`CONFIG_ENV`] / `mail4agent.toml`.
+/// There is no built-in host.
+pub const HOMESERVER_URL_ENV: &str = "M4A_HOMESERVER_URL";
+
+/// Optional path of a toml file whose `homeserver_url` is used when
+/// [`HOMESERVER_URL_ENV`] is unset. Unset looks at `./mail4agent.toml` and
+/// ignores it when that file is absent.
+pub const CONFIG_ENV: &str = "M4A_CONFIG";
+
+/// Display name of this Grok Bot web session, the name the host already
+/// shows. The nick is derived from it. This is not a nick slug.
+pub const BOT_NAME_ENV: &str = "M4A_BOT_NAME";
+
+/// Session id the web host already assigned. The store directory is
+/// [`session_store_dir`] of this id. The same id reopens the same store.
+pub const SESSION_ID_ENV: &str = "M4A_SESSION_ID";
+
+/// Device bearer from the host keychain, for a session that already
+/// registered. Unset on the first connect: the register response supplies
+/// it, once, into process memory. Never a file.
+pub const DEVICE_TOKEN_ENV: &str = "M4A_DEVICE_TOKEN";
 
 /// Directory for `session_id` under `root`.
 ///
@@ -173,6 +205,177 @@ impl SessionWake {
 
 fn nonempty_var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+/// One Grok Bot web session, ready to register. Built from the host
+/// environment ([`SessionConfig::from_env`]) or from the same fields the
+/// host would have injected. The nick is [`nick_from_display_name`] of
+/// `bot_name`. Local grok CLI sessions do not use this type.
+pub struct SessionConfig {
+    homeserver_url: String,
+    nick: String,
+    public_id: String,
+    session_id: String,
+    store_root: PathBuf,
+    device_token: Option<Zeroizing<String>>,
+}
+
+impl SessionConfig {
+    /// `bot_name` is the display name (`Hostbot`, `Привет мир`), not a nick.
+    pub fn new(
+        homeserver_url: impl Into<String>,
+        bot_name: &str,
+        session_id: impl Into<String>,
+        store_root: impl Into<PathBuf>,
+        device_token: Option<String>,
+    ) -> Result<Self, ShellError> {
+        let homeserver_url = homeserver_url.into();
+        parse_base_url(&homeserver_url)?;
+        let session_id = session_id.into();
+        validate_session_id(&session_id)?;
+        let nick = nick_from_display_name(bot_name)?;
+        let device_token = device_token.filter(|token| !token.is_empty());
+        if let Some(token) = &device_token {
+            validate_device_token(token)?;
+        }
+        Ok(Self {
+            homeserver_url,
+            public_id: nick.clone(),
+            nick,
+            session_id,
+            store_root: store_root.into(),
+            device_token: device_token.map(Zeroizing::new),
+        })
+    }
+
+    /// Host environment for a Grok Bot web session.
+    ///
+    /// Required: [`HOMESERVER_URL_ENV`] or `homeserver_url` in toml,
+    /// [`BOT_NAME_ENV`] (display name), [`SESSION_ID_ENV`], [`STORE_ROOT_ENV`].
+    /// Optional: [`DEVICE_TOKEN_ENV`], [`ROUTINE_URL_ENV`], [`ROUTINE_BEARER_ENV`],
+    /// [`LEADER_SOCK_ENV`]. `M4A_NICK` is not read.
+    pub fn from_env() -> Result<Self, ShellError> {
+        let toml_text = load_homeserver_toml()?;
+        Self::from_lookup(
+            |key| std::env::var(key).ok().filter(|value| !value.is_empty()),
+            toml_text.as_deref(),
+        )
+    }
+
+    pub(crate) fn from_lookup(
+        mut get: impl FnMut(&str) -> Option<String>,
+        toml_text: Option<&str>,
+    ) -> Result<Self, ShellError> {
+        let from_toml = match toml_text {
+            Some(text) => homeserver_url_from_toml(text)?,
+            None => None,
+        };
+        let homeserver_url = get(HOMESERVER_URL_ENV)
+            .or(from_toml)
+            .ok_or(ShellError::HomeserverUrl)?;
+        let bot_name = get(BOT_NAME_ENV).ok_or(ShellError::BotName)?;
+        let session_id = get(SESSION_ID_ENV).ok_or(ShellError::EmptySession)?;
+        let store_root = get(STORE_ROOT_ENV).ok_or(ShellError::StoreRoot)?;
+        let device_token = get(DEVICE_TOKEN_ENV);
+        let _ignored_nick_slug = get("M4A_NICK");
+        let _ = _ignored_nick_slug;
+        Self::new(
+            homeserver_url,
+            &bot_name,
+            session_id,
+            store_root,
+            device_token,
+        )
+    }
+
+    /// Derived nick. Not the display name.
+    pub fn nick(&self) -> &str {
+        &self.nick
+    }
+
+    /// [`session_store_dir`] for this session under the configured root.
+    pub fn store_dir(&self) -> PathBuf {
+        session_store_dir(&self.store_root, &self.session_id)
+    }
+}
+
+impl std::fmt::Debug for SessionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionConfig")
+            .field("homeserver_url", &self.homeserver_url)
+            .field("nick", &self.nick)
+            .field("session_id", &self.session_id)
+            .field("store_root", &self.store_root)
+            .field(
+                "device_token",
+                &self.device_token.as_ref().map(|_| "[redacted]"),
+            )
+            .finish()
+    }
+}
+
+fn validate_session_id(session_id: &str) -> Result<(), ShellError> {
+    if session_id.is_empty()
+        || session_id.len() > 128
+        || session_id.starts_with("legacy-user-")
+        || session_id
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch.is_control())
+    {
+        return Err(ShellError::EmptySession);
+    }
+    Ok(())
+}
+
+fn validate_device_token(token: &str) -> Result<(), ShellError> {
+    if token.is_empty()
+        || token
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || !byte.is_ascii())
+    {
+        return Err(ShellError::DeviceToken);
+    }
+    Ok(())
+}
+
+fn load_homeserver_toml() -> Result<Option<String>, ShellError> {
+    let path = if let Some(configured) = nonempty_var(CONFIG_ENV) {
+        PathBuf::from(configured)
+    } else {
+        let cwd = PathBuf::from("mail4agent.toml");
+        if !cwd.exists() {
+            return Ok(None);
+        }
+        cwd
+    };
+    if !path.is_file() {
+        return Err(ShellError::Config("config file is missing".to_string()));
+    }
+    std::fs::read_to_string(&path)
+        .map(Some)
+        .map_err(|err| ShellError::Config(clip_public(err.to_string())))
+}
+
+fn homeserver_url_from_toml(text: &str) -> Result<Option<String>, ShellError> {
+    #[derive(serde::Deserialize)]
+    struct File {
+        #[serde(default)]
+        homeserver_url: Option<String>,
+    }
+    let file: File =
+        toml::from_str(text).map_err(|err| ShellError::Config(clip_public(err.to_string())))?;
+    Ok(file
+        .homeserver_url
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty()))
+}
+
+/// A session found by nick. No routine URL and no bearer.
+pub struct FoundSession {
+    /// The nick stored for that session.
+    pub nick: String,
+    /// That session's Matrix user id.
+    pub user_id: String,
 }
 
 /// One decrypted room text the routine should learn about.
@@ -320,6 +523,9 @@ pub struct OpenedStore {
     /// Session id this store was opened with. Also the ACP `sessionId`
     /// when a leader socket is configured. Not a secret.
     session_id: String,
+    /// Set by [`OpenedStore::connect`]. Empty when opened with a bearer
+    /// the caller already held.
+    nick: Option<String>,
     routine_url: Option<String>,
     routine_bearer: Option<Zeroizing<String>>,
     leader_sock: Option<PathBuf>,
@@ -430,6 +636,7 @@ impl OpenedStore {
             sync_flight: None,
             http_trace: Vec::new(),
             session_id: session_id.to_string(),
+            nick: None,
             routine_url: None,
             routine_bearer: None,
             leader_sock: None,
@@ -442,6 +649,196 @@ impl OpenedStore {
         // History already on disk is not a new inbound text.
         opened.note_already_present();
         Ok(opened)
+    }
+
+    /// Registers this Grok Bot web session, then opens its sealed store.
+    ///
+    /// `POST /client/v3/register` with the derived nick, the session id, and
+    /// a public id equal to that nick. The bearer from a creating response
+    /// stays in memory. A repeat of the same session id returns no bearer;
+    /// [`DEVICE_TOKEN_ENV`] (already copied into `config`) is used instead.
+    /// One [`Self::drive`] publishes this device's public keys. The private
+    /// Olm account stays in the store.
+    pub fn connect(config: &SessionConfig) -> Result<Self, ShellError> {
+        let registered = register_session(config)?;
+        let server_name = registered
+            .user_id
+            .split_once(':')
+            .map(|(_, server)| server)
+            .filter(|server| !server.is_empty())
+            .ok_or(ShellError::Register("user id has no server".to_string()))?;
+        let mut opened = Self::open(
+            &config.store_dir(),
+            &config.session_id,
+            registered.device_id,
+            &registered.user_id,
+            server_name,
+            &config.homeserver_url,
+            &registered.bearer,
+        )?;
+        opened.nick = Some(config.nick.clone());
+        // The first sync is what publishes the public keys.
+        opened.drive(1_000, false)?;
+        Ok(opened)
+    }
+
+    /// [`SessionConfig::from_env`] then [`Self::connect`].
+    pub fn connect_from_env() -> Result<Self, ShellError> {
+        Self::connect(&SessionConfig::from_env()?)
+    }
+
+    /// Bearer for the host keychain. Not written to disk and not logged.
+    pub fn device_bearer(&self) -> &str {
+        self.device_token.as_str()
+    }
+
+    /// This session's derived nick, when [`Self::connect`] stored one.
+    /// [`Self::open`] leaves this empty.
+    pub fn nick(&self) -> Option<&str> {
+        self.nick.as_deref()
+    }
+
+    /// Looks up `name_or_nick` in the user directory. A display name is
+    /// derived first when it is not already a nick. The hit is nick plus
+    /// user id. No routine URL is returned or sent.
+    pub fn find_nick(
+        &mut self,
+        name_or_nick: &str,
+        now_ms: i64,
+    ) -> Result<FoundSession, ShellError> {
+        let needle = nick::lookup_nick(name_or_nick)?;
+        self.dispatch(
+            MessengerCommand::SearchUsers {
+                term: needle.clone(),
+            },
+            now_ms,
+        )?;
+        self.drive(now_ms, false)?;
+        let mut hits: Vec<FoundSession> = self
+            .core
+            .user_search_result()
+            .iter()
+            .filter_map(|entry| {
+                let nick = entry.display_name.as_deref()?.trim();
+                if !nick.eq_ignore_ascii_case(&needle) {
+                    return None;
+                }
+                Some(FoundSession {
+                    nick: nick.to_string(),
+                    user_id: entry.user_id.as_str().to_string(),
+                })
+            })
+            .collect();
+        hits.sort_by(|left, right| left.user_id.cmp(&right.user_id));
+        hits.dedup_by(|left, right| left.user_id == right.user_id);
+        match hits.len() {
+            1 => Ok(hits.remove(0)),
+            0 => Err(ShellError::UnknownNick),
+            _ => Err(ShellError::UnknownNick),
+        }
+    }
+
+    /// Writes `text` to the session named by `name_or_nick`.
+    ///
+    /// The caller is already registered. This looks the nick up, reuses the
+    /// encrypted DM when one exists, otherwise creates one, and sends. It
+    /// does not register the other session and it does not put a routine
+    /// URL in the room.
+    pub fn write_to_nick(
+        &mut self,
+        name_or_nick: &str,
+        text: &str,
+        mut now_ms: i64,
+    ) -> Result<String, ShellError> {
+        let found = self.find_nick(name_or_nick, now_ms)?;
+        let peer = UserId::parse(&found.user_id)?;
+        if &peer == self.core.user_id() {
+            return Err(ShellError::UnknownNick);
+        }
+        let room_id = if let Some(room_id) = self.dm_room(&peer) {
+            room_id
+        } else {
+            self.dispatch(
+                MessengerCommand::CreateRoom {
+                    kind: CreateRoomKind::Dm { peer: peer.clone() },
+                },
+                now_ms,
+            )?;
+            self.wait_for_dm(&peer, &mut now_ms)?
+        };
+        let encrypted = self
+            .rooms()
+            .into_iter()
+            .any(|room| room.room_id == room_id && room.encrypted);
+        if !encrypted {
+            return Err(ShellError::Dm);
+        }
+        self.dispatch(
+            MessengerCommand::SendMessage {
+                room_id: RoomId::parse(&room_id)?,
+                message: OutgoingMessage {
+                    kind: MessageKind::Text,
+                    body: text.to_string(),
+                    reply_to: None,
+                    edit_of: None,
+                },
+                txn_id: None,
+            },
+            now_ms,
+        )?;
+        for _ in 0..8 {
+            now_ms += 1_000;
+            self.drive(now_ms, false)?;
+            if let Some(row) = self
+                .texts()
+                .into_iter()
+                .find(|row| row.room_id == room_id && row.body == text)
+            {
+                if row.outcome == "sent" {
+                    return Ok(room_id);
+                }
+                if row.outcome.starts_with("failed") {
+                    return Err(ShellError::Dm);
+                }
+            }
+        }
+        Err(ShellError::Dm)
+    }
+
+    fn wait_for_dm(&mut self, peer: &UserId, now_ms: &mut i64) -> Result<String, ShellError> {
+        for attempt in 0..6 {
+            *now_ms += 1_000;
+            self.drive(*now_ms, attempt == 5)?;
+            if let Some(room_id) = self.dm_room(peer) {
+                return Ok(room_id);
+            }
+        }
+        Err(ShellError::Dm)
+    }
+
+    fn dm_room(&self, peer: &UserId) -> Option<String> {
+        let me = self.core.user_id().clone();
+        let ids: Vec<RoomId> = self.core.room_ids().cloned().collect();
+        for room_id in &ids {
+            let (joined, has_peer) = {
+                let Some(state) = self.core.room_state(room_id) else {
+                    continue;
+                };
+                let joined = state
+                    .members
+                    .get(&me)
+                    .is_some_and(|member| member.membership == Membership::Join);
+                let has_peer = state.members.contains_key(peer);
+                (joined, has_peer)
+            };
+            if !joined || !has_peer {
+                continue;
+            }
+            if self.core.room_kind(room_id) == Some(RoomKind::Dm) {
+                return Some(room_id.as_str().to_string());
+            }
+        }
+        None
     }
 
     /// Replaces the wake targets, including ones read from the environment
@@ -919,10 +1316,100 @@ fn parse_base_url(raw: &str) -> Result<reqwest::Url, ShellError> {
         "http" | "https" => {}
         _ => return Err(ShellError::BaseUrl),
     }
-    if url.host_str().is_none() || url.query().is_some() || url.fragment().is_some() {
+    if url.host_str().is_none()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
         return Err(ShellError::BaseUrl);
     }
     Ok(url)
+}
+
+struct RegisteredSession {
+    user_id: String,
+    device_id: DeviceId,
+    bearer: Zeroizing<String>,
+}
+
+fn register_session(config: &SessionConfig) -> Result<RegisteredSession, ShellError> {
+    let base = parse_base_url(&config.homeserver_url)?;
+    let mut url = base;
+    url.set_path("/client/v3/register");
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .http1_only()
+        .build()
+        .map_err(|err| ShellError::Http(clip_public(err.to_string())))?;
+    let body = serde_json::json!({
+        "public_id": config.public_id,
+        "nick": config.nick,
+        "session_id": config.session_id,
+    });
+    let response = client
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(
+            serde_json::to_vec(&body)
+                .map_err(|err| ShellError::Http(clip_public(err.to_string())))?,
+        )
+        .send()
+        .map_err(|err| ShellError::Http(clip_public(err.to_string())))?;
+    let status = response.status().as_u16();
+    let bytes = response
+        .bytes()
+        .map_err(|err| ShellError::Http(clip_public(err.to_string())))?;
+    if !(200..300).contains(&status) {
+        return Err(ShellError::Register(register_failure(status, &bytes)));
+    }
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|_| ShellError::Register("register response was not json".to_string()))?;
+    let user_id = parsed
+        .get("user_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    let device_raw = parsed
+        .get("device_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    if user_id.is_empty() || device_raw.is_empty() {
+        return Err(ShellError::Register(
+            "register response missed an id".to_string(),
+        ));
+    }
+    let device_id = DeviceId::parse(device_raw)?;
+    let minted = parsed
+        .get("access_token")
+        .and_then(|value| value.as_str())
+        .filter(|token| !token.is_empty());
+    let bearer = if let Some(token) = minted {
+        validate_device_token(token)?;
+        Zeroizing::new(token.to_string())
+    } else if let Some(token) = &config.device_token {
+        token.clone()
+    } else {
+        return Err(ShellError::DeviceToken);
+    };
+    Ok(RegisteredSession {
+        user_id,
+        device_id,
+        bearer,
+    })
+}
+
+fn register_failure(status: u16, body: &[u8]) -> String {
+    let parsed: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
+    let errcode = parsed
+        .get("errcode")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let error = parsed
+        .get("error")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    clip_public(format!("status {status} {errcode} {error}"))
 }
 
 fn sync_timeout_ms(request: &OutgoingRequest) -> u64 {
@@ -1038,6 +1525,27 @@ pub enum ShellError {
     /// [`STORE_ROOT_ENV`] is unset outside tests.
     #[error("store root is unset")]
     StoreRoot,
+    /// [`HOMESERVER_URL_ENV`] and toml `homeserver_url` are both unset.
+    #[error("homeserver url is unset")]
+    HomeserverUrl,
+    /// [`BOT_NAME_ENV`] is unset. The display name is required for a web session.
+    #[error("bot display name is unset")]
+    BotName,
+    /// The display name did not yield a nick.
+    #[error("nick could not be derived from the bot display name")]
+    Nick,
+    /// Homeserver register failed. The text is a status and errcode, not a bearer.
+    #[error("homeserver register failed: {0}")]
+    Register(String),
+    /// No session nick matched.
+    #[error("no session with that nick")]
+    UnknownNick,
+    /// A direct room was not opened or its encrypted send did not finish.
+    #[error("direct room was not ready")]
+    Dm,
+    /// Toml for the homeserver URL could not be read.
+    #[error("config: {0}")]
+    Config(String),
     /// The bearer is empty or not a single header value.
     #[error("device token is empty or not a single header value")]
     DeviceToken,
@@ -1152,6 +1660,51 @@ fn record_path(dir: &Path, key: &RecordKey) -> Result<PathBuf, ShellError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_session_config_derives_the_nick_and_ignores_a_slug() {
+        let config = SessionConfig::from_lookup(
+            |key| match key {
+                HOMESERVER_URL_ENV => Some("http://127.0.0.1:9".to_string()),
+                BOT_NAME_ENV => Some("Привет мир".to_string()),
+                SESSION_ID_ENV => Some("web-session-1".to_string()),
+                STORE_ROOT_ENV => Some("/tmp/m4a-root".to_string()),
+                "M4A_NICK" => Some("nachshtab".to_string()),
+                _ => None,
+            },
+            None,
+        )
+        .expect("config");
+        assert_eq!(config.nick(), "privet_mir");
+        assert_eq!(
+            config.store_dir(),
+            session_store_dir(Path::new("/tmp/m4a-root"), "web-session-1")
+        );
+        let hostbot = SessionConfig::from_lookup(
+            |key| match key {
+                HOMESERVER_URL_ENV => Some("http://127.0.0.1:9".to_string()),
+                BOT_NAME_ENV => Some("Hostbot".to_string()),
+                SESSION_ID_ENV => Some("web-hostbot".to_string()),
+                STORE_ROOT_ENV => Some("/tmp/m4a-root".to_string()),
+                _ => None,
+            },
+            Some("homeserver_url = \"http://127.0.0.1:1\"\n"),
+        )
+        .expect("hostbot");
+        assert_eq!(hostbot.nick(), "hostbot");
+        assert!(hostbot.homeserver_url.contains("127.0.0.1:9"));
+        let from_toml = SessionConfig::from_lookup(
+            |key| match key {
+                BOT_NAME_ENV => Some("Hostbot".to_string()),
+                SESSION_ID_ENV => Some("web-hostbot".to_string()),
+                STORE_ROOT_ENV => Some("/tmp/m4a-root".to_string()),
+                _ => None,
+            },
+            Some("homeserver_url = \"http://127.0.0.1:9\"\nother = \"ignored\"\n"),
+        )
+        .expect("toml url");
+        assert_eq!(from_toml.homeserver_url, "http://127.0.0.1:9");
+    }
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::process::{Command, Stdio};

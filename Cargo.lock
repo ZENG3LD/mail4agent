@@ -1293,9 +1293,11 @@ dependencies = [
  "mail4agent-grok",
  "mail4agent-messenger",
  "reqwest",
+ "serde",
  "serde_json",
  "sha2",
  "thiserror",
+ "toml",
  "zeroize",
 ]
 

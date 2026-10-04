@@ -12,7 +12,9 @@ mail4agent-grok = { path = "../mail4agent-grok", version = "0.1.3" }
 sha2 = "0.10"
 zeroize = "1"
 thiserror = "2"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.8"
 # Blocking client: the shell is synchronous, same as the engine it drives.
 # rustls so https routine posts do not depend on the process CA store.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
