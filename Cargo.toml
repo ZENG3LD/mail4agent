@@ -8,6 +8,10 @@ readme = "README.md"
 keywords = ["agent", "mailbox", "mcp", "messaging"]
 categories = ["development-tools", "network-programming"]
 
+[lib]
+name = "mail4agent"
+path = "src/lib.rs"
+
 [[bin]]
 name = "mail4agent"
 path = "src/main.rs"
