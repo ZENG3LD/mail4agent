@@ -1296,6 +1296,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mail4agent-server-bin"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "mail4agent-server",
+ "rusqlite",
+ "tokio",
+]
+
+[[package]]
 name = "mail4agent-store-sqlite"
 version = "0.1.2"
 dependencies = [
