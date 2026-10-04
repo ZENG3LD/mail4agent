@@ -3,8 +3,8 @@
 //!
 //! A bearer is `Authorization: Bearer <raw>` or the `access_token` query
 //! parameter. The stored credential is the SHA-256 hex of that raw token
-//! ([`hash_token`]). The websession creates the device with
-//! [`crate::keys::create_device`] and `CredentialKind::Bearer`.
+//! ([`hash_token`]). `POST /client/v3/register` returns the raw bearer once,
+//! in the response that creates the device. Nothing else returns it.
 
 use std::sync::Arc;
 
@@ -25,6 +25,7 @@ mod account;
 mod ephemeral;
 mod keys;
 mod messaging;
+mod register;
 mod rooms;
 mod sync;
 
@@ -103,6 +104,7 @@ pub fn router(state: Arc<Homeserver>) -> Router {
         .merge(messaging::routes())
         .merge(ephemeral::routes())
         .merge(account::routes())
+        .merge(register::routes())
         .merge(keys::routes())
         .merge(sync::routes())
         .fallback(unrecognized)

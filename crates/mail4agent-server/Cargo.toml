@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 publish = false
-description = "Matrix-subset homeserver: protocol decisions plus the Client-Server HTTP routes. No chart accounts and no billing. The websession mounts the router, sets nicks, and mints bearer devices."
+description = "Matrix-subset homeserver: protocol decisions plus the Client-Server HTTP routes. No chart accounts and no billing. A session autoregisters, keeps the nick, and receives its device bearer once."
 
 [lib]
 name = "mail4agent_server"

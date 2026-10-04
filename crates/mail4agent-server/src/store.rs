@@ -29,10 +29,12 @@
 //!
 //! # Cross-database rule
 //!
-//! This module stores `user_id INTEGER` and, on `matrix_users`, the nick.
-//! [`crate::nick`] reads and writes that nick. There is no identity database.
-//! `matrix_users` maps `user_id` to its Matrix id (`mxid`) once: `public_id`
-//! is immutable, so the mapping does not change.
+//! This module stores `user_id INTEGER`. The nick lives on
+//! `messenger_sessions`, which [`crate::nick`] reads and writes. The
+//! `matrix_users.nick` column is left in place and is not the source of
+//! truth. There is no identity database. `matrix_users` maps `user_id` to
+//! its Matrix id (`mxid`) once: `public_id` is immutable, so the mapping
+//! does not change.
 //!
 //! The one place a label does end up in this database is the `displayname`
 //! field of an `m.room.member` event's `content` — the Matrix convention,
@@ -396,6 +398,20 @@ pub fn create_matrix_schema(conn: &Connection) -> rusqlite::Result<()> {
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_matrix_users_nick_lower
             ON matrix_users(LOWER(nick)) WHERE nick IS NOT NULL;
+
+        -- Nick belongs to a session, not to matrix_users and not to the
+        -- device. device_id is only a mark. One device may have many sessions.
+        -- matrix_users.nick stays for old databases and is not read.
+        CREATE TABLE IF NOT EXISTS messenger_sessions (
+            session_id TEXT PRIMARY KEY,
+            user_id    INTEGER NOT NULL,
+            device_id  TEXT NOT NULL,
+            nick       TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_messenger_sessions_user
+            ON messenger_sessions(user_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_messenger_sessions_nick_lower
+            ON messenger_sessions(LOWER(nick));
 
         CREATE TABLE IF NOT EXISTS rooms (
             id                  TEXT PRIMARY KEY,
