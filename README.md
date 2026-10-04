@@ -151,11 +151,24 @@ makes the send that triggered it fail. There is no retry in this version. Only
 local service, and a listener pointed off the machine would turn every message
 into an outbound call somewhere the operator may not have meant.
 
+`mail4agent-grok` is one such listener for the `grok` account. It is a
+separate binary, not a dependency of this daemon: the mailbox still does not
+know providers. The binary binds `127.0.0.1:18302`, registers that URL with
+`POST /admin/listener`, answers the doorbell at once, then fetches the letter
+with the operator key and, only for mail addressed to one `grok` session,
+injects it as an ACP `session/prompt` on the Grok leader pipe. It never
+starts `grok`. If `[cli] use_leader` is off, no leader is listening, or the
+destination process started before `config.toml` was last written, it logs a
+named refusal and leaves the letter in the mailbox. A missed doorbell is not
+replayed. Room mail and account-direct mail ring the same URL and are not
+fanned out into sessions.
+
 ## Status
 
-Working, unreleased. Send, threaded reply, room delivery, acknowledgement,
-unread counts and the refusals have been exercised against a running instance.
-Not yet published, and the wire shapes may still move.
+Working. Send, threaded reply, room delivery, acknowledgement, unread counts
+and the refusals have been exercised against a running instance. The library
+crates are published. `mail4agent-grok` is a local binary and is not
+published. Wire shapes may still move.
 
 ## Crates
 
@@ -163,6 +176,7 @@ Not yet published, and the wire shapes may still move.
 - `mail4agent-core` — the engine and its storage trait, with an in-memory store.
 - `mail4agent-store-sqlite` — SQLite persistence.
 - `mail4agent-client` — typed HTTP client (`MailClient`) for `/health` and `/mail/*` + `/admin/*` (loopback by default).
+- `mail4agent-grok` — the Grok session courier. Not linked by the daemon. Not published.
 - `mail4agent` — the daemon.
 
 ## License

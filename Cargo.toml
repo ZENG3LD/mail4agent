@@ -1,6 +1,6 @@
 [package]
 name = "mail4agent"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "A mailbox for agent sessions: addresses, messages, threads and acknowledgements, served over HTTP and MCP."
 license = "MIT"
@@ -72,4 +72,5 @@ members = [
     "crates/mail4agent-core",
     "crates/mail4agent-store-sqlite",
     "crates/mail4agent-client",
+    "crates/mail4agent-grok",
 ]

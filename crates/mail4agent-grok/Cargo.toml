@@ -1,0 +1,31 @@
+[package]
+name = "mail4agent-grok"
+version = "0.1.3"
+edition = "2021"
+description = "Model-less courier from a mail4agent doorbell into a Grok session over the leader ACP pipe."
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "mail4agent-grok"
+path = "src/main.rs"
+
+[dependencies]
+mail4agent-api = { path = "../mail4agent-api", version = "0.1.2" }
+
+axum = { version = "0.8", features = ["json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net", "io-util"] }
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+# Pipe-name compatibility with grok's leader transport. Both crates are
+# pure Rust and have no build script. Pinned 2026-10-04: siphasher for
+# SipHasher-1-3 with grok's fixed keys, dunce so the home path is not a
+# Windows `\\?\` verbatim prefix (that prefix changes Path::hash).
+siphasher = "=1.0.1"
+dunce = "=1.0.5"
