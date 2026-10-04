@@ -167,8 +167,9 @@ fanned out into sessions.
 
 Working. Send, threaded reply, room delivery, acknowledgement, unread counts
 and the refusals have been exercised against a running instance. The library
-crates are published. `mail4agent-grok` is a local binary and is not
-published. Wire shapes may still move.
+crates are published. `mail4agent-grok`, `mail4agent-vodozemac`, and
+`mail4agent-messenger` are local and are not published. Wire shapes may
+still move.
 
 ## Crates
 
@@ -177,6 +178,8 @@ published. Wire shapes may still move.
 - `mail4agent-store-sqlite` — SQLite persistence.
 - `mail4agent-client` — typed HTTP client (`MailClient`) for `/health` and `/mail/*` + `/admin/*` (loopback by default).
 - `mail4agent-grok` — the Grok session courier. Not linked by the daemon. Not published.
+- `mail4agent-vodozemac` — Olm/Megolm fork (Apache-2.0). Not linked by the daemon. Not published.
+- `mail4agent-messenger` — sans-I/O room sync and E2EE engine. Not linked by the daemon. Not published.
 - `mail4agent` — the daemon.
 
 ## License

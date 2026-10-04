@@ -1,0 +1,46 @@
+[package]
+name = "mail4agent-messenger"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Sans-I/O Matrix Client-Server-subset sync + E2EE (Olm/Megolm) engine -- no network, no disk; shells execute OutgoingRequests and persist sealed records the core exports through a flush-before-send barrier."
+
+[lib]
+name = "mail4agent_messenger"
+path = "src/lib.rs"
+
+[dependencies]
+mail4agent-vodozemac = { path = "../mail4agent-vodozemac" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2"
+# Zeroizing wrappers for caller-supplied key material this crate holds
+# (`core::CoreSecrets::store_seal_key`/`backup_key`,
+# `store::sealed::SealedRecordCodec`'s own key).
+zeroize = "1"
+# The record-log codec (`persist_log`) frames a shell's `records.log` as
+# `[len][SHA-256(payload)][payload]` so boot-time replay can tell a torn
+# tail (a crash mid-write) apart from real data.
+sha2 = "0.10"
+# `wire::events` keeps Olm/Megolm ciphertext, Megolm session-key exports,
+# and OTK/backup blobs as opaque base64 strings at the wire-parsing layer.
+# Decoding them is the crypto machine's job.
+base64 = "0.22"
+# Local store seal (`store::sealed`). Nonce drawn from `OsRng`; ciphertext
+# layout matches the previous vault helper: nonce prefix plus GCM tag
+# appended to the ciphertext. No HKDF, no identity derivation.
+aes-gcm = "0.10"
+rand = "0.8"
+
+[features]
+# Enables `store::InsecurePlainCodecForTests`. Off by default so no shell
+# (or any other crate) can compile against a codec that provides zero
+# confidentiality by linking against this crate normally -- only this
+# crate's own test builds turn it on, via the self-referential dev-dependency
+# below (Cargo unifies a dev-dependency's requested features into the same
+# build the corresponding lib/test targets use).
+test-support = []
+
+[dev-dependencies]
+mail4agent-messenger = { path = ".", features = ["test-support"] }

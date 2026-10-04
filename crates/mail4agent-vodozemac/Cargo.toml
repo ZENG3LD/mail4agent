@@ -1,0 +1,106 @@
+[package]
+name = "mail4agent-vodozemac"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+publish = false
+description = "Vendored, reduced fork of vodozemac 0.10.0 (Olm, Megolm, SAS) -- see FORK.md."
+
+[lib]
+name = "mail4agent_vodozemac"
+path = "src/lib.rs"
+
+# Kept verbatim from upstream vodozemac's own Cargo.toml rather than
+# `[lints] workspace = true` (root `Cargo.toml` only sets
+# `significant_drop_in_scrutinee = "warn"`, much weaker). This is a vendored
+# crypto primitive crate; its own stricter bar is worth more here than
+# workspace-lint uniformity. See FORK.md.
+[lints.rust]
+unexpected_cfgs = { level = "deny", check-cfg = ['cfg(fuzzing)'] }
+unsafe_code = "deny"
+missing_docs = "deny"
+dead_code = "deny"
+trivial_casts = "deny"
+trivial_numeric_casts = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unused_extern_crates = "deny"
+unused_import_braces = "deny"
+unused_qualifications = "deny"
+rust_2018_idioms = "deny"
+
+[lints.clippy]
+panic = "deny"
+unreachable = "deny"
+expect_used = "deny"
+unwrap_used = "deny"
+mem_forget = "deny"
+
+# `libolm-compat`, `insecure-pk-encryption` and upstream's `js` feature are
+# dropped by this fork (see FORK.md). `experimental-session-config` and
+# `low-level-api` are kept declared exactly as upstream, off by default.
+[features]
+default = []
+experimental-session-config = []
+low-level-api = []
+
+[dependencies]
+aes = "0.8.4"
+arrayvec = { version = "0.7.6", features = ["serde"] }
+base64 = "0.22.1"
+base64ct = { version = "1.8.3", features = ["std", "alloc"] }
+cbc = { version = "0.1.2", features = ["std"] }
+# Kept as a direct dependency per the audit's final dependency list even
+# though this fork no longer names `curve25519_dalek::*` directly in `src/`
+# (the only direct use was the now-removed libolm-compat expanded-Ed25519-key
+# path) -- it is still required transitively by `ed25519-dalek`/
+# `x25519-dalek`, and declaring it directly keeps the version pinned in lock
+# step with those two. See FORK.md.
+curve25519-dalek = { version = "4.1.3", default-features = false, features = [
+    "zeroize",
+] }
+# Upstream also requests the `hazmat` feature (for the expanded-secret-key
+# signing path used by libolm-compat interop). That path is stripped in this
+# fork, so the feature is dropped here too. See FORK.md.
+ed25519-dalek = { version = "2.1.1", default-features = false, features = [
+    "rand_core",
+    "std",
+    "serde",
+    "zeroize",
+] }
+hkdf = "0.12.4"
+hmac = "0.12.1"
+matrix-pickle = "0.2.1"
+prost = "0.14.3"
+rand = "0.8.5"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_bytes = "0.11.17"
+serde_json = "1.0.140"
+sha2 = "0.10.9"
+subtle = "2.6.1"
+thiserror = "2.0.18"
+x25519-dalek = { version = "2.0.1", features = [
+    "serde",
+    "reusable_secrets",
+    "static_secrets",
+    "zeroize",
+] }
+zeroize = "1.8.2"
+
+# `getrandom` has no direct
+# call site in `src/` (it is only reached transitively through `rand`'s
+# `thread_rng()` backend), but on wasm32 it needs its `js` feature enabled
+# for that backend to have an entropy source at all. A target-cfg dependency
+# means every downstream crate gets this for free without remembering to
+# enable a Cargo feature.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
+# Upstream's own dev-dependencies (`olm-rs`, `assert_matches2`, `criterion`,
+# `ntest`, `proptest`, `insta`) are all dropped -- see FORK.md for the test
+# conversions that made each one unnecessary. `anyhow` survives because two
+# static, pure-Rust tests (`megolm/session_keys.rs`) still use it for
+# ergonomic `Result`-returning test bodies, and it is already pinned exactly
+# in this workspace's lockfile.
+[dev-dependencies]
+anyhow = "1.0.102"

@@ -73,4 +73,6 @@ members = [
     "crates/mail4agent-store-sqlite",
     "crates/mail4agent-client",
     "crates/mail4agent-grok",
+    "crates/mail4agent-vodozemac",
+    "crates/mail4agent-messenger",
 ]
