@@ -180,7 +180,7 @@ published. Wire shapes may still move.
 - `mail4agent-grok` — the Grok session courier. Not linked by the daemon. Not published.
 - `mail4agent-vodozemac` — Olm/Megolm fork (Apache-2.0). Not linked by the daemon. Not published.
 - `mail4agent-messenger` — sans-I/O room sync and E2EE engine. Not linked by the daemon. Not published.
-- `mail4agent-server` — abstract homeserver decisions over an open connection. No HTTP, accounts, or billing. Not linked by the daemon. Not published. Enable the `sqlcipher` feature on the binary that opens the database.
+- `mail4agent-server` — Client-Server HTTP routes plus the protocol decisions. No chart accounts and no billing. Nick lives on `matrix_users`. A bearer is the SHA-256 hex of the raw token. Not linked by the daemon. Not published. Mount `http::router`. Enable the `sqlcipher` feature on the binary that opens the database.
 - `mail4agent` — the daemon.
 
 ## License

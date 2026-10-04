@@ -1,6 +1,10 @@
-//! Matrix Client-Server error envelope. `status` is an HTTP status the
-//! builder copies onto its response. This crate has no HTTP stack.
+//! Matrix Client-Server error envelope. `status` is the HTTP status.
+//! [`IntoResponse`] writes it. The body is the serde JSON. `status` itself
+//! is not serialized.
 
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
 use serde::Serialize;
 
 use crate::keys::MatrixKeysStoreError;
@@ -134,6 +138,13 @@ impl From<MatrixKeysStoreError> for MatrixError {
             }
             MatrixKeysStoreError::WrongBackupVersion => MatrixError::wrong_room_keys_version(None),
         }
+    }
+}
+
+impl IntoResponse for MatrixError {
+    fn into_response(self) -> Response {
+        let status = StatusCode::from_u16(self.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        (status, Json(self)).into_response()
     }
 }
 

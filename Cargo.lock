@@ -1280,13 +1280,18 @@ dependencies = [
 name = "mail4agent-server"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "base64",
  "chrono",
  "ed25519-dalek",
+ "hex",
  "rand 0.8.8",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
+ "tokio",
+ "tower",
  "tracing",
 ]
 

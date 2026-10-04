@@ -29,13 +29,10 @@
 //!
 //! # Cross-database rule
 //!
-//! Like `dm_db.rs`, this module stores only `user_id INTEGER` — never a
-//! display name or a nick — labels are resolved live from the identity
-//! connection by callers. The one exception is [`matrix_users`], the table
-//! that maps `user_id` to its Matrix id (`mxid`) once and for all (plan §2
-//! manager decision: `public_id` is immutable, so this mapping never
-//! changes and is safe to cache here rather than re-deriving it from the
-//! identity database on every response).
+//! This module stores `user_id INTEGER` and, on `matrix_users`, the nick.
+//! [`crate::nick`] reads and writes that nick. There is no identity database.
+//! `matrix_users` maps `user_id` to its Matrix id (`mxid`) once: `public_id`
+//! is immutable, so the mapping does not change.
 //!
 //! The one place a label does end up in this database is the `displayname`
 //! field of an `m.room.member` event's `content` — the Matrix convention,
@@ -394,8 +391,11 @@ pub fn create_matrix_schema(conn: &Connection) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS matrix_users (
             user_id    INTEGER PRIMARY KEY,
             mxid       TEXT NOT NULL UNIQUE,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            nick       TEXT
         );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_matrix_users_nick_lower
+            ON matrix_users(LOWER(nick)) WHERE nick IS NOT NULL;
 
         CREATE TABLE IF NOT EXISTS rooms (
             id                  TEXT PRIMARY KEY,
