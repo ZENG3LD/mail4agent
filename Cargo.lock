@@ -1277,6 +1277,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mail4agent-messenger-shell"
+version = "0.1.0"
+dependencies = [
+ "mail4agent-messenger",
+ "sha2",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
 name = "mail4agent-server"
 version = "0.1.0"
 dependencies = [

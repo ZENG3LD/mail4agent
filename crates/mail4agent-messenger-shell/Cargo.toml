@@ -1,0 +1,13 @@
+[package]
+name = "mail4agent-messenger-shell"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Client shell that opens the sealed messenger store for one session."
+
+[dependencies]
+mail4agent-messenger = { path = "../mail4agent-messenger", version = "0.1.0" }
+sha2 = "0.10"
+zeroize = "1"
+thiserror = "2"
