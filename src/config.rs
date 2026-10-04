@@ -16,6 +16,7 @@ const DEFAULT_BIND: &str = "127.0.0.1:18301";
 /// Environment override for the sqlite path. Wins unconditionally over
 /// both [`Config::db_path`] and the per-user-data-directory default.
 const DB_PATH_ENV: &str = "MAIL4AGENT_DB_PATH";
+const BIND_ENV: &str = "MAIL4AGENT_BIND";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -61,11 +62,21 @@ impl Config {
     /// all is a supported first run.
     pub fn load() -> Result<Self, ConfigError> {
         let path = PathBuf::from(CONFIG_FILE_NAME);
-        if !path.exists() {
-            return Ok(Self::default());
+        let mut cfg = if !path.exists() {
+            Self::default()
+        } else {
+            let raw = std::fs::read_to_string(&path).map_err(|err| ConfigError::Read(path.clone(), err))?;
+            toml::from_str(&raw).map_err(|err| ConfigError::Parse(path, Box::new(err)))?
+        };
+        if let Ok(bind) = std::env::var(BIND_ENV) {
+            cfg.bind = bind.parse().map_err(|err| {
+                ConfigError::Read(
+                    PathBuf::from(BIND_ENV),
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{err}")),
+                )
+            })?;
         }
-        let raw = std::fs::read_to_string(&path).map_err(|err| ConfigError::Read(path.clone(), err))?;
-        toml::from_str(&raw).map_err(|err| ConfigError::Parse(path, Box::new(err)))
+        Ok(cfg)
     }
 
     /// Resolves the sqlite path: [`DB_PATH_ENV`] wins unconditionally over

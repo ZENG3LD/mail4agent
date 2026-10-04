@@ -1,8 +1,8 @@
 //! mail4agent daemon entrypoint.
 //!
-//! Library face for the node kit. crates.io 0.1.2 published this package as a
-//! binary only, so the node path-depends on this tree. Version stays 0.1.2
-//! and this face is not published.
+//! Library face for the node kit and the standalone binary. crates.io 0.1.3
+//! was binary-only; this package is 0.1.4 so the lib/`run`/`spawn` face can
+//! publish without yanking. The binary remains runnable with no node.
 //!
 //! Boot sequence, deliberately split across two phases:
 //!
@@ -83,7 +83,13 @@ pub fn main() -> Result<(), MainError> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+    run()
+}
 
+/// Run the mailbox until a process shutdown signal. Does not install a
+/// tracing subscriber — the standalone binary calls [`main`], the node kit
+/// calls [`spawn`] on a background thread.
+pub fn run() -> Result<(), MainError> {
     let config = Config::load()?;
     let db_path = config.resolve_db_path()?;
     tracing::info!(db = %db_path.display(), bind = %config.bind, "mail4agent starting");
@@ -100,6 +106,48 @@ pub fn main() -> Result<(), MainError> {
 
     let runtime = tokio::runtime::Runtime::new().map_err(MainError::Runtime)?;
     runtime.block_on(serve(service, config.bind))
+}
+
+/// Join handle for a mailbox started by [`spawn`]. Dropping detaches the
+/// thread; the process exit still tears the socket down.
+pub struct MailboxJoinHandle {
+    join: Option<std::thread::JoinHandle<Result<(), MainError>>>,
+}
+
+impl MailboxJoinHandle {
+    /// Block until the mailbox thread finishes.
+    pub fn join(mut self) -> Result<(), MainError> {
+        match self.join.take() {
+            Some(handle) => match handle.join() {
+                Ok(result) => result,
+                Err(_) => Err(MainError::Runtime(std::io::Error::other(
+                    "mail4agent thread panicked",
+                ))),
+            },
+            None => Ok(()),
+        }
+    }
+}
+
+/// Start the mailbox daemon on a background thread. Same config and DB
+/// rules as the standalone binary. Safe to call from a process that already
+/// installed tracing (the node kit).
+pub fn spawn() -> Result<MailboxJoinHandle, MainError> {
+    let join = std::thread::Builder::new()
+        .name("mail4agent".to_owned())
+        .spawn(run)
+        .map_err(MainError::Runtime)?;
+    Ok(MailboxJoinHandle { join: Some(join) })
+}
+
+#[cfg(test)]
+mod spawn_tests {
+    #[test]
+    fn spawn_symbol_is_the_automaton_entry() {
+        let start: fn() -> Result<super::MailboxJoinHandle, super::MainError> = super::spawn;
+        let run: fn() -> Result<(), super::MainError> = super::run;
+        let _ = (start as usize) | (run as usize);
+    }
 }
 
 async fn serve(service: Arc<MailboxService>, bind: SocketAddr) -> Result<(), MainError> {
