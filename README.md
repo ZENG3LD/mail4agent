@@ -155,13 +155,32 @@ into an outbound call somewhere the operator may not have meant.
 separate binary, not a dependency of this daemon: the mailbox still does not
 know providers. The binary binds `127.0.0.1:18302`, registers that URL with
 `POST /admin/listener`, answers the doorbell at once, then fetches the letter
-with the operator key and, only for mail addressed to one `grok` session,
-injects it as an ACP `session/prompt` on the Grok leader pipe. It never
-starts `grok`. If `[cli] use_leader` is off, no leader is listening, or the
-destination process started before `config.toml` was last written, it logs a
-named refusal and leaves the letter in the mailbox. A missed doorbell is not
-replayed. Room mail and account-direct mail ring the same URL and are not
-fanned out into sessions.
+with the operator key. A session letter can leave two ways, and only one of
+them runs. With no webhook bound for that session, it injects the letter as
+an ACP `session/prompt` on the Grok leader pipe. It never starts `grok`. If
+`[cli] use_leader` is off, no leader is listening, or the destination process
+started before `config.toml` was last written, it logs a named refusal and
+leaves the letter in the mailbox. A missed doorbell is not replayed. Room
+mail and account-direct mail ring the same URL and are not fanned out into
+sessions.
+
+The other way is a webhook, not a second mailbox and not a listener URL.
+`mail4agent-webhooks.toml` in the Grok home (`$GROK_HOME`, otherwise
+`~/.grok`) maps one session id to one URL:
+
+```toml
+[sessions]
+s-01234567 = "https://example.invalid/hook"
+```
+
+The key is the mailbox session id on the letter (`s-` plus hex), not the
+Grok process session id. When that id is present, the
+courier POSTs the letter text once to that URL and does not also push the
+leader pipe. The URL is whatever the operator pastes for that session. It is
+not stored as a participant `listener_url`, and `validate_listener_url` is
+unchanged: a mailbox listener is still only `http://127.0.0.1` or
+`http://localhost`. The webhook URL is not written to the log. Until the
+operator pastes one, a real web bot is not woken.
 
 ## Status
 

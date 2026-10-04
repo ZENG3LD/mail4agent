@@ -135,17 +135,11 @@ mod tests {
     #[test]
     fn socket_override_replaces_the_default() {
         let home = Path::new(r"C:\grok");
-        assert_eq!(
-            leader_socket(home, None),
-            PathBuf::from(r"C:\grok\leader.sock")
-        );
+        assert_eq!(leader_socket(home, None), home.join("leader.sock"));
         assert_eq!(
             leader_socket(home, Some(OsStr::new(r"D:\custom.sock"))),
             PathBuf::from(r"D:\custom.sock")
         );
-        assert_eq!(
-            leader_socket(home, Some(OsStr::new(""))),
-            PathBuf::from(r"C:\grok\leader.sock")
-        );
+        assert_eq!(leader_socket(home, Some(OsStr::new(""))), home.join("leader.sock"));
     }
 }

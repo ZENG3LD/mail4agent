@@ -191,8 +191,11 @@ mod tests {
             row(1001, "aaa", r"C:\work\nemo"),
             row(1001, "bbb", r"C:\work\other"),
         ];
+        // `norm_cwd` folds slashes only on Windows. Elsewhere the hint must
+        // already equal the row, or two rows stay ambiguous.
+        let cwd_hint = if cfg!(windows) { r"C:/work/nemo" } else { r"C:\work\nemo" };
         let target = locate(
-            &directory(true, 20, Some(r"C:/work/nemo")),
+            &directory(true, 20, Some(cwd_hint)),
             "grok",
             "s-01234567",
             &index,

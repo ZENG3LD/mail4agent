@@ -17,8 +17,9 @@ use axum::{Json, Router};
 use clap::Parser;
 use mail4agent_api::{DeliveryNotification, Directory, Message, MessageGetRequest};
 use mail4agent_grok::{
-    config_mtime_unix_ms, grok_home, leader_is_listening, leader_socket, locate, parse_active_sessions, prompt_text,
-    push_into_session, screen, use_leader_enabled, LocateError, Screen,
+    choose_route, config_mtime_unix_ms, grok_home, leader_is_listening, leader_socket, locate, parse_active_sessions,
+    post_letter, prompt_text, push_into_session, screen_session, use_leader_enabled, webhook_for, webhooks_path,
+    DeliveryRoute, LocateError, Screen, WebPostError,
 };
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use reqwest::Client;
@@ -79,6 +80,7 @@ async fn main() -> Result<(), BootError> {
     let http = Client::builder()
         .connect_timeout(Duration::from_secs(2))
         .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|err| BootError::Register(err.to_string()))?;
 
@@ -138,10 +140,26 @@ async fn deliver(app: &App, note: DeliveryNotification) -> Result<(), Failure> {
         .unwrap_or(false);
     let sock = leader_socket(&app.grok_home, std::env::var_os("GROK_LEADER_SOCKET").as_deref());
     let leader_ready = use_leader && leader_is_listening(&sock);
-    let mail_session = match screen(&note, &app.account, use_leader, leader_ready) {
+    let mail_session = match screen_session(&note, &app.account) {
         Screen::Drop(reason) => return Err(Failure::BeforePush(reason.to_string())),
         Screen::Proceed { mail_session } => mail_session,
     };
+    let webhook = session_webhook(&app.grok_home, &mail_session)?;
+    match choose_route(&note, &app.account, webhook.as_deref(), use_leader, leader_ready) {
+        DeliveryRoute::Drop(reason) => return Err(Failure::BeforePush(reason.to_string())),
+        DeliveryRoute::Web { mail_session, url } => {
+            let text = load_letter(app, &note, &message_id).await?;
+            match post_letter(&app.http, &url, &text).await {
+                Ok(()) => {
+                    tracing::info!(message_id = %message_id, session = %mail_session, "posted letter to session webhook");
+                    return Ok(());
+                }
+                Err(WebPostError::Transport) => return Err(Failure::BeforePush(WebPostError::Transport.to_string())),
+                Err(err @ WebPostError::Status(_)) => return Err(Failure::AfterPush(err.to_string())),
+            }
+        }
+        DeliveryRoute::Leader { .. } => {}
+    }
 
     let directory = post_json::<Directory>(app, "/mail/directory", serde_json::json!({})).await?;
     let index_text = std::fs::read_to_string(app.grok_home.join("active_sessions.json"))
@@ -151,19 +169,7 @@ async fn deliver(app: &App, note: DeliveryNotification) -> Result<(), Failure> {
     let target = locate(&directory, &app.account, &mail_session, &index, config_mtime)
         .map_err(|err| Failure::BeforePush(locate_reason(err)))?;
 
-    let request = MessageGetRequest { message_id: note.message_id.clone() };
-    let body = serde_json::to_value(&request).map_err(|err| Failure::BeforePush(format!("mailbox: {err}")))?;
-    let message = post_json::<Message>(app, "/mail/get", body).await?;
-    if message.message_id.as_str() != message_id {
-        return Err(Failure::BeforePush("message-id-mismatch".to_string()));
-    }
-    let text = prompt_text(
-        &message.from.to_string(),
-        &message.to.to_string(),
-        &message.subject,
-        message.message_id.as_str(),
-        &message.body,
-    );
+    let text = load_letter(app, &note, &message_id).await?;
     push_into_session(&sock, &target.grok_session_id, &target.cwd, &text)
         .await
         .map_err(|err| Failure::AfterPush(err.to_string()))?;
@@ -173,6 +179,32 @@ async fn deliver(app: &App, note: DeliveryNotification) -> Result<(), Failure> {
         "pushed into grok session"
     );
     Ok(())
+}
+
+fn session_webhook(grok_home: &std::path::Path, session_id: &str) -> Result<Option<String>, Failure> {
+    let path = webhooks_path(grok_home);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(Failure::BeforePush("webhooks-unreadable".to_string())),
+    };
+    webhook_for(&text, session_id).map_err(|err| Failure::BeforePush(err.to_string()))
+}
+
+async fn load_letter(app: &App, note: &DeliveryNotification, message_id: &str) -> Result<String, Failure> {
+    let request = MessageGetRequest { message_id: note.message_id.clone() };
+    let body = serde_json::to_value(&request).map_err(|err| Failure::BeforePush(format!("mailbox: {err}")))?;
+    let message = post_json::<Message>(app, "/mail/get", body).await?;
+    if message.message_id.as_str() != message_id {
+        return Err(Failure::BeforePush("message-id-mismatch".to_string()));
+    }
+    Ok(prompt_text(
+        &message.from.to_string(),
+        &message.to.to_string(),
+        &message.subject,
+        message.message_id.as_str(),
+        &message.body,
+    ))
 }
 
 fn locate_reason(err: LocateError) -> String {
