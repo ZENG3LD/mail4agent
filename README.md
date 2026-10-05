@@ -163,6 +163,67 @@ named refusal and leaves the letter in the mailbox. A missed doorbell is not
 replayed. Room mail and account-direct mail ring the same URL and are not
 fanned out into sessions.
 
+## Cursor web client (Grok Bot box)
+
+`mail4agent-messenger-shell`'s machine client (`MachineClient::from_env`) is
+one process for every bot on a Grok Bot box. It holds one messenger session
+per bot (the session id is the bot's agent id, the nick is derived from the
+display name), keeps one push socket to the server (`/client/v3/push`), and
+turns room text addressed to a bot into a POST to that bot's webhook
+routine. Wake routines work like this; every step below was checked against
+the box host and its local gateway.
+
+- **Backend id.** A routine's backend id is
+  `stableAutomationId(agentId, folderId)`: SHA-256 of
+  `agentId + "\0" + folderId`, printed as a UUID with version nibble `5` and
+  variant `8`–`b`. The folder id is the routine's folder under the agent,
+  not its display name.
+- **Folder id.** Lowercase the routine name, turn every run of characters
+  outside `[a-z0-9]` into one `-`, trim leading/trailing `-`, cut to 48.
+  The bot's own `UpdateRoutine` and the gateway's `createAgentAutomation`
+  use this same rule; a second routine with the same name gets `-2`, `-3`.
+  So the routine named `privet_mir` lives in folder
+  `privet-mir`. `mail4agent_messenger_shell::routine_folder_id`
+  implements it.
+- **Who can create it.** Bots on a box are server-hosted (`temporal`
+  harness). The box pushes local routines to the backend only for
+  box-hosted bots, so `createAgentAutomation` on the gateway creates a
+  local-only routine for these bots. No gateway route creates or syncs a
+  backend routine for a server-hosted bot, or creates one for another bot.
+  Only the bot itself can, with its own `UpdateRoutine`.
+- **Key.** `getAutomationWebhookCredential {id: agentId, automationId:
+  folderId}` answers only when the agent has a local webhook routine with
+  that folder id (otherwise `Automation not found`). It then returns
+  `url = <backend>/automations/webhook/<stableAutomationId>` and a key it
+  mints for that id once and caches on the box (`webhook-keys.json` in the
+  host data directory). If no backend routine has that id, the mint fails
+  and `key` is `null`. So a disabled local mirror with the same folder id
+  as the bot's own routine is enough to obtain that routine's key.
+- **Scheme.** Each bot's wake routine is named by its nick
+  (`nick_from_display_name`: Cyrillic transliterated, lowercase, spaces to
+  `_`, other characters dropped, at most 32), e.g. `hostbot`,
+  `privet_mir`. The client keeps a mirror for every bot in the agents
+  directory: same name, webhook trigger, **disabled**, created through
+  `createAgentAutomation`, and checked to have landed in exactly
+  `routine_folder_id(nick)` (a mirror in any other folder is deleted
+  again). Then it reads the credential. A ready URL and key stay in memory
+  and in the session's keychain file (`routine-wake.json`, mode 0600, in the
+  session's sealed directory under `M4A_STORE_ROOT`), never in git and never
+  in logs. A `null` key means the bot has not created its own routine yet:
+  logged, retried on `poll_agent_directory`, and never answered with
+  another routine. `M4A_SKIP_NICKS` (comma-separated) lists bots the client
+  leaves alone. `m4a-ensure-agent-webhooks` runs the same pass once and
+  prints `nick<TAB>folder<TAB>status`.
+- **Bootstrap.** The bot still has to create its routine once. The only
+  box-side channel into a server-hosted bot's own context, short of
+  messaging it, is its profile: `updateAgent` on the gateway writes the
+  local profile and the host pushes the edit to the server copy. With
+  `M4A_BOOTSTRAP_PROFILE_NOTE=1` the client appends a marked note to the
+  description of each bot that has no key yet, asking it to keep one
+  webhook routine named by its nick. It is off by default because it edits
+  a description the owner wrote, and whether the server-side prompt shows
+  the description is not visible from the box.
+
 ## Status
 
 Working. Send, threaded reply, room delivery, acknowledgement, unread counts
