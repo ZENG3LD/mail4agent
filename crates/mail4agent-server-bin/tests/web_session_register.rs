@@ -8,7 +8,10 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use mail4agent_messenger_shell::{session_store_dir, OpenedStore, SessionConfig};
+use mail4agent_messenger_shell::{
+    session_store_dir, OpenedStore, SessionConfig, BOT_NAME_ENV, DEVICE_TOKEN_ENV,
+    HOMESERVER_URL_ENV, SESSION_ID_ENV, STORE_ROOT_ENV,
+};
 
 struct StopServer(Option<Child>);
 
@@ -162,8 +165,8 @@ fn two_web_sessions_register_and_one_finds_the_other_by_nick() {
     assert_eq!(chief_dir, session_store_dir(&root, "web-chief"));
     assert_ne!(hostbot_dir, chief_dir);
 
-    let mut hostbot = OpenedStore::connect(&hostbot_cfg).expect("hostbot connect");
-    let mut chief = OpenedStore::connect(&chief_cfg).expect("chief connect");
+    let mut hostbot = connect_web(&base, "Hostbot", "web-hostbot", &root);
+    let mut chief = connect_web(&base, "Привет мир", "web-chief", &root);
     assert_eq!(hostbot.nick(), Some("hostbot"));
     assert_eq!(chief.nick(), Some("privet_mir"));
     assert!(
@@ -185,6 +188,22 @@ fn two_web_sessions_register_and_one_finds_the_other_by_nick() {
         .expect("chief finds hostbot by nick");
     assert_eq!(found.nick, "hostbot");
     assert_eq!(found.user_id, "@hostbot:localhost");
+
+    let chief_nick = chief.nick().unwrap().to_string();
+    let event_id = exchange_encrypted_dm(
+        &mut hostbot,
+        &mut chief,
+        &chief_nick,
+        "web-session-dm-plaintext",
+    );
+    println!(
+        "local_sender_user={} local_sender_nick={} local_peer_user={} local_peer_nick={} local_event_id={}",
+        hostbot.user_id(),
+        hostbot.nick().unwrap_or(""),
+        chief.user_id(),
+        chief_nick,
+        event_id
+    );
 
     let hostbot_bearer = hostbot.device_bearer().to_string();
     drop(hostbot);
@@ -216,4 +235,221 @@ fn two_web_sessions_register_and_one_finds_the_other_by_nick() {
         let _ = child.wait();
     }
     server.0 = None;
+}
+
+fn connect_web(
+    base: &str,
+    bot_name: &str,
+    session_id: &str,
+    store_root: &std::path::Path,
+) -> OpenedStore {
+    std::env::set_var(HOMESERVER_URL_ENV, base);
+    std::env::set_var(BOT_NAME_ENV, bot_name);
+    std::env::set_var(SESSION_ID_ENV, session_id);
+    std::env::set_var(STORE_ROOT_ENV, store_root);
+    std::env::remove_var(DEVICE_TOKEN_ENV);
+    std::env::remove_var("M4A_NICK");
+    let opened = OpenedStore::connect_from_env();
+    for key in [
+        HOMESERVER_URL_ENV,
+        BOT_NAME_ENV,
+        SESSION_ID_ENV,
+        STORE_ROOT_ENV,
+        DEVICE_TOKEN_ENV,
+    ] {
+        std::env::remove_var(key);
+    }
+    opened.unwrap_or_else(|err| panic!("connect {bot_name}: {err}"))
+}
+
+fn describe(shell: &OpenedStore) -> String {
+    let rooms: Vec<String> = shell
+        .rooms()
+        .iter()
+        .map(|room| {
+            format!(
+                "{} membership={} encrypted={}",
+                room.room_id, room.membership, room.encrypted
+            )
+        })
+        .collect();
+    let texts: Vec<String> = shell
+        .texts()
+        .iter()
+        .map(|text| {
+            format!(
+                "{} outcome={} body_len={}",
+                text.room_id,
+                text.outcome,
+                text.body.len()
+            )
+        })
+        .collect();
+    format!(
+        "user={} nick={} rooms=[{}] texts=[{}] http=[{}]",
+        shell.user_id(),
+        shell.nick().unwrap_or(""),
+        rooms.join(", "),
+        texts.join(", "),
+        shell.http_trace().join(" | ")
+    )
+}
+
+fn drive(shell: &mut OpenedStore, now: &mut i64, wait: bool) {
+    *now += 1_000;
+    shell
+        .drive(*now, wait)
+        .unwrap_or_else(|err| panic!("drive: {err}; {}", describe(shell)));
+}
+
+/// Sender looks the peer up by the derived nick, the peer joins, the sender
+/// sends one encrypted DM, and the peer decrypts it. Returns the event id
+/// the peer read. No bearer is printed.
+fn exchange_encrypted_dm(
+    sender: &mut OpenedStore,
+    peer: &mut OpenedStore,
+    peer_nick: &str,
+    plaintext: &str,
+) -> String {
+    let mut sender_now = 10_000_i64;
+    let mut peer_now = 10_000_i64;
+    let room_id = sender
+        .ensure_dm(peer_nick, sender_now)
+        .unwrap_or_else(|err| panic!("ensure dm: {err}; {}", describe(sender)));
+    let mut encrypted = sender
+        .rooms()
+        .iter()
+        .any(|room| room.room_id == room_id && room.encrypted && room.membership == "join");
+    for _ in 0..6 {
+        if encrypted {
+            break;
+        }
+        drive(sender, &mut sender_now, true);
+        encrypted = sender
+            .rooms()
+            .iter()
+            .any(|room| room.room_id == room_id && room.encrypted && room.membership == "join");
+    }
+    assert!(
+        encrypted,
+        "dm was not an encrypted join; {}",
+        describe(sender)
+    );
+
+    let mut saw_invite = false;
+    for _ in 0..8 {
+        drive(peer, &mut peer_now, true);
+        saw_invite = peer.rooms().iter().any(|room| {
+            room.room_id == room_id && (room.membership == "invite" || room.membership == "join")
+        });
+        if saw_invite {
+            break;
+        }
+    }
+    assert!(saw_invite, "peer never saw the dm; {}", describe(peer));
+    if peer
+        .rooms()
+        .iter()
+        .any(|room| room.room_id == room_id && room.membership == "invite")
+    {
+        peer.accept_direct_invites(peer_now)
+            .unwrap_or_else(|err| panic!("join: {err}; {}", describe(peer)));
+        for _ in 0..4 {
+            if peer
+                .rooms()
+                .iter()
+                .any(|room| room.room_id == room_id && room.membership == "join")
+            {
+                break;
+            }
+            drive(peer, &mut peer_now, true);
+        }
+    }
+    assert!(
+        peer.rooms()
+            .iter()
+            .any(|room| room.room_id == room_id && room.membership == "join"),
+        "peer did not join; {}",
+        describe(peer)
+    );
+
+    let peer_user = peer.user_id().to_string();
+    let mut sender_sees_join = false;
+    for _ in 0..8 {
+        drive(sender, &mut sender_now, true);
+        if sender.member_joined(&room_id, &peer_user) {
+            sender_sees_join = true;
+            break;
+        }
+    }
+    assert!(
+        sender_sees_join,
+        "sender did not see the peer join; {}",
+        describe(sender)
+    );
+
+    let sent = sender
+        .write_to_nick(peer_nick, plaintext, sender_now)
+        .unwrap_or_else(|err| panic!("send: {err}; {}", describe(sender)));
+    assert_eq!(sent, room_id, "send used a different room");
+
+    for _ in 0..12 {
+        drive(peer, &mut peer_now, true);
+        if let Some(row) = peer
+            .texts()
+            .iter()
+            .find(|text| text.room_id == room_id && text.body == plaintext)
+        {
+            let event_id = row
+                .event_id
+                .clone()
+                .unwrap_or_else(|| panic!("decrypted row has no event id; {}", describe(peer)));
+            assert!(!event_id.is_empty(), "decrypted event id was empty");
+            return event_id;
+        }
+    }
+    panic!("peer did not decrypt the dm; {}", describe(peer));
+}
+
+#[test]
+#[ignore = "existing homeserver named by M4A_HOMESERVER_URL"]
+fn two_web_sessions_dm_against_existing_homeserver() {
+    let base = std::env::var(HOMESERVER_URL_ENV).expect("M4A_HOMESERVER_URL");
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis();
+    let temp = TempDb {
+        dir: PathBuf::from(format!("/tmp/mail4agent-web-proof-{stamp}")),
+    };
+    std::fs::create_dir_all(&temp.dir).expect("tmpdir");
+    let root = temp.dir.join("stores");
+    std::fs::create_dir_all(&root).expect("store root");
+    let hostbot_name = format!("Hostbot {stamp}");
+    let chief_name = format!("Проба {stamp}");
+    let hostbot_session = format!("proof-h-{stamp}");
+    let chief_session = format!("proof-c-{stamp}");
+    let mut hostbot = connect_web(&base, &hostbot_name, &hostbot_session, &root);
+    let mut chief = connect_web(&base, &chief_name, &chief_session, &root);
+    let chief_nick = chief.nick().unwrap().to_string();
+    assert_ne!(chief_nick, "nachshtab");
+    assert_ne!(hostbot.nick(), Some("hostbot"));
+    assert_ne!(
+        session_store_dir(&root, &hostbot_session),
+        session_store_dir(&root, &chief_session)
+    );
+    let event_id = exchange_encrypted_dm(
+        &mut hostbot,
+        &mut chief,
+        &chief_nick,
+        "production-web-session-dm-plaintext",
+    );
+    println!(
+        "prod_sender_user={} prod_sender_nick={} prod_peer_user={} prod_peer_nick={} prod_event_id={}",
+        hostbot.user_id(),
+        hostbot.nick().unwrap_or(""),
+        chief.user_id(),
+        chief_nick,
+        event_id
+    );
 }

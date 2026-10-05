@@ -573,6 +573,9 @@ pub struct TextView {
     pub body: String,
     /// `sent`, `sending`, `failed`, or `undecryptable`.
     pub outcome: String,
+    /// Matrix event id once the server has one. Empty for a local echo
+    /// that has not been accepted yet.
+    pub event_id: Option<String>,
 }
 
 impl OpenedStore {
@@ -698,6 +701,27 @@ impl OpenedStore {
         self.nick.as_deref()
     }
 
+    /// This account's Matrix user id.
+    pub fn user_id(&self) -> &str {
+        self.core.user_id().as_str()
+    }
+
+    /// Whether `user_id` is a joined member of `room_id` in this store.
+    pub fn member_joined(&self, room_id: &str, user_id: &str) -> bool {
+        let Ok(room_id) = RoomId::parse(room_id) else {
+            return false;
+        };
+        let Ok(user_id) = UserId::parse(user_id) else {
+            return false;
+        };
+        self.core.room_state(&room_id).is_some_and(|state| {
+            state
+                .members
+                .get(&user_id)
+                .is_some_and(|member| member.membership == Membership::Join)
+        })
+    }
+
     /// Looks up `name_or_nick` in the user directory. A display name is
     /// derived first when it is not already a nick. The hit is nick plus
     /// user id. No routine URL is returned or sent.
@@ -738,34 +762,79 @@ impl OpenedStore {
         }
     }
 
+    /// Looks `name_or_nick` up and opens the encrypted DM, creating it when
+    /// this account does not already have one. Does not send. The peer may
+    /// still be invited: [`Self::write_to_nick`] sends only after they join.
+    pub fn ensure_dm(&mut self, name_or_nick: &str, mut now_ms: i64) -> Result<String, ShellError> {
+        let (_peer, room_id) = self.open_dm(name_or_nick, &mut now_ms)?;
+        Ok(room_id)
+    }
+
+    /// Joins direct-message invites already visible to this store.
+    ///
+    /// Returns the room ids this call asked to join. A room that is not an
+    /// `is_direct` invite is left alone. This does not register the inviter.
+    pub fn accept_direct_invites(&mut self, mut now_ms: i64) -> Result<Vec<String>, ShellError> {
+        let me = self.core.user_id().clone();
+        let invited: Vec<RoomId> = self
+            .core
+            .room_ids()
+            .cloned()
+            .filter(|room_id| {
+                let Some(state) = self.core.room_state(room_id) else {
+                    return false;
+                };
+                state.members.get(&me).is_some_and(|member| {
+                    member.membership == Membership::Invite && member.is_direct
+                })
+            })
+            .collect();
+        let mut ids = Vec::new();
+        for room_id in invited {
+            self.dispatch(
+                MessengerCommand::JoinRoom {
+                    room_id: room_id.clone(),
+                },
+                now_ms,
+            )?;
+            ids.push(room_id.as_str().to_string());
+        }
+        if ids.is_empty() {
+            return Ok(ids);
+        }
+        for _ in 0..8 {
+            now_ms += 1_000;
+            self.drive(now_ms, false)?;
+            let still_invited = ids.iter().any(|room_id| {
+                self.rooms()
+                    .iter()
+                    .any(|room| room.room_id == *room_id && room.membership == "invite")
+            });
+            if !still_invited {
+                break;
+            }
+        }
+        Ok(ids)
+    }
+
     /// Writes `text` to the session named by `name_or_nick`.
     ///
     /// The caller is already registered. This looks the nick up, reuses the
-    /// encrypted DM when one exists, otherwise creates one, and sends. It
-    /// does not register the other session and it does not put a routine
-    /// URL in the room.
+    /// encrypted DM when one exists, otherwise creates one, and sends only
+    /// after the peer's membership is `join`. A peer who is still invited
+    /// gets no ciphertext: the caller joins them first
+    /// ([`Self::accept_direct_invites`]) and calls this again. It does not
+    /// register the other session and it does not put a routine URL in the room.
     pub fn write_to_nick(
         &mut self,
         name_or_nick: &str,
         text: &str,
         mut now_ms: i64,
     ) -> Result<String, ShellError> {
-        let found = self.find_nick(name_or_nick, now_ms)?;
-        let peer = UserId::parse(&found.user_id)?;
-        if &peer == self.core.user_id() {
-            return Err(ShellError::UnknownNick);
+        let (peer, room_id) = self.open_dm(name_or_nick, &mut now_ms)?;
+        if !self.member_joined(&room_id, peer.as_str()) {
+            return Err(ShellError::Dm);
         }
-        let room_id = if let Some(room_id) = self.dm_room(&peer) {
-            room_id
-        } else {
-            self.dispatch(
-                MessengerCommand::CreateRoom {
-                    kind: CreateRoomKind::Dm { peer: peer.clone() },
-                },
-                now_ms,
-            )?;
-            self.wait_for_dm(&peer, &mut now_ms)?
-        };
         let encrypted = self
             .rooms()
             .into_iter()
@@ -786,7 +855,7 @@ impl OpenedStore {
             },
             now_ms,
         )?;
-        for _ in 0..8 {
+        for _ in 0..20 {
             now_ms += 1_000;
             self.drive(now_ms, false)?;
             if let Some(row) = self
@@ -803,6 +872,30 @@ impl OpenedStore {
             }
         }
         Err(ShellError::Dm)
+    }
+
+    fn open_dm(
+        &mut self,
+        name_or_nick: &str,
+        now_ms: &mut i64,
+    ) -> Result<(UserId, String), ShellError> {
+        let found = self.find_nick(name_or_nick, *now_ms)?;
+        let peer = UserId::parse(&found.user_id)?;
+        if &peer == self.core.user_id() {
+            return Err(ShellError::UnknownNick);
+        }
+        let room_id = if let Some(room_id) = self.dm_room(&peer) {
+            room_id
+        } else {
+            self.dispatch(
+                MessengerCommand::CreateRoom {
+                    kind: CreateRoomKind::Dm { peer: peer.clone() },
+                },
+                *now_ms,
+            )?;
+            self.wait_for_dm(&peer, now_ms)?
+        };
+        Ok((peer, room_id))
     }
 
     fn wait_for_dm(&mut self, peer: &UserId, now_ms: &mut i64) -> Result<String, ShellError> {
@@ -1003,12 +1096,14 @@ impl OpenedStore {
                             room_id: room_id.as_str().to_string(),
                             body: text.body.clone(),
                             outcome: outcome_name(&item.send_state),
+                            event_id: item.event_id.as_ref().map(|id| id.as_str().to_string()),
                         });
                     }
                     ItemContent::Undecryptable { reason } => out.push(TextView {
                         room_id: room_id.as_str().to_string(),
                         body: String::new(),
                         outcome: format!("undecryptable:{reason}"),
+                        event_id: item.event_id.as_ref().map(|id| id.as_str().to_string()),
                     }),
                     _ => {}
                 }
