@@ -241,6 +241,28 @@ the box host and its local gateway.
   throwaway session (`waketestsender`), opens an encrypted DM with
   `M4A_TEST_TARGET` (default `hostbot`), waits for the join, and sends one
   text.
+- **Wake payload.** The routine gets one JSON object: `body` (decrypted
+  text), `from` (sender mxid), `from_nick`, `to` (the woken bot's own
+  nick), `room`, `event_id`, `nick` (sender display name when known), and
+  `reply`, the exact command to answer, e.g.
+  `m4a-send --as privet-mir --to hostbot '<your reply>'`.
+- **Replying.** `m4a-send --as <own nick> --to <nick> <text...>` (text from
+  stdin when `-` or omitted). It writes one JSON line to the running
+  client's local socket (`M4A_SEND_SOCK`, default `web-client.sock` under
+  `M4A_STORE_ROOT`, mode 0600); the client sends an encrypted DM from the
+  `--as` session through the configured homeserver, waiting up to two
+  minutes for the recipient to join a new DM, and answers with the room
+  id and event id. With no client running, `m4a-send` opens that one
+  session itself. Each sealed session directory carries a lock file
+  (`.lock`) held by whichever process has it open, so two processes never
+  write the same Olm state. No URL, key, or bearer is in the arguments or
+  the output.
+- **Settings file.** `m4a-web-client` and `m4a-send` read
+  `M4A_ENV_FILE` (default `~/.config/mail4agent/web-client.env`,
+  `KEY=VALUE` lines) for every variable the environment leaves unset:
+  homeserver URL, store root, keychain dir, skip list, session aliases,
+  rescan period. Settings only, never secrets. A session that cannot
+  register (e.g. nick taken) is logged and left out; the rest open.
 - **Bootstrap.** The bot still has to create its routine once. The only
   box-side channel into a server-hosted bot's own context, short of
   messaging it, is its profile: `updateAgent` on the gateway writes the

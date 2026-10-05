@@ -879,6 +879,34 @@ fn attach_webhook_routines(
 /// the host injects them. Never logged.
 pub const KEYCHAIN_DIR_ENV: &str = "M4A_KEYCHAIN_DIR";
 
+/// Lock file in each sealed session directory. [`MachineClient::open`]
+/// holds an exclusive lock on it for as long as the client lives, so a
+/// second process (another client, or `m4a-send` opening the store itself)
+/// cannot write the same Olm state at the same time.
+pub const STORE_LOCK_FILE: &str = ".lock";
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn lock_store(dir: &Path) -> Result<File, ShellError> {
+    std::fs::create_dir_all(dir)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(STORE_LOCK_FILE))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(_) => Err(ShellError::SessionList(
+            "session store is in use by another process".to_string(),
+        )),
+    }
+}
+
 /// File name of one session's device bearer under [`KEYCHAIN_DIR_ENV`].
 pub const DEVICE_KEYCHAIN_FILE: &str = "device-bearer";
 
@@ -1166,6 +1194,33 @@ pub struct MachineClient {
     /// Agent ids whose wake is already set on an open session or reported
     /// ready. Not asked again.
     ready_agents: HashSet<String>,
+    /// Exclusive locks on every open session directory ([`STORE_LOCK_FILE`]).
+    _locks: Vec<File>,
+    /// Local socket `m4a-send` writes to ([`MachineClient::listen_for_sends`]).
+    send_listener: Option<std::os::unix::net::UnixListener>,
+    send_sock: Option<PathBuf>,
+    /// Sends waiting for the peer to join the DM.
+    send_queue: Vec<PendingSend>,
+}
+
+/// One `m4a-send` request still in progress.
+struct PendingSend {
+    stream: std::os::unix::net::UnixStream,
+    request: crate::SendRequest,
+    started: std::time::Instant,
+    room: Option<String>,
+    peer: Option<String>,
+}
+
+/// How long a send waits for the recipient to join a new DM.
+const SEND_JOIN_WAIT_SECS: u64 = 120;
+
+impl Drop for MachineClient {
+    fn drop(&mut self) {
+        if let Some(path) = self.send_sock.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 /// What one [`MachineClient::tick`] did. Nicks, event ids, room ids, and
@@ -1178,6 +1233,8 @@ pub struct TickReport {
     pub joined: Vec<(String, String)>,
     /// (nick, error) for each session whose drive failed.
     pub errors: Vec<(String, String)>,
+    /// (from nick, to nick, answer) for each `m4a-send` request finished.
+    pub sent: Vec<(String, String, crate::SendReply)>,
 }
 
 /// An open session still waiting for its bot's own routine.
@@ -1198,12 +1255,25 @@ impl MachineClient {
         store_root: &Path,
         sessions: Vec<HostSession>,
     ) -> Result<Self, ShellError> {
+        Self::open_with(homeserver_url, store_root, sessions, false)
+    }
+
+    /// [`Self::open`]; with `lenient`, a session that fails to register or
+    /// whose store is locked is logged and left out instead of failing the
+    /// whole open (at least one session must open).
+    fn open_with(
+        homeserver_url: &str,
+        store_root: &Path,
+        sessions: Vec<HostSession>,
+        lenient: bool,
+    ) -> Result<Self, ShellError> {
         if sessions.is_empty() {
             return Err(ShellError::SessionList("session list is empty".to_string()));
         }
         let mut prepared = Vec::with_capacity(sessions.len());
         let mut seen_ids = Vec::new();
         let mut seen_nicks = Vec::new();
+        let mut locks = Vec::new();
         for session in sessions {
             let config = SessionConfig::new(
                 homeserver_url,
@@ -1223,7 +1293,23 @@ impl MachineClient {
             }
             seen_ids.push(config.session_id().to_string());
             seen_nicks.push(config.nick().to_string());
-            let registered = register_session(&config)?;
+            let lock = match lock_store(&config.store_dir()) {
+                Ok(lock) => lock,
+                Err(err) if lenient => {
+                    eprintln!("mail4agent: session {} left out: {err}", config.nick());
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            let registered = match register_session(&config) {
+                Ok(registered) => registered,
+                Err(err) if lenient => {
+                    eprintln!("mail4agent: session {} left out: {err}", config.nick());
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            locks.push(lock);
             prepared.push(Prepared {
                 config,
                 user_id: registered.user_id,
@@ -1232,6 +1318,11 @@ impl MachineClient {
                 routine_url: session.routine_url,
                 routine_bearer: session.routine_bearer,
             });
+        }
+        if prepared.is_empty() {
+            return Err(ShellError::SessionList(
+                "no session could be opened".to_string(),
+            ));
         }
         let server_name = server_name_of(&prepared[0].user_id)?;
         for item in &prepared[1..] {
@@ -1299,6 +1390,10 @@ impl MachineClient {
             last_full_drive: std::time::Instant::now(),
             pending_wakes: Vec::new(),
             ready_agents: HashSet::new(),
+            _locks: locks,
+            send_listener: None,
+            send_sock: None,
+            send_queue: Vec::new(),
         })
     }
 
@@ -1325,6 +1420,17 @@ impl MachineClient {
     /// keys are not read from disk and are not written back.
     /// [`crate::LEADER_SOCK_ENV`] is not read.
     pub fn from_env() -> Result<Self, ShellError> {
+        Self::from_env_filtered(None)
+    }
+
+    /// [`Self::from_env`] with only the session whose nick is `nick`: the
+    /// path `m4a-send` takes when no client is running. Does not listen
+    /// for sends.
+    pub fn from_env_for(nick: &str) -> Result<Self, ShellError> {
+        Self::from_env_filtered(Some(nick))
+    }
+
+    fn from_env_filtered(only: Option<&str>) -> Result<Self, ShellError> {
         let homeserver_url = std::env::var(HOMESERVER_URL_ENV)
             .ok()
             .filter(|value| !value.is_empty())
@@ -1349,6 +1455,23 @@ impl MachineClient {
             let sessions_dir = get(SESSIONS_DIR_ENV)
                 .ok_or_else(|| ShellError::SessionList("session directory is unset".to_string()))?;
             (load_web_sessions(Path::new(&sessions_dir), &mut get)?, None)
+        };
+        let sessions = match only {
+            Some(nick) => {
+                let needle = crate::nick::lookup_nick(nick)?;
+                let kept: Vec<HostSession> = sessions
+                    .into_iter()
+                    .filter(|session| {
+                        routine_name_for(session)
+                            .is_some_and(|name| name.eq_ignore_ascii_case(&needle))
+                    })
+                    .collect();
+                if kept.is_empty() {
+                    return Err(ShellError::UnknownNick);
+                }
+                kept
+            }
+            None => sessions,
         };
         let gateway_file = get(GATEWAY_FILE_ENV).map(PathBuf::from);
         let gateway_token = get(GATEWAY_TOKEN_ENV);
@@ -1389,7 +1512,7 @@ impl MachineClient {
                 ));
             }
         }
-        let mut client = Self::open(&homeserver_url, Path::new(&store_root), sessions)?;
+        let mut client = Self::open_with(&homeserver_url, Path::new(&store_root), sessions, true)?;
         if let Some(dir) = keychain_dir.as_deref() {
             for (store_dir, session_id, loaded) in &loaded_bearers {
                 let Some(store) = client.sessions.iter().find(|s| s.store_dir() == store_dir)
@@ -1630,7 +1753,191 @@ impl MachineClient {
                 Err(err) => report.errors.push((nick, err.to_string())),
             }
         }
+        self.serve_sends(now_ms, &mut report);
         report
+    }
+
+    /// Listens on `path` for `m4a-send` requests (one JSON line each, see
+    /// [`crate::SendRequest`]). A stale socket file is replaced; the socket
+    /// is mode 0600 and removed when the client drops. [`Self::tick`]
+    /// answers requests: the `as` session opens (or reuses) the encrypted
+    /// DM with `to`, waits up to two minutes for `to` to join, and sends.
+    pub fn listen_for_sends(&mut self, path: &Path) -> Result<(), ShellError> {
+        if path.exists() {
+            if std::os::unix::net::UnixStream::connect(path).is_ok() {
+                return Err(ShellError::SessionList(
+                    "another client already listens on the send socket".to_string(),
+                ));
+            }
+            std::fs::remove_file(path)?;
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let listener = std::os::unix::net::UnixListener::bind(path)?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        listener.set_nonblocking(true)?;
+        self.send_listener = Some(listener);
+        self.send_sock = Some(path.to_path_buf());
+        Ok(())
+    }
+
+    /// [`Self::listen_for_sends`] on [`crate::SEND_SOCK_ENV`], or
+    /// [`crate::DEFAULT_SOCK_NAME`] under the store root. Returns the path.
+    pub fn listen_for_sends_from_env(&mut self) -> Result<PathBuf, ShellError> {
+        let root = self.store_root.clone().ok_or(ShellError::StoreRoot)?;
+        let path = crate::send_sock_path(
+            |key| std::env::var(key).ok().filter(|value| !value.is_empty()),
+            &root,
+        );
+        self.listen_for_sends(&path)?;
+        Ok(path)
+    }
+
+    /// Sends `text` from session `as_nick` to `to` in their encrypted DM,
+    /// driving until `to` has joined (up to `wait`). The direct path of
+    /// `m4a-send` when no client is running.
+    pub fn send_blocking(
+        &mut self,
+        as_nick: &str,
+        to: &str,
+        text: &str,
+        wait: std::time::Duration,
+    ) -> crate::SendReply {
+        let started = std::time::Instant::now();
+        let mut room = None;
+        let mut peer = None;
+        loop {
+            let now = now_ms();
+            match self.try_send(as_nick, to, text, now, &mut room, &mut peer) {
+                Some(reply) => return reply,
+                None if started.elapsed() >= wait => {
+                    return crate::SendReply {
+                        room,
+                        ..crate::SendReply::failed(format!("{to} has not joined the DM yet"))
+                    }
+                }
+                None => {
+                    if let Ok(store) = self.session_mut(as_nick) {
+                        let _ = store.drive(now, false);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+            }
+        }
+    }
+
+    /// One attempt. `None` means the DM exists but `to` has not joined yet.
+    fn try_send(
+        &mut self,
+        as_nick: &str,
+        to: &str,
+        text: &str,
+        now_ms: i64,
+        room: &mut Option<String>,
+        peer: &mut Option<String>,
+    ) -> Option<crate::SendReply> {
+        let store = match self.session_mut(as_nick) {
+            Ok(store) => store,
+            Err(_) => {
+                return Some(crate::SendReply::failed(format!(
+                    "{as_nick} is not a session on this client"
+                )))
+            }
+        };
+        if peer.is_none() {
+            match store.find_nick(to, now_ms) {
+                Ok(found) => *peer = Some(found.user_id),
+                Err(err) => return Some(crate::SendReply::failed(format!("find {to}: {err}"))),
+            }
+        }
+        if room.is_none() {
+            match store.ensure_dm(to, now_ms) {
+                Ok(room_id) => *room = Some(room_id),
+                Err(err) => return Some(crate::SendReply::failed(format!("open DM: {err}"))),
+            }
+        }
+        let (room_id, peer_id) = (room.clone()?, peer.clone()?);
+        if !store.member_joined(&room_id, &peer_id) {
+            return None;
+        }
+        match store.write_to_nick(to, text, now_ms) {
+            Ok(room_id) => {
+                let event_id = store
+                    .texts()
+                    .into_iter()
+                    .rev()
+                    .find(|row| row.room_id == room_id && row.body == text)
+                    .and_then(|row| row.event_id);
+                Some(crate::SendReply {
+                    ok: true,
+                    room: Some(room_id),
+                    event_id,
+                    error: None,
+                })
+            }
+            Err(err) => Some(crate::SendReply {
+                room: Some(room_id),
+                ..crate::SendReply::failed(format!("send: {err}"))
+            }),
+        }
+    }
+
+    fn serve_sends(&mut self, now_ms: i64, report: &mut TickReport) {
+        if let Some(listener) = &self.send_listener {
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => match crate::send::read_request(&mut stream) {
+                        Ok(request) => self.send_queue.push(PendingSend {
+                            stream,
+                            request,
+                            started: std::time::Instant::now(),
+                            room: None,
+                            peer: None,
+                        }),
+                        Err(err) => {
+                            crate::send::write_reply(&mut stream, &crate::SendReply::failed(err))
+                        }
+                    },
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+        }
+        let queue = std::mem::take(&mut self.send_queue);
+        for mut pending in queue {
+            let (as_nick, to, text) = (
+                pending.request.as_nick.clone(),
+                pending.request.to.clone(),
+                pending.request.text.clone(),
+            );
+            let outcome = self.try_send(
+                &as_nick,
+                &to,
+                &text,
+                now_ms,
+                &mut pending.room,
+                &mut pending.peer,
+            );
+            let reply = match outcome {
+                Some(reply) => reply,
+                None if pending.started.elapsed().as_secs() >= SEND_JOIN_WAIT_SECS => {
+                    crate::SendReply {
+                        room: pending.room.clone(),
+                        ..crate::SendReply::failed(format!("{to} has not joined the DM yet"))
+                    }
+                }
+                None => {
+                    self.send_queue.push(pending);
+                    continue;
+                }
+            };
+            crate::send::write_reply(&mut pending.stream, &reply);
+            report.sent.push((as_nick, to, reply));
+        }
     }
 
     /// Every routine POST attempted by every session, as (nick, attempt).

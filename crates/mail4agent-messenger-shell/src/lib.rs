@@ -64,6 +64,7 @@
 mod machine;
 mod nick;
 mod push;
+mod send;
 
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
@@ -86,7 +87,8 @@ pub use machine::{
     ensure_agent_webhook_routines, ensure_agent_webhook_routines_from_env, load_agents_dir,
     load_session_records, HostSession, MachineClient, RoutineReport, TickReport, WakeOptions,
     WakeStatus, AGENTS_DIR_ENV, AGENT_RESCAN_SECS_ENV, DEFAULT_AGENTS_DIR, KEYCHAIN_DIR_ENV,
-    PROFILE_NOTE_ENV, SESSIONS_DIR_ENV, SESSION_IDS_ENV, SKIP_NICKS_ENV, WAKE_KEYCHAIN_FILE,
+    PROFILE_NOTE_ENV, SESSIONS_DIR_ENV, SESSION_IDS_ENV, SKIP_NICKS_ENV, STORE_LOCK_FILE,
+    WAKE_KEYCHAIN_FILE,
 };
 pub use mail4agent_messenger::{
     CreateRoomKind, DeviceId, MessageKind, MessengerCommand, OutgoingMessage, RoomId, RoomKind,
@@ -94,6 +96,10 @@ pub use mail4agent_messenger::{
 };
 pub use nick::{nick_from_display_name, routine_folder_id};
 pub use push::PushedRoomEvent;
+pub use send::{
+    load_env_file, send_sock_path, send_via_socket, SendReply, SendRequest, DEFAULT_SOCK_NAME,
+    ENV_FILE_ENV, MAX_SEND_BYTES, SEND_SOCK_ENV,
+};
 
 /// SHA-256 of `session_id`'s UTF-8 bytes. That digest is the check that this
 /// session may open the store. The bytes are not written to disk.
@@ -470,6 +476,7 @@ pub struct FoundSession {
 /// only reads the message still finds. `from` is the sender mxid.
 /// `event_id` is the Matrix event id. `nick` is omitted when this shell
 /// does not already know a display name; it is never invented.
+#[derive(Default)]
 pub struct DecryptedWake<'a> {
     /// Plaintext body.
     pub body: &'a str,
@@ -479,6 +486,29 @@ pub struct DecryptedWake<'a> {
     pub nick: Option<&'a str>,
     /// Matrix event id.
     pub event_id: &'a str,
+    /// Room id the text arrived in (`room`).
+    pub room: Option<&'a str>,
+    /// Sender nick: the localpart of `from` (`from_nick`).
+    pub from_nick: Option<&'a str>,
+    /// Recipient nick: the session this wake is for (`to`).
+    pub to: Option<&'a str>,
+    /// One-line reply command for the recipient (`reply`), e.g.
+    /// `m4a-send --as <to> --to <from_nick> '<text>'`.
+    pub reply: Option<&'a str>,
+}
+
+/// Command a woken bot runs to answer, as shown in the wake's `reply`.
+pub const SEND_COMMAND: &str = "m4a-send";
+
+/// The `reply` hint for a wake from `from_nick` to `to`.
+pub fn reply_hint(to: &str, from_nick: &str) -> String {
+    format!("{SEND_COMMAND} --as {to} --to {from_nick} '<your reply>'")
+}
+
+/// Localpart of a Matrix user id (`@hostbot:server` -> `hostbot`).
+pub fn mxid_localpart(mxid: &str) -> &str {
+    let rest = mxid.strip_prefix('@').unwrap_or(mxid);
+    rest.split_once(':').map(|(local, _)| local).unwrap_or(rest)
 }
 
 /// POSTs `wake` once, as a JSON object, to `url`. No mailbox path and no
@@ -555,6 +585,19 @@ fn routine_json(wake: &DecryptedWake<'_>) -> Result<Vec<u8>, ShellError> {
             "nick".to_string(),
             serde_json::Value::String(nick.to_string()),
         );
+    }
+    for (key, value) in [
+        ("room", wake.room),
+        ("from_nick", wake.from_nick),
+        ("to", wake.to),
+        ("reply", wake.reply),
+    ] {
+        if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+            object.insert(
+                key.to_string(),
+                serde_json::Value::String(value.to_string()),
+            );
+        }
     }
     serde_json::to_vec(&object)
         .map_err(|err| ShellError::RoutineTransport(clip_public(err.to_string())))
@@ -1514,6 +1557,7 @@ impl OpenedStore {
                 };
                 let key = format!("{}\n{}", room_id.as_str(), event_id.as_str());
                 out.push(InboundPlaintext {
+                    room_id: room_id.as_str().to_string(),
                     key,
                     body,
                     from: item.sender.as_str().to_string(),
@@ -1568,11 +1612,18 @@ impl OpenedStore {
         for item in items {
             if let Some(url) = url.as_deref() {
                 if !self.routine_sent.contains(&item.key) {
+                    let from_nick = mxid_localpart(&item.from).to_string();
+                    let to = self.nick.clone();
+                    let reply = to.as_deref().map(|to| reply_hint(to, &from_nick));
                     let wake = DecryptedWake {
                         body: &item.body,
                         from: &item.from,
                         nick: item.nick.as_deref(),
                         event_id: &item.event_id,
+                        room: Some(&item.room_id),
+                        from_nick: Some(&from_nick),
+                        to: to.as_deref(),
+                        reply: reply.as_deref(),
                     };
                     match post_decrypted_with_bearer(
                         url,
@@ -1631,6 +1682,7 @@ impl OpenedStore {
 }
 
 struct InboundPlaintext {
+    room_id: String,
     key: String,
     body: String,
     from: String,
@@ -1965,6 +2017,9 @@ fn persist(dir: &Path, core: &mut MessengerCore<SealedRecordCodec>) -> Result<()
     Ok(())
 }
 
+/// Files in a session directory that are not sealed records.
+const NOT_RECORDS: &[&str] = &[machine::WAKE_KEYCHAIN_FILE, machine::STORE_LOCK_FILE];
+
 fn read_records(dir: &Path) -> Result<Vec<SealedRecord>, ShellError> {
     let mut records = Vec::new();
     if dir.exists() {
@@ -1979,6 +2034,16 @@ fn walk(dir: &Path, root: &Path, records: &mut Vec<SealedRecord>) -> Result<(), 
         let path = entry.path();
         if path.is_dir() {
             walk(&path, root, records)?;
+            continue;
+        }
+        // Keychain and lock files share the session directory; they are
+        // not sealed records.
+        if dir == root
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| NOT_RECORDS.contains(&name))
+        {
             continue;
         }
         let rel = path
@@ -2243,6 +2308,7 @@ mod tests {
                 from: "@bob:localhost",
                 nick: None,
                 event_id: "$m1:localhost",
+                ..Default::default()
             },
         )
         .expect("post");
@@ -2333,6 +2399,7 @@ mod tests {
                 from: "@bob:localhost",
                 nick: None,
                 event_id: "$m1:localhost",
+                ..Default::default()
             },
         )
         .expect_err("a self-signed cert must not verify");
@@ -2876,6 +2943,7 @@ mod tests {
                 from: "@bob:localhost",
                 nick: Some("Bob"),
                 event_id: "$m1:localhost",
+                ..Default::default()
             },
             Some(bearer),
         )
@@ -2950,6 +3018,7 @@ mod tests {
                 from: "@bob:localhost",
                 nick: None,
                 event_id: "$m1:localhost",
+                ..Default::default()
             },
         )
         .expect("missing nick");
@@ -2960,6 +3029,7 @@ mod tests {
                 from: "@bob:localhost",
                 nick: Some("   "),
                 event_id: "$m1:localhost",
+                ..Default::default()
             },
         )
         .expect("blank nick");

@@ -34,3 +34,7 @@ path = "src/bin/ensure_agent_webhooks.rs"
 [[bin]]
 name = "m4a-web-client"
 path = "src/bin/web_client.rs"
+
+[[bin]]
+name = "m4a-send"
+path = "src/bin/send.rs"
