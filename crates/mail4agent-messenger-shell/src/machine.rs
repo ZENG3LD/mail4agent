@@ -10,16 +10,27 @@
 //! present. A session record is the bot display name, the mail session id,
 //! and the Grok Bot agent id when this session has one. A routine URL or a
 //! bearer in the file is refused.
-//! [`MachineClient::from_env`] creates one webhook routine per agent,
-//! through the local gateway, and keeps the URL and key in memory. It
-//! skips a name that already exists (so Hostbot is not minted twice). A
-//! record with no agent id does not create a routine. It does not write
-//! them back and it does not log them. One URL is not shared across
-//! sessions. [`ensure_agent_webhook_routines`] is the same create path
-//! without opening sealed stores. [`MachineClient::poll_agent_directory`]
-//! rescans the agents directory for bots that appeared after open.
-//! [`crate::LEADER_SOCK_ENV`] is not this path. The node CLI does not
-//! create a routine.
+//!
+//! Wake routines. Every bot here is server-hosted, so only the bot itself
+//! can put a routine on the backend, with its own `UpdateRoutine`. The
+//! routine is named by the bot's nick and so lives in folder
+//! [`crate::routine_folder_id`] of that nick (`privet_mir` ->
+//! `privet-mir`). Its backend id is
+//! `stableAutomationId(agentId, folderId)`. The local gateway hands out a
+//! webhook key only for a routine it finds locally, and mints it for that
+//! same id, so [`MachineClient::from_env`] keeps a disabled local mirror
+//! (webhook trigger, same folder) per bot through `createAgentAutomation`
+//! and then calls `getAutomationWebhookCredential`. A null key means the
+//! bot has not created its routine yet: logged, retried by
+//! [`MachineClient::poll_agent_directory`], and never answered with another
+//! routine. A mirror that lands in any other folder is deleted again.
+//! [`SKIP_NICKS_ENV`] lists bots to leave alone. A ready URL and key stay
+//! in memory and in the session's keychain file ([`WAKE_KEYCHAIN_FILE`],
+//! mode 0600, under the sealed store root); they are never logged. A
+//! record with no agent id gets no wake. One URL is not shared across
+//! sessions. [`ensure_agent_webhook_routines`] is the same path without
+//! opening sealed stores. [`crate::LEADER_SOCK_ENV`] is not this path. The
+//! node CLI does not create a routine.
 //!
 //! Each session still seals under [`crate::session_store_dir`]. Olm pickles
 //! are not shared. While [`MachineClient::set_local_delivery`] is set, the
@@ -36,7 +47,7 @@ use mail4agent_messenger::{HttpResponseDescriptor, OutgoingRequest, OutgoingRequ
 use mail4agent_server::http::{hash_token, router, Homeserver};
 use mail4agent_server::store::{self, create_matrix_schema};
 use rusqlite::{params, Connection};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -267,28 +278,30 @@ fn resolve_agents_dir(mut get: impl FnMut(&str) -> Option<String>) -> Option<Pat
     }
 }
 
-/// Session records plus one webhook routine per session that has an agent id.
+/// Session records plus one wake per session that has an agent id.
 ///
 /// `get` is the process environment on [`MachineClient::from_env`]. A
 /// shared [`crate::ROUTINE_URL_ENV`] is not copied onto every session.
 /// [`GATEWAY_FILE_ENV`] names the gateway file. When that lookup is empty,
 /// this does not look for a gateway, so a test that did not point at one
-/// does not create a routine. The json files are not rewritten.
+/// does not create a mirror. The json files are not rewritten.
 fn load_web_sessions(
     dir: &Path,
     mut get: impl FnMut(&str) -> Option<String>,
 ) -> Result<Vec<HostSession>, ShellError> {
-    let mut sessions = load_session_records(dir)?;
+    let sessions = load_session_records(dir)?;
+    let mut sessions = drop_skipped(sessions, &skip_nicks(&mut get));
     attach_routines_from_env(&mut sessions, &mut get)?;
     Ok(sessions)
 }
 
-/// [`load_agents_dir`] plus one webhook routine per agent.
+/// [`load_agents_dir`] minus [`SKIP_NICKS_ENV`], plus one wake per agent.
 fn load_web_agents(
     dir: &Path,
     mut get: impl FnMut(&str) -> Option<String>,
 ) -> Result<Vec<HostSession>, ShellError> {
-    let mut sessions = load_agents_dir(dir)?;
+    let sessions = load_agents_dir(dir)?;
+    let mut sessions = drop_skipped(sessions, &skip_nicks(&mut get));
     attach_routines_from_env(&mut sessions, &mut get)?;
     Ok(sessions)
 }
@@ -297,53 +310,252 @@ fn attach_routines_from_env(
     sessions: &mut [HostSession],
     get: &mut impl FnMut(&str) -> Option<String>,
 ) -> Result<(), ShellError> {
+    let store_root = get(STORE_ROOT_ENV).map(PathBuf::from);
     let Some(path) = get(GATEWAY_FILE_ENV).filter(|value| !value.is_empty()) else {
         return Ok(());
     };
     let token = get(GATEWAY_TOKEN_ENV).filter(|value| !value.is_empty());
-    attach_webhook_routines(sessions, Path::new(&path), token.as_deref())?;
+    attach_webhook_routines(
+        sessions,
+        Path::new(&path),
+        token.as_deref(),
+        store_root.as_deref(),
+    )?;
     Ok(())
 }
 
-/// Creates webhook routines for every agent under `agents_dir` that does not
-/// already have a routine of the intended name. Returns the routine names
-/// that exist afterwards (including ones that were already present). Does
+/// Comma-separated nicks this client leaves alone: no session, no mirror,
+/// no credential call. Machine-specific, so it lives in the environment
+/// and not in source.
+pub const SKIP_NICKS_ENV: &str = "M4A_SKIP_NICKS";
+
+fn skip_nicks(get: &mut impl FnMut(&str) -> Option<String>) -> Vec<String> {
+    parse_skip_nicks(get(SKIP_NICKS_ENV).as_deref().unwrap_or(""))
+}
+
+fn parse_skip_nicks(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|item| item.trim().to_ascii_lowercase())
+        .filter(|item| !item.is_empty())
+        .collect()
+}
+
+fn drop_skipped(sessions: Vec<HostSession>, skip: &[String]) -> Vec<HostSession> {
+    if skip.is_empty() {
+        return sessions;
+    }
+    sessions
+        .into_iter()
+        .filter(|session| match routine_name_for(session) {
+            Some(nick) => !skip.iter().any(|item| item.eq_ignore_ascii_case(&nick)),
+            None => true,
+        })
+        .collect()
+}
+
+/// Where one bot's wake stands after [`ensure_agent_webhook_routines`].
+/// Carries no URL and no key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WakeStatus {
+    /// Local mirror present and the gateway returned a URL and a key.
+    Ready,
+    /// Local mirror present, key null: the bot has not created its own
+    /// routine with this folder id yet. Retried on the next poll. No
+    /// second routine is made.
+    AwaitingBackend,
+    /// Nothing usable. The text names the reason, never a secret.
+    Failed(String),
+}
+
+/// One bot's wake routine, by nick and folder id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutineReport {
+    /// Grok Bot agent id.
+    pub agent_id: String,
+    /// Bot nick, which is also the routine name.
+    pub nick: String,
+    /// Routine folder id: [`crate::routine_folder_id`] of the nick.
+    pub folder_id: String,
+    /// Outcome.
+    pub status: WakeStatus,
+}
+
+/// Knobs for [`ensure_agent_webhook_routines`]. All machine-specific, so
+/// they come from the environment ([`WakeOptions::from_lookup`]).
+#[derive(Debug, Clone, Default)]
+pub struct WakeOptions {
+    /// Nicks to leave alone ([`SKIP_NICKS_ENV`]).
+    pub skip_nicks: Vec<String>,
+    /// Sealed store root for the per-session keychain file.
+    pub store_root: Option<PathBuf>,
+    /// Write the bootstrap note into the profile description of a bot that
+    /// has no routine yet ([`PROFILE_NOTE_ENV`]). Off unless asked for.
+    pub profile_note: bool,
+}
+
+impl WakeOptions {
+    /// [`SKIP_NICKS_ENV`], [`STORE_ROOT_ENV`], [`PROFILE_NOTE_ENV`].
+    pub fn from_lookup(mut get: impl FnMut(&str) -> Option<String>) -> Self {
+        Self {
+            skip_nicks: skip_nicks(&mut get),
+            store_root: get(STORE_ROOT_ENV).map(PathBuf::from),
+            profile_note: get(PROFILE_NOTE_ENV).as_deref() == Some("1"),
+        }
+    }
+}
+
+/// Ensures each agent's local mirror (webhook trigger, disabled, folder =
+/// [`crate::routine_folder_id`] of the nick) and asks the gateway for its
+/// credential. Bots whose nick is in `skip_nicks` are not touched. Does
 /// not open sealed stores, does not register on the homeserver, and does
-/// not log URLs or keys.
+/// not log or return URLs or keys. When `store_root` is set, a ready URL
+/// and key are written to that session's keychain file. With
+/// `profile_note`, a bot still waiting gets the bootstrap note.
 pub fn ensure_agent_webhook_routines(
     agents_dir: &Path,
     gateway_file: &Path,
     token_override: Option<&str>,
-) -> Result<Vec<String>, ShellError> {
-    let mut sessions = load_agents_dir(agents_dir)?;
-    attach_webhook_routines(&mut sessions, gateway_file, token_override)?;
-    // Re-list so a card whose credential mint returned no key still appears.
-    let mut names = list_webhook_routine_names(&sessions, gateway_file, token_override)?;
-    if names.is_empty() {
-        names = sessions
-            .iter()
-            .filter(|session| session.agent_id.is_some())
-            .map(routine_name_for)
-            .collect();
+    options: &WakeOptions,
+) -> Result<Vec<RoutineReport>, ShellError> {
+    let store_root = options.store_root.as_deref();
+    let sessions = drop_skipped(load_agents_dir(agents_dir)?, &options.skip_nicks);
+    let Some(gate) = open_gateway(gateway_file, token_override)? else {
+        return Err(ShellError::Gateway("gateway file is missing".to_string()));
+    };
+    let mut reports = Vec::new();
+    for session in &sessions {
+        let Some(agent_id) = session.agent_id.as_deref().filter(|id| !id.is_empty()) else {
+            continue;
+        };
+        let Some(nick) = routine_name_for(session) else {
+            continue;
+        };
+        let outcome = ensure_wake(&gate, agent_id, &nick);
+        let folder_id = crate::nick::routine_folder_id(&nick).unwrap_or_default();
+        if let (WakeOutcome::Ready { url, key }, Some(root)) = (&outcome, store_root) {
+            save_wake(root, &session.session_id, &folder_id, url, key);
+        }
+        log_outcome(&nick, &folder_id, &outcome);
+        if options.profile_note && matches!(outcome, WakeOutcome::AwaitingBackend) {
+            note_profile(&gate, agents_dir, agent_id, &nick);
+        }
+        reports.push(RoutineReport {
+            agent_id: agent_id.to_string(),
+            nick,
+            folder_id,
+            status: outcome.status(),
+        });
     }
-    names.sort();
-    names.dedup();
-    Ok(names)
+    Ok(reports)
 }
 
-/// [`ensure_agent_webhook_routines`] using the host gateway file and the
-/// agents directory from the environment (or [`DEFAULT_AGENTS_DIR`]).
-pub fn ensure_agent_webhook_routines_from_env() -> Result<Vec<String>, ShellError> {
-    let agents_dir = resolve_agents_dir(|key| std::env::var(key).ok().filter(|v| !v.is_empty()))
+/// [`ensure_agent_webhook_routines`] using the host gateway file, the
+/// agents directory from the environment (or [`DEFAULT_AGENTS_DIR`]),
+/// [`SKIP_NICKS_ENV`], and [`STORE_ROOT_ENV`] when set.
+pub fn ensure_agent_webhook_routines_from_env() -> Result<Vec<RoutineReport>, ShellError> {
+    let mut get = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
+    let agents_dir = resolve_agents_dir(&mut get)
         .ok_or_else(|| ShellError::SessionList("agents directory is missing".to_string()))?;
-    let gateway = std::env::var(GATEWAY_FILE_ENV)
-        .ok()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_GATEWAY_FILE.to_string());
-    let token = std::env::var(GATEWAY_TOKEN_ENV)
-        .ok()
-        .filter(|value| !value.is_empty());
-    ensure_agent_webhook_routines(Path::new(&agents_dir), Path::new(&gateway), token.as_deref())
+    let gateway = get(GATEWAY_FILE_ENV).unwrap_or_else(|| DEFAULT_GATEWAY_FILE.to_string());
+    let token = get(GATEWAY_TOKEN_ENV);
+    let options = WakeOptions::from_lookup(&mut get);
+    ensure_agent_webhook_routines(&agents_dir, Path::new(&gateway), token.as_deref(), &options)
+}
+
+/// Set to `1` to write the bootstrap note into the profile description of
+/// each bot that has no routine yet, through the gateway's `updateAgent`
+/// (the host pushes profile edits to the server copy of the bot). The note
+/// asks the bot to create its own routine named by its nick on its next
+/// turn. Off by default: it edits a description the owner wrote.
+pub const PROFILE_NOTE_ENV: &str = "M4A_BOOTSTRAP_PROFILE_NOTE";
+
+const NOTE_OPEN: &str = "<!-- mail4agent:wake -->";
+const NOTE_CLOSE: &str = "<!-- /mail4agent:wake -->";
+/// Host limit on a profile description.
+const DESCRIPTION_MAX: usize = 20_000;
+
+/// The bootstrap note for `nick`. No host name, no key, no agent id.
+fn wake_note(nick: &str) -> String {
+    format!(
+        "{NOTE_OPEN}\nmail4agent wake: keep exactly one routine named \"{nick}\" with a webhook trigger, enabled. If it is missing, create it with UpdateRoutine: name \"{nick}\", trigger webhook, prompt \"A mail4agent room message woke this routine. The webhook JSON has body, from, event_id, and nick. Read that message.\" Do not rename it and do not create a second one.\n{NOTE_CLOSE}"
+    )
+}
+
+/// `description` with the note for `nick` in place: an older note block is
+/// replaced, otherwise the note is appended after a blank line. `None`
+/// when the description already carries exactly this note.
+fn with_wake_note(description: &str, nick: &str) -> Option<String> {
+    let note = wake_note(nick);
+    if description.contains(&note) {
+        return None;
+    }
+    if let (Some(start), Some(end)) = (description.find(NOTE_OPEN), description.find(NOTE_CLOSE)) {
+        if end > start {
+            let mut out = String::with_capacity(description.len() + note.len());
+            out.push_str(&description[..start]);
+            out.push_str(&note);
+            out.push_str(&description[end + NOTE_CLOSE.len()..]);
+            return Some(out);
+        }
+    }
+    let base = description.trim_end();
+    Some(if base.is_empty() {
+        note
+    } else {
+        format!("{base}\n\n{note}")
+    })
+}
+
+/// Writes the note into one bot's profile description through the
+/// gateway. Reads the rest of the profile from `profile.json` so name,
+/// title, and avatar are sent back unchanged. Failures are logged only.
+fn note_profile(gate: &GatewayConn, agents_dir: &Path, agent_id: &str, nick: &str) {
+    match ensure_profile_note(gate, agents_dir, agent_id, nick) {
+        Ok(true) => eprintln!("mail4agent: wake {nick}: bootstrap note written to the profile"),
+        Ok(false) => {}
+        Err(err) => eprintln!("mail4agent: wake {nick}: bootstrap note not written ({err})"),
+    }
+}
+
+fn ensure_profile_note(
+    gate: &GatewayConn,
+    agents_dir: &Path,
+    agent_id: &str,
+    nick: &str,
+) -> Result<bool, ShellError> {
+    let text = std::fs::read_to_string(agents_dir.join(agent_id).join("profile.json"))
+        .map_err(|_| ShellError::Gateway("profile is unreadable".to_string()))?;
+    let profile: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|_| ShellError::Gateway("profile is unreadable".to_string()))?;
+    let field = |key: &str| profile.get(key).and_then(|value| value.as_str());
+    let Some(name) = field("name").filter(|name| !name.trim().is_empty()) else {
+        return Err(ShellError::Gateway("profile has no name".to_string()));
+    };
+    let Some(description) = with_wake_note(field("description").unwrap_or(""), nick) else {
+        return Ok(false);
+    };
+    if description.chars().count() > DESCRIPTION_MAX {
+        return Err(ShellError::Gateway(
+            "description would be too long".to_string(),
+        ));
+    }
+    let mut body = serde_json::json!({ "name": name, "description": description });
+    for key in ["title", "avatarShape", "avatarColor"] {
+        if let Some(value) = field(key) {
+            body[key] = serde_json::Value::String(value.to_string());
+        }
+    }
+    let (status, _) = gateway_post(
+        gate,
+        "updateAgent",
+        &serde_json::json!({ "id": agent_id, "profile": body }),
+    )?;
+    if status != 200 {
+        return Err(ShellError::Gateway(format!(
+            "gateway profile status {status}"
+        )));
+    }
+    Ok(true)
 }
 
 /// Gateway file the host already runs. [`GATEWAY_FILE_ENV`] overrides it.
@@ -358,9 +570,15 @@ pub const GATEWAY_FILE_ENV: &str = "M4A_GATEWAY_FILE";
 /// It is never written to disk.
 pub const GATEWAY_TOKEN_ENV: &str = "M4A_GATEWAY_TOKEN";
 
-/// Saved prompt for the webhook routine. The wake body is still the JSON
-/// object [`crate::routine_json`] posts. No host name and no key.
-const WEBHOOK_ROUTINE_PROMPT: &str = "A mail4agent room message woke this routine. The webhook JSON has body, from, event_id, and nick only when the sender display name is already known. Read that message.";
+/// Saved prompt of the local mirror. The mirror is disabled and never runs:
+/// the backend routine the bot made itself is the one the webhook wakes.
+/// No host name and no key.
+const MIRROR_ROUTINE_PROMPT: &str = "mail4agent wake mirror. Disabled on purpose: it only lets the local gateway hand out the webhook key for the routine with this folder id, which the bot creates itself with UpdateRoutine.";
+
+/// Per-session keychain file under the session's sealed directory
+/// ([`crate::session_store_dir`]). Mode 0600. Holds the folder id, the
+/// webhook URL, and its key. Outside any repository; never logged.
+pub const WAKE_KEYCHAIN_FILE: &str = "routine-wake.json";
 
 #[derive(serde::Deserialize)]
 struct GatewayFile {
@@ -374,6 +592,28 @@ struct GatewayFile {
 struct AutomationCard {
     id: String,
     name: String,
+    #[serde(default)]
+    trigger: Option<serde_json::Value>,
+}
+
+impl AutomationCard {
+    /// Whether the card fires on a webhook. A card without a trigger field
+    /// is not judged here; the credential call refuses it if it is not.
+    fn is_webhook(&self) -> bool {
+        fn has_webhook(value: &serde_json::Value) -> bool {
+            match value {
+                serde_json::Value::Array(items) => items.iter().any(has_webhook),
+                serde_json::Value::Object(map) => {
+                    map.get("type").and_then(|kind| kind.as_str()) == Some("webhook")
+                        || map
+                            .values()
+                            .any(|inner| inner.is_array() && has_webhook(inner))
+                }
+                _ => false,
+            }
+        }
+        self.trigger.as_ref().map(has_webhook).unwrap_or(true)
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -382,41 +622,20 @@ struct WebhookCredential {
     key: Option<String>,
 }
 
-/// Folder slug the gateway uses for a new routine name. ASCII letters and
-/// digits only, matching the gateway's slug. Empty when `name` has none.
-fn automation_slug(name: &str) -> String {
-    let mut slug = String::new();
-    let mut pending_dash = false;
-    for ch in name.to_lowercase().chars() {
-        if ch.is_ascii_alphanumeric() {
-            if pending_dash && !slug.is_empty() {
-                slug.push('-');
-            }
-            pending_dash = false;
-            slug.push(ch);
-        } else if !slug.is_empty() {
-            pending_dash = true;
-        }
-    }
-    if slug.len() > 48 {
-        slug.truncate(48);
-    }
-    slug
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredWake {
+    folder_id: String,
+    url: String,
+    key: String,
 }
 
-/// Routine name for a new card. An ASCII display name is kept as written
-/// so an existing card such as `Hostbot` is not minted again. A name with
-/// no ASCII slug, including Cyrillic, uses the same transliteration as the
-/// nick (`Привет мир` -> `privet_mir`). The session id is only
-/// the fallback when that transliteration is empty. This does not rename a
-/// card that already exists.
-fn routine_name_for(session: &HostSession) -> String {
-    if automation_slug(&session.bot_name).is_empty() {
-        crate::nick::nick_from_display_name(session.bot_name.trim())
-            .unwrap_or_else(|_| session.session_id.clone())
-    } else {
-        session.bot_name.clone()
-    }
+/// Routine name for a bot: its nick ([`crate::nick_from_display_name`] of
+/// the display name, so `Hostbot` -> `hostbot`, `Привет мир` ->
+/// `privet_mir`). The bot names its own routine the same way, and
+/// the folder id follows from the name. `None` when no nick derives.
+fn routine_name_for(session: &HostSession) -> Option<String> {
+    crate::nick::nick_from_display_name(session.bot_name.trim()).ok()
 }
 
 struct GatewayConn {
@@ -462,126 +681,208 @@ fn open_gateway(
     }))
 }
 
-/// Creates each session's webhook routine, or reads the credential when
-/// that name already exists. A missing gateway file leaves the sessions
-/// unchanged. The URL and key stay on `sessions` and are not logged.
+/// Result of [`ensure_wake`] for one agent. Holds the secret only in
+/// memory, on its way to the session and the keychain file.
+enum WakeOutcome {
+    Ready { url: String, key: String },
+    AwaitingBackend,
+    Failed(String),
+}
+
+impl WakeOutcome {
+    fn status(&self) -> WakeStatus {
+        match self {
+            WakeOutcome::Ready { .. } => WakeStatus::Ready,
+            WakeOutcome::AwaitingBackend => WakeStatus::AwaitingBackend,
+            WakeOutcome::Failed(reason) => WakeStatus::Failed(reason.clone()),
+        }
+    }
+}
+
+fn log_outcome(nick: &str, folder_id: &str, outcome: &WakeOutcome) {
+    match outcome {
+        WakeOutcome::Ready { .. } => eprintln!("mail4agent: wake {nick} ({folder_id}): ready"),
+        WakeOutcome::AwaitingBackend => eprintln!(
+            "mail4agent: wake {nick} ({folder_id}): no key yet; the bot has not created its own routine with this folder id; will retry"
+        ),
+        WakeOutcome::Failed(reason) => {
+            eprintln!("mail4agent: wake {nick} ({folder_id}): {reason}")
+        }
+    }
+}
+
+/// One agent: make sure the disabled local mirror exists in exactly the
+/// folder the bot's own routine uses, then read the credential.
+///
+/// The gateway mints a key only for a routine it can find locally, and it
+/// mints it for `stableAutomationId(agentId, folderId)`, which is the
+/// backend id of the bot's own routine with that folder id. A null key
+/// means that backend routine does not exist yet. This never creates a
+/// second routine: a mirror that lands in another folder (`-2`) is deleted
+/// again and reported.
+fn ensure_wake(gate: &GatewayConn, agent_id: &str, nick: &str) -> WakeOutcome {
+    let Some(folder) = crate::nick::routine_folder_id(nick) else {
+        return WakeOutcome::Failed("nick has no routine folder id".to_string());
+    };
+    let before = match list_agent_automations(gate, agent_id) {
+        Ok(cards) => cards,
+        Err(err) => return WakeOutcome::Failed(err.to_string()),
+    };
+    match before.iter().find(|card| card.id == folder) {
+        Some(card) if !card.is_webhook() => {
+            return WakeOutcome::Failed(
+                "a routine in this folder is not webhook-triggered; left as is".to_string(),
+            );
+        }
+        Some(_) => {}
+        None => {
+            let after = match create_mirror_routine(gate, agent_id, nick) {
+                Ok(cards) => cards,
+                Err(err) => return WakeOutcome::Failed(err.to_string()),
+            };
+            if !after.iter().any(|card| card.id == folder) {
+                for stray in after
+                    .iter()
+                    .filter(|card| card.name == nick && !before.iter().any(|old| old.id == card.id))
+                {
+                    let _ = delete_agent_automation(gate, agent_id, &stray.id);
+                }
+                return WakeOutcome::Failed(
+                    "the mirror did not land in the expected folder; removed it".to_string(),
+                );
+            }
+        }
+    }
+    match read_webhook_credential(gate, agent_id, &folder) {
+        Ok(CredentialRead::Ready { url, key }) => WakeOutcome::Ready { url, key },
+        Ok(CredentialRead::MintFailed) => WakeOutcome::AwaitingBackend,
+        Ok(CredentialRead::Missing) => {
+            WakeOutcome::Failed("the mirror is gone from the gateway".to_string())
+        }
+        Err(err) => WakeOutcome::Failed(err.to_string()),
+    }
+}
+
+/// Sets each session's wake. With a gateway: [`ensure_wake`], and a ready
+/// URL and key go into the session and, when `store_root` is set, into the
+/// keychain file. Without a gateway file: the keychain file, if it holds a
+/// wake for this nick's folder. A session with no agent id is left alone.
 fn attach_webhook_routines(
     sessions: &mut [HostSession],
     gateway_file: &Path,
     token_override: Option<&str>,
+    store_root: Option<&Path>,
 ) -> Result<(), ShellError> {
-    let Some(gate) = open_gateway(gateway_file, token_override)? else {
-        return Ok(());
-    };
+    let gate = open_gateway(gateway_file, token_override)?;
     for session in sessions.iter_mut() {
         if session.routine_url.is_some() && session.routine_bearer.is_some() {
             continue;
         }
-        // createAgentAutomation's id is the Grok Bot agent, not the mail
-        // session id. No agent id means no routine, not a call with the
-        // wrong id.
+        // The gateway id is the Grok Bot agent, not the mail session id.
         let Some(agent_id) = session.agent_id.clone().filter(|id| !id.is_empty()) else {
             continue;
         };
-        let name = routine_name_for(session);
-        let slug = automation_slug(&name);
-        if slug.is_empty() || session.session_id.is_empty() {
-            return Err(ShellError::Gateway(
-                "session has no routine name".to_string(),
-            ));
-        }
-        let existing = list_agent_automations(&gate.client, &gate.base, &gate.token, &agent_id)?;
-        if let Some(card) = existing.iter().find(|card| card.name == name) {
-            // Name already exists: never mint a second card (Hostbot).
-            apply_credential(session, &gate, &agent_id, &card.id)?;
+        let Some(nick) = routine_name_for(session) else {
             continue;
-        }
-        match read_webhook_credential(&gate.client, &gate.base, &gate.token, &agent_id, &slug)? {
-            CredentialRead::Ready { url, key } => {
+        };
+        let Some(folder) = crate::nick::routine_folder_id(&nick) else {
+            continue;
+        };
+        let Some(gate) = gate.as_ref() else {
+            if let Some(root) = store_root {
+                if let Some((url, key)) = load_wake(root, &session.session_id, &folder) {
+                    session.routine_url = Some(url);
+                    session.routine_bearer = Some(key);
+                }
+            }
+            continue;
+        };
+        let outcome = ensure_wake(gate, &agent_id, &nick);
+        log_outcome(&nick, &folder, &outcome);
+        match outcome {
+            WakeOutcome::Ready { url, key } => {
+                if let Some(root) = store_root {
+                    save_wake(root, &session.session_id, &folder, &url, &key);
+                }
                 session.routine_url = Some(url);
                 session.routine_bearer = Some(key);
-                continue;
             }
-            CredentialRead::MintFailed => continue,
-            CredentialRead::Missing => {}
+            WakeOutcome::AwaitingBackend => {
+                // A key kept from before is not trusted once the gateway
+                // says the routine has none.
+                if let Some(root) = store_root {
+                    clear_wake(root, &session.session_id);
+                }
+            }
+            WakeOutcome::Failed(_) => {}
         }
-        let cards = create_webhook_routine(&gate.client, &gate.base, &gate.token, &agent_id, &name)?;
-        let Some(card) = pick_created_card(&cards, &name, &slug) else {
-            return Err(ShellError::Gateway(
-                "gateway create did not return the routine".to_string(),
-            ));
-        };
-        apply_credential(session, &gate, &agent_id, &card.id)?;
     }
     Ok(())
 }
 
-fn apply_credential(
-    session: &mut HostSession,
-    gate: &GatewayConn,
-    agent_id: &str,
-    automation_id: &str,
-) -> Result<(), ShellError> {
-    match read_webhook_credential(
-        &gate.client,
-        &gate.base,
-        &gate.token,
-        agent_id,
-        automation_id,
-    )? {
-        CredentialRead::Ready { url, key } => {
-            session.routine_url = Some(url);
-            session.routine_bearer = Some(key);
+fn keychain_path(store_root: &Path, session_id: &str) -> PathBuf {
+    crate::session_store_dir(store_root, session_id).join(WAKE_KEYCHAIN_FILE)
+}
+
+/// Writes the wake atomically with mode 0600. A failure is logged without
+/// the values and does not stop the client: the gateway still has the key.
+fn save_wake(store_root: &Path, session_id: &str, folder_id: &str, url: &str, key: &str) {
+    let path = keychain_path(store_root, session_id);
+    let stored = StoredWake {
+        folder_id: folder_id.to_string(),
+        url: url.to_string(),
+        key: key.to_string(),
+    };
+    let result = (|| -> std::io::Result<()> {
+        let dir = path.parent().unwrap_or(store_root);
+        std::fs::create_dir_all(dir)?;
+        let tmp = dir.join(format!("{WAKE_KEYCHAIN_FILE}.tmp"));
+        let bytes = serde_json::to_vec(&stored).map_err(std::io::Error::other)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
         }
-        CredentialRead::MintFailed | CredentialRead::Missing => {}
+        let mut file = options.open(&tmp)?;
+        std::io::Write::write_all(&mut file, &bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, &path)
+    })();
+    if result.is_err() {
+        eprintln!("mail4agent: wake keychain write failed for folder {folder_id}");
     }
-    Ok(())
+}
+
+fn load_wake(store_root: &Path, session_id: &str, folder_id: &str) -> Option<(String, String)> {
+    let text = std::fs::read_to_string(keychain_path(store_root, session_id)).ok()?;
+    let stored: StoredWake = serde_json::from_str(&text).ok()?;
+    if stored.folder_id != folder_id || stored.url.is_empty() || stored.key.is_empty() {
+        return None;
+    }
+    Some((stored.url, stored.key))
+}
+
+fn clear_wake(store_root: &Path, session_id: &str) {
+    let _ = std::fs::remove_file(keychain_path(store_root, session_id));
 }
 
 fn list_agent_automations(
-    client: &reqwest::blocking::Client,
-    base: &str,
-    token: &str,
+    gate: &GatewayConn,
     agent_id: &str,
 ) -> Result<Vec<AutomationCard>, ShellError> {
     let (status, body) = gateway_post(
-        client,
-        base,
-        token,
+        gate,
         "getAgentAutomations",
         &serde_json::json!({ "id": agent_id }),
     )?;
     if status != 200 {
-        return Err(ShellError::Gateway(format!(
-            "gateway list status {status}"
-        )));
+        return Err(ShellError::Gateway(format!("gateway list status {status}")));
     }
     serde_json::from_slice(&body)
         .map_err(|_| ShellError::Gateway("gateway list was not understood".to_string()))
-}
-
-fn list_webhook_routine_names(
-    sessions: &[HostSession],
-    gateway_file: &Path,
-    token_override: Option<&str>,
-) -> Result<Vec<String>, ShellError> {
-    let Some(gate) = open_gateway(gateway_file, token_override)? else {
-        return Ok(Vec::new());
-    };
-    let mut names = Vec::new();
-    for session in sessions {
-        let Some(agent_id) = session.agent_id.as_deref().filter(|id| !id.is_empty()) else {
-            continue;
-        };
-        let want = routine_name_for(session);
-        let cards = list_agent_automations(&gate.client, &gate.base, &gate.token, agent_id)?;
-        for card in cards {
-            if card.name == want {
-                names.push(card.name);
-            }
-        }
-    }
-    Ok(names)
 }
 
 enum CredentialRead {
@@ -589,7 +890,7 @@ enum CredentialRead {
         url: String,
         key: String,
     },
-    /// The routine exists and the gateway did not return a key.
+    /// The mirror exists and the gateway did not return a key.
     MintFailed,
     Missing,
 }
@@ -604,19 +905,18 @@ fn gateway_client() -> Result<reqwest::blocking::Client, ShellError> {
 }
 
 fn gateway_post(
-    client: &reqwest::blocking::Client,
-    base: &str,
-    token: &str,
+    gate: &GatewayConn,
     method: &str,
     body: &serde_json::Value,
 ) -> Result<(u16, Vec<u8>), ShellError> {
-    let url = format!("{base}/api/{method}");
-    let authorization = crate::bearer_header(token).map_err(|_| {
+    let url = format!("{}/api/{method}", gate.base);
+    let authorization = crate::bearer_header(&gate.token).map_err(|_| {
         ShellError::Gateway("gateway token is not a single header value".to_string())
     })?;
     let bytes = serde_json::to_vec(body)
         .map_err(|_| ShellError::Gateway("gateway request was not json".to_string()))?;
-    let response = client
+    let response = gate
+        .client
         .post(&url)
         .header(reqwest::header::AUTHORIZATION, authorization)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -631,16 +931,12 @@ fn gateway_post(
 }
 
 fn read_webhook_credential(
-    client: &reqwest::blocking::Client,
-    base: &str,
-    token: &str,
+    gate: &GatewayConn,
     agent_id: &str,
     automation_id: &str,
 ) -> Result<CredentialRead, ShellError> {
     let (status, body) = gateway_post(
-        client,
-        base,
-        token,
+        gate,
         "getAutomationWebhookCredential",
         &serde_json::json!({
             "id": agent_id,
@@ -674,8 +970,7 @@ fn read_webhook_credential(
 }
 
 /// A missing routine is not a 200. The gateway reports that as 404 or as
-/// 500 with its not-found error. Any other failure is not treated as
-/// "create another one".
+/// 500 with its not-found error.
 fn credential_is_missing(status: u16, body: &[u8]) -> bool {
     if status == 404 {
         return true;
@@ -688,25 +983,21 @@ fn credential_is_missing(status: u16, body: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
-fn create_webhook_routine(
-    client: &reqwest::blocking::Client,
-    base: &str,
-    token: &str,
+fn create_mirror_routine(
+    gate: &GatewayConn,
     agent_id: &str,
-    name: &str,
+    nick: &str,
 ) -> Result<Vec<AutomationCard>, ShellError> {
     let (status, body) = gateway_post(
-        client,
-        base,
-        token,
+        gate,
         "createAgentAutomation",
         &serde_json::json!({
             "id": agent_id,
             "spec": {
-                "name": name,
-                "prompt": WEBHOOK_ROUTINE_PROMPT,
+                "name": nick,
+                "prompt": MIRROR_ROUTINE_PROMPT,
                 "trigger": { "type": "webhook" },
-                "isEnabled": true,
+                "isEnabled": false,
             },
         }),
     )?;
@@ -719,32 +1010,22 @@ fn create_webhook_routine(
         .map_err(|_| ShellError::Gateway("gateway create was not understood".to_string()))
 }
 
-fn pick_created_card<'a>(
-    cards: &'a [AutomationCard],
-    name: &str,
-    slug: &str,
-) -> Option<&'a AutomationCard> {
-    let matches = cards.iter().filter(|card| card.name == name);
-    if let Some(exact) = cards
-        .iter()
-        .find(|card| card.name == name && card.id == slug)
-    {
-        return Some(exact);
+fn delete_agent_automation(
+    gate: &GatewayConn,
+    agent_id: &str,
+    automation_id: &str,
+) -> Result<(), ShellError> {
+    let (status, _) = gateway_post(
+        gate,
+        "deleteAgentAutomation",
+        &serde_json::json!({ "id": agent_id, "automationId": automation_id }),
+    )?;
+    if status != 200 {
+        return Err(ShellError::Gateway(format!(
+            "gateway delete status {status}"
+        )));
     }
-    matches.max_by(|left, right| slug_rank(&left.id, slug).cmp(&slug_rank(&right.id, slug)))
-}
-
-fn slug_rank(id: &str, slug: &str) -> u32 {
-    if id == slug {
-        return 1;
-    }
-    let Some(rest) = id
-        .strip_prefix(slug)
-        .and_then(|rest| rest.strip_prefix('-'))
-    else {
-        return 0;
-    };
-    rest.parse::<u32>().unwrap_or(0)
+    Ok(())
 }
 
 struct Prepared {
@@ -770,6 +1051,23 @@ pub struct MachineClient {
     gateway_token: Option<String>,
     last_agent_poll: std::time::Instant,
     agent_rescan_secs: u64,
+    /// Root for per-session keychain files ([`WAKE_KEYCHAIN_FILE`]).
+    store_root: Option<PathBuf>,
+    /// [`SKIP_NICKS_ENV`] as read at open.
+    skip_nicks: Vec<String>,
+    /// [`PROFILE_NOTE_ENV`] as read at open.
+    profile_note: bool,
+    /// Open sessions whose bot has no key yet. Retried on each poll.
+    pending_wakes: Vec<PendingWake>,
+    /// Agent ids whose wake is already set on an open session or reported
+    /// ready. Not asked again.
+    ready_agents: HashSet<String>,
+}
+
+/// An open session still waiting for its bot's own routine.
+struct PendingWake {
+    store_dir: PathBuf,
+    agent_id: String,
 }
 
 impl MachineClient {
@@ -878,6 +1176,11 @@ impl MachineClient {
             gateway_token: None,
             last_agent_poll: std::time::Instant::now(),
             agent_rescan_secs: 0,
+            store_root: None,
+            skip_nicks: Vec::new(),
+            profile_note: false,
+            pending_wakes: Vec::new(),
+            ready_agents: HashSet::new(),
         })
     }
 
@@ -925,9 +1228,8 @@ impl MachineClient {
         let (sessions, agents_dir) = if let Some(dir) = agents_dir {
             (load_web_agents(&dir, &mut get)?, Some(dir))
         } else {
-            let sessions_dir = get(SESSIONS_DIR_ENV).ok_or_else(|| {
-                ShellError::SessionList("session directory is unset".to_string())
-            })?;
+            let sessions_dir = get(SESSIONS_DIR_ENV)
+                .ok_or_else(|| ShellError::SessionList("session directory is unset".to_string()))?;
             (load_web_sessions(Path::new(&sessions_dir), &mut get)?, None)
         };
         let gateway_file = get(GATEWAY_FILE_ENV).map(PathBuf::from);
@@ -935,7 +1237,31 @@ impl MachineClient {
         let agent_rescan_secs = get(AGENT_RESCAN_SECS_ENV)
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(0);
+        let mut pending_wakes = Vec::new();
+        let mut ready_agents = HashSet::new();
+        for session in &sessions {
+            let Some(agent_id) = session.agent_id.clone() else {
+                continue;
+            };
+            if session.routine_url.is_some() && session.routine_bearer.is_some() {
+                ready_agents.insert(agent_id);
+            } else {
+                pending_wakes.push(PendingWake {
+                    store_dir: crate::session_store_dir(
+                        Path::new(&store_root),
+                        &session.session_id,
+                    ),
+                    agent_id,
+                });
+            }
+        }
+        let options = WakeOptions::from_lookup(&mut get);
         let mut client = Self::open(&homeserver_url, Path::new(&store_root), sessions)?;
+        client.store_root = Some(PathBuf::from(&store_root));
+        client.skip_nicks = options.skip_nicks;
+        client.profile_note = options.profile_note;
+        client.pending_wakes = pending_wakes;
+        client.ready_agents = ready_agents;
         client.agents_dir = agents_dir;
         client.gateway_file = gateway_file;
         client.gateway_token = gateway_token;
@@ -945,14 +1271,17 @@ impl MachineClient {
     }
 
     /// Rescans the agents directory when this client was opened from one.
-    /// Creates a webhook routine for each new agent that has no card of the
-    /// intended name. Does not open a new sealed store for that agent in
-    /// this process; the next open picks it up. When
-    /// [`AGENT_RESCAN_SECS_ENV`] is set and greater than zero, returns
-    /// without scanning until that many seconds have passed since the last
-    /// poll. Returns the routine names that exist for agents found on disk.
-    pub fn poll_agent_directory(&mut self) -> Result<Vec<String>, ShellError> {
-        let Some(agents_dir) = self.agents_dir.as_ref() else {
+    ///
+    /// For every bot not skipped and not ready yet: ensures the local
+    /// mirror and asks for the credential again. A bot that just created
+    /// its own routine turns ready here; when that bot has an open session,
+    /// its wake is set in place and saved to the keychain file. A bot that
+    /// appeared after open gets its mirror now; its sealed store opens with
+    /// the next process. When [`AGENT_RESCAN_SECS_ENV`] is set and greater
+    /// than zero, returns without scanning until that many seconds have
+    /// passed since the last poll. Reports carry no URL and no key.
+    pub fn poll_agent_directory(&mut self) -> Result<Vec<RoutineReport>, ShellError> {
+        let Some(agents_dir) = self.agents_dir.clone() else {
             return Ok(Vec::new());
         };
         if self.agent_rescan_secs > 0 {
@@ -966,11 +1295,74 @@ impl MachineClient {
             .gateway_file
             .clone()
             .unwrap_or_else(|| PathBuf::from(DEFAULT_GATEWAY_FILE));
-        ensure_agent_webhook_routines(
-            agents_dir,
-            &gateway,
-            self.gateway_token.as_deref(),
-        )
+        let Some(gate) = open_gateway(&gateway, self.gateway_token.as_deref())? else {
+            return Ok(Vec::new());
+        };
+        let sessions = drop_skipped(load_agents_dir(&agents_dir)?, &self.skip_nicks);
+        let mut reports = Vec::new();
+        for session in &sessions {
+            let Some(agent_id) = session.agent_id.clone() else {
+                continue;
+            };
+            let Some(nick) = routine_name_for(session) else {
+                continue;
+            };
+            let folder_id = crate::nick::routine_folder_id(&nick).unwrap_or_default();
+            if self.ready_agents.contains(&agent_id) {
+                reports.push(RoutineReport {
+                    agent_id,
+                    nick,
+                    folder_id,
+                    status: WakeStatus::Ready,
+                });
+                continue;
+            }
+            let outcome = ensure_wake(&gate, &agent_id, &nick);
+            log_outcome(&nick, &folder_id, &outcome);
+            if self.profile_note && matches!(outcome, WakeOutcome::AwaitingBackend) {
+                note_profile(&gate, &agents_dir, &agent_id, &nick);
+            }
+            if let WakeOutcome::Ready { url, key } = &outcome {
+                if let Some(root) = &self.store_root {
+                    save_wake(root, &session.session_id, &folder_id, url, key);
+                }
+                if let Some(index) = self
+                    .pending_wakes
+                    .iter()
+                    .position(|pending| pending.agent_id == agent_id)
+                {
+                    let pending = self.pending_wakes.remove(index);
+                    if let Some(store) = self
+                        .sessions
+                        .iter_mut()
+                        .find(|store| store.store_dir() == pending.store_dir)
+                    {
+                        store.set_wake(SessionWake {
+                            routine_url: Some(url.clone()),
+                            routine_bearer: Some(key.clone()),
+                            leader_sock: None,
+                            leader_cwd: None,
+                        });
+                    }
+                }
+                self.ready_agents.insert(agent_id.clone());
+            }
+            reports.push(RoutineReport {
+                agent_id,
+                nick,
+                folder_id,
+                status: outcome.status(),
+            });
+        }
+        Ok(reports)
+    }
+
+    /// Agent ids of open sessions that still have no wake.
+    pub fn pending_wake_agents(&self) -> Vec<String> {
+        self.pending_wakes
+            .iter()
+            .map(|pending| pending.agent_id.clone())
+            .collect()
     }
 
     /// While `enabled`, drive does not call the homeserver. Requests are
@@ -1473,7 +1865,8 @@ mod tests {
     }
 
     #[test]
-    fn two_sessions_get_two_webhook_routines_and_a_second_open_does_not_mint() {
+    fn mirrors_follow_the_nick_folder_and_keys_wait_for_the_bot_routine() {
+        use std::collections::HashSet;
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -1484,11 +1877,20 @@ mod tests {
             agent: String,
             id: String,
             name: String,
-            key: Option<String>,
+            trigger: &'static str,
+            enabled: bool,
         }
+        #[derive(Default)]
         struct Gateway {
             creates: usize,
+            deletes: usize,
             cards: Vec<Card>,
+            // (agent, folder) pairs whose routine the bot created itself.
+            backend: HashSet<(String, String)>,
+            // Agents whose next mirror lands in `<folder>-2`.
+            clash: HashSet<String>,
+            agents_seen: HashSet<String>,
+            profiles: Vec<(String, serde_json::Value)>,
         }
 
         fn read_http(sock: &mut std::net::TcpStream) -> Option<(String, Vec<u8>)> {
@@ -1497,289 +1899,394 @@ mod tests {
             let mut tmp = [0u8; 2048];
             loop {
                 let n = sock.read(&mut tmp).unwrap_or(0);
-                if n == 0 && buf.is_empty() {
+                if n == 0 {
                     return None;
                 }
-                if n == 0 {
-                    break;
-                }
                 buf.extend_from_slice(&tmp[..n]);
-                let header_end = buf.windows(4).position(|window| window == b"\r\n\r\n")?;
-                let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
-                let length = headers.lines().find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    if name.eq_ignore_ascii_case("content-length") {
-                        value.trim().parse::<usize>().ok()
-                    } else {
-                        None
-                    }
-                })?;
-                if buf.len() >= header_end + 4 + length {
-                    let body = buf[header_end + 4..header_end + 4 + length].to_vec();
-                    return Some((headers, body));
+                let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&buf[..end]).to_string();
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if buf.len() >= end + 4 + length {
+                    return Some((headers, buf[end + 4..end + 4 + length].to_vec()));
                 }
             }
-            None
+        }
+        fn reply(status: &str, body: &serde_json::Value) -> Vec<u8> {
+            let payload = serde_json::to_vec(body).expect("json");
+            let mut out = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                payload.len()
+            )
+            .into_bytes();
+            out.extend(payload);
+            out
+        }
+        fn cards_of(gate: &Gateway, agent: &str) -> serde_json::Value {
+            serde_json::Value::Array(
+                gate.cards
+                    .iter()
+                    .filter(|card| card.agent == agent)
+                    .map(|card| {
+                        serde_json::json!({
+                            "id": card.id,
+                            "name": card.name,
+                            "trigger": {"type": card.trigger},
+                            "isEnabled": card.enabled,
+                        })
+                    })
+                    .collect(),
+            )
         }
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         listener.set_nonblocking(true).expect("nonblocking");
         let port = listener.local_addr().expect("addr").port();
-        let state = Arc::new(Mutex::new(Gateway {
-            creates: 0,
-            cards: Vec::new(),
-        }));
-        let recorded = Arc::clone(&state);
+        let state = Arc::new(Mutex::new(Gateway::default()));
+        {
+            let mut gate = state.lock().expect("gate");
+            gate.backend.insert(("agent-h".into(), "hostbot".into()));
+            gate.clash.insert("agent-x".into());
+            gate.cards.push(Card {
+                agent: "agent-k".into(),
+                id: "cron-bot".into(),
+                name: "cron_bot".into(),
+                trigger: "cron",
+                enabled: true,
+            });
+        }
+        let shared = Arc::clone(&state);
         let token = "gw-test-token";
         let done = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&done);
         let server = thread::spawn(move || {
             while !flag.load(Ordering::Relaxed) {
-                match listener.accept() {
-                    Ok((mut sock, _)) => {
-                        let _ = sock.set_nonblocking(false);
-                        let Some((headers, body)) = read_http(&mut sock) else {
-                            continue;
-                        };
-                        let lower = headers.to_ascii_lowercase();
-                        assert!(
-                            !lower.contains("x-automation-key"),
-                            "gateway call must not send the routine key"
-                        );
-                        let authorized = headers.lines().any(|line| {
-                            line.eq_ignore_ascii_case(&format!("authorization: Bearer {token}"))
-                                || line == format!("Authorization: Bearer {token}")
-                        });
-                        let response = if !authorized {
-                            b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
-                        } else if lower.starts_with("post /api/getagentautomations ") {
-                            let request: serde_json::Value =
-                                serde_json::from_slice(&body).expect("list json");
-                            let agent = request["id"].as_str().unwrap_or("");
-                            let gate = recorded.lock().expect("gate");
-                            let list: Vec<serde_json::Value> = gate
-                                .cards
-                                .iter()
-                                .filter(|card| card.agent == agent)
-                                .map(|card| serde_json::json!({"id": card.id, "name": card.name}))
-                                .collect();
-                            drop(gate);
-                            let payload = serde_json::to_vec(&list).expect("list");
-                            let mut out = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        payload.len()
-                    )
-                    .into_bytes();
-                            out.extend(payload);
-                            out
-                        } else if lower.starts_with("post /api/createagentautomation ") {
-                            let request: serde_json::Value =
-                                serde_json::from_slice(&body).expect("create json");
-                            let agent = request["id"].as_str().unwrap_or("").to_string();
-                            let name = request["spec"]["name"].as_str().unwrap_or("").to_string();
-                            let trigger = request["spec"]["trigger"]["type"].as_str().unwrap_or("");
-                            assert_eq!(trigger, "webhook");
-                            assert!(request["spec"]["isEnabled"].as_bool().unwrap_or(false));
-                            assert!(!request["spec"]["prompt"].as_str().unwrap_or("").is_empty());
-                            let mut gate = recorded.lock().expect("gate");
-                            gate.creates += 1;
-                            let slug = automation_slug(&name);
-                            let taken = gate
-                                .cards
-                                .iter()
-                                .any(|card| card.agent == agent && card.id == slug);
-                            let id = if taken { format!("{slug}-2") } else { slug };
-                            let key = if name == "web-null" {
-                                None
-                            } else {
-                                Some(format!("k-{id}"))
-                            };
-                            gate.cards.push(Card {
-                                agent: agent.clone(),
-                                id: id.clone(),
-                                name: name.clone(),
-                                key,
-                            });
-                            let list: Vec<serde_json::Value> = gate
-                                .cards
-                                .iter()
-                                .filter(|card| card.agent == agent)
-                                .map(|card| serde_json::json!({"id": card.id, "name": card.name}))
-                                .collect();
-                            drop(gate);
-                            let payload = serde_json::to_vec(&list).expect("list");
-                            let mut out = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        payload.len()
-                    )
-                    .into_bytes();
-                            out.extend(payload);
-                            out
-                        } else if lower.starts_with("post /api/getautomationwebhookcredential ") {
-                            let request: serde_json::Value =
-                                serde_json::from_slice(&body).expect("cred json");
-                            let agent = request["id"].as_str().unwrap_or("");
-                            let automation = request["automationId"].as_str().unwrap_or("");
-                            let gate = recorded.lock().expect("gate");
-                            let found = gate
-                                .cards
-                                .iter()
-                                .find(|card| card.agent == agent && card.id == automation);
-                            let out = if let Some(card) = found {
-                                let payload = serde_json::to_vec(&serde_json::json!({
-                            "url": format!("https://127.0.0.1/automations/webhook/{}/{}", card.agent, card.id),
-                            "key": card.key,
-                        }))
-                        .expect("cred");
-                                let mut bytes = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                            payload.len()
-                        )
-                        .into_bytes();
-                                bytes.extend(payload);
-                                bytes
-                            } else {
-                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
-                            };
-                            out
-                        } else {
-                            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
-                        };
-                        let _ = sock.write_all(&response);
-                    }
+                let (mut sock, _) = match listener.accept() {
+                    Ok(pair) => pair,
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(std::time::Duration::from_millis(10));
+                        thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
                     }
                     Err(_) => break,
-                }
+                };
+                let _ = sock.set_nonblocking(false);
+                let Some((headers, body)) = read_http(&mut sock) else {
+                    continue;
+                };
+                let lower = headers.to_ascii_lowercase();
+                let authorized = lower.contains(&format!("authorization: bearer {token}"));
+                let request: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+                let agent = request["id"].as_str().unwrap_or("").to_string();
+                let mut gate = shared.lock().expect("gate");
+                gate.agents_seen.insert(agent.clone());
+                let response = if !authorized {
+                    reply("401 Unauthorized", &serde_json::json!({}))
+                } else if lower.starts_with("post /api/getagentautomations ") {
+                    reply("200 OK", &cards_of(&gate, &agent))
+                } else if lower.starts_with("post /api/createagentautomation ") {
+                    let spec = &request["spec"];
+                    assert_eq!(spec["trigger"]["type"], "webhook");
+                    assert_eq!(spec["isEnabled"], false, "mirror must be disabled");
+                    let name = spec["name"].as_str().unwrap_or("").to_string();
+                    let prompt = spec["prompt"].as_str().unwrap_or("");
+                    assert!(!prompt.is_empty());
+                    assert!(!prompt.contains("http"));
+                    gate.creates += 1;
+                    let folder = crate::nick::routine_folder_id(&name).expect("slug");
+                    let id = if gate.clash.contains(&agent) {
+                        format!("{folder}-2")
+                    } else {
+                        folder
+                    };
+                    gate.cards.push(Card {
+                        agent: agent.clone(),
+                        id,
+                        name,
+                        trigger: "webhook",
+                        enabled: false,
+                    });
+                    reply("200 OK", &cards_of(&gate, &agent))
+                } else if lower.starts_with("post /api/updateagent ") {
+                    gate.profiles
+                        .push((agent.clone(), request["profile"].clone()));
+                    reply("200 OK", &serde_json::json!({"id": agent}))
+                } else if lower.starts_with("post /api/deleteagentautomation ") {
+                    let id = request["automationId"].as_str().unwrap_or("");
+                    gate.deletes += 1;
+                    gate.cards
+                        .retain(|card| !(card.agent == agent && card.id == id));
+                    reply("200 OK", &cards_of(&gate, &agent))
+                } else if lower.starts_with("post /api/getautomationwebhookcredential ") {
+                    let id = request["automationId"].as_str().unwrap_or("").to_string();
+                    let local = gate
+                        .cards
+                        .iter()
+                        .find(|card| card.agent == agent && card.id == id);
+                    match local {
+                        None => reply(
+                            "500 Internal Server Error",
+                            &serde_json::json!({"error": format!("Automation not found: {id}")}),
+                        ),
+                        Some(card) if card.trigger != "webhook" => reply(
+                            "500 Internal Server Error",
+                            &serde_json::json!({"error": "Automation is not webhook-triggered"}),
+                        ),
+                        Some(_) => {
+                            let minted = gate.backend.contains(&(agent.clone(), id.clone()));
+                            reply(
+                                "200 OK",
+                                &serde_json::json!({
+                                    "url": format!("https://backend.invalid/automations/webhook/{agent}-{id}"),
+                                    "key": minted.then(|| format!("key-{agent}-{id}")),
+                                }),
+                            )
+                        }
+                    }
+                } else {
+                    reply("404 Not Found", &serde_json::json!({}))
+                };
+                drop(gate);
+                let _ = sock.write_all(&response);
             }
         });
 
         let dir = std::env::temp_dir().join(format!(
-            "m4a-gw-{}-{}",
+            "m4a-mirror-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock")
-                .as_millis()
+                .as_nanos()
         ));
-        let sessions = dir.join("sessions");
-        std::fs::create_dir_all(&sessions).expect("dir");
-        let hostbot =
-            r#"{"bot_name":"Hostbot","session_id":"web-hostbot","agent_id":"agent-hostbot"}"#;
-        let chief = "{\"bot_name\":\"Привет мир\",\"session_id\":\"web-chief\",\"agent_id\":\"agent-chief\"}";
-        let null_bot = r#"{"bot_name":"web-null","session_id":"web-null","agent_id":"agent-null"}"#;
-        let skip = r#"{"bot_name":"Skipper","session_id":"web-skip"}"#;
-        std::fs::write(sessions.join("hostbot.json"), hostbot).expect("hostbot");
-        std::fs::write(sessions.join("chief.json"), chief).expect("chief");
-        std::fs::write(sessions.join("null.json"), null_bot).expect("null");
-        std::fs::write(sessions.join("skip.json"), skip).expect("skip");
+        let agents = dir.join("agents");
+        let store_root = dir.join("stores");
+        let describe = |id: &str| {
+            if id == "agent-c" {
+                "about the chief"
+            } else {
+                ""
+            }
+        };
+        for (id, name) in [
+            ("agent-h", "Hostbot"),
+            ("agent-c", "Привет мир"),
+            ("agent-s", "Свой браузер"),
+            ("agent-x", "Clash Bot"),
+            ("agent-k", "Cron Bot"),
+        ] {
+            std::fs::create_dir_all(agents.join(id)).expect("agent dir");
+            std::fs::write(
+                agents.join(id).join("profile.json"),
+                serde_json::to_vec(&serde_json::json!({"name": name, "description": describe(id)}))
+                    .expect("profile"),
+            )
+            .expect("profile");
+        }
         let gateway = dir.join("gateway-file.json");
         std::fs::write(
             &gateway,
-            format!(
-                r#"{{"host":"192.0.2.1","port":{port},"scheme":"http","token":"{token}","pid":1}}"#
-            ),
+            format!(r#"{{"host":"192.0.2.1","port":{port},"scheme":"http","token":"{token}"}}"#),
         )
         .expect("gateway");
-        let gateway_path = gateway.display().to_string();
-        let load = |sessions: &std::path::Path| {
-            load_web_sessions(sessions, |key| match key {
-                GATEWAY_FILE_ENV => Some(gateway_path.clone()),
-                _ => None,
-            })
+        let skip = parse_skip_nicks(" svoi_brauzer , ");
+        assert_eq!(skip, vec!["svoi_brauzer".to_string()]);
+        let options = WakeOptions {
+            skip_nicks: skip.clone(),
+            store_root: Some(store_root.clone()),
+            profile_note: false,
         };
-        let first = load(&sessions).expect("first open");
-        assert_eq!(first.len(), 4);
-        let hostbot_session = first
+
+        let status_of = |reports: &[RoutineReport], agent: &str| {
+            reports
+                .iter()
+                .find(|report| report.agent_id == agent)
+                .map(|report| report.status.clone())
+        };
+        let first =
+            ensure_agent_webhook_routines(&agents, &gateway, None, &options).expect("first pass");
+        assert_eq!(status_of(&first, "agent-h"), Some(WakeStatus::Ready));
+        assert_eq!(
+            status_of(&first, "agent-c"),
+            Some(WakeStatus::AwaitingBackend)
+        );
+        assert!(matches!(
+            status_of(&first, "agent-x"),
+            Some(WakeStatus::Failed(_))
+        ));
+        assert!(matches!(
+            status_of(&first, "agent-k"),
+            Some(WakeStatus::Failed(_))
+        ));
+        assert_eq!(status_of(&first, "agent-s"), None);
+        let chief = first
             .iter()
-            .find(|session| session.session_id == "web-hostbot")
-            .expect("hostbot");
-        let chief_session = first
-            .iter()
-            .find(|session| session.session_id == "web-chief")
+            .find(|r| r.agent_id == "agent-c")
             .expect("chief");
-        let null_session = first
-            .iter()
-            .find(|session| session.session_id == "web-null")
-            .expect("null");
-        let skip_session = first
-            .iter()
-            .find(|session| session.session_id == "web-skip")
-            .expect("skip");
-        assert_eq!(hostbot_session.agent_id.as_deref(), Some("agent-hostbot"));
-        assert_eq!(chief_session.agent_id.as_deref(), Some("agent-chief"));
-        assert_ne!(
-            hostbot_session.agent_id.as_deref(),
-            Some(hostbot_session.session_id.as_str())
-        );
-        assert_ne!(
-            hostbot_session.routine_url.as_deref(),
-            chief_session.routine_url.as_deref()
-        );
-        assert!(hostbot_session
-            .routine_url
-            .as_deref()
-            .unwrap_or("")
-            .starts_with("https://"));
-        assert!(chief_session
-            .routine_url
-            .as_deref()
-            .unwrap_or("")
-            .starts_with("https://"));
-        assert!(hostbot_session.routine_bearer.is_some());
-        assert!(chief_session.routine_bearer.is_some());
-        assert_ne!(
-            hostbot_session.routine_bearer.as_deref(),
-            chief_session.routine_bearer.as_deref()
-        );
-        assert!(null_session.routine_url.is_none());
-        assert!(null_session.routine_bearer.is_none());
-        assert!(skip_session.agent_id.is_none());
-        assert!(skip_session.routine_url.is_none());
-        assert!(skip_session.routine_bearer.is_none());
-        let shown = format!("{hostbot_session:?} {chief_session:?}");
-        assert!(!shown.contains("k-"));
+        assert_eq!(chief.nick, "privet_mir");
+        assert_eq!(chief.folder_id, "privet-mir");
+        let shown = format!("{first:?}");
+        assert!(!shown.contains("key-"));
         assert!(!shown.contains("automations/webhook"));
-        assert!(!shown.contains(token));
+        {
+            let gate = state.lock().expect("gate");
+            // hostbot, privet_mir, clash_bot. Not the skipped bot,
+            // not the folder that already holds a cron routine.
+            assert_eq!(gate.creates, 3);
+            assert_eq!(gate.deletes, 1);
+            assert!(!gate.agents_seen.contains("agent-s"));
+            assert!(gate.cards.iter().all(|card| card.agent != "agent-x"));
+            let cron = gate
+                .cards
+                .iter()
+                .find(|card| card.agent == "agent-k")
+                .expect("cron");
+            assert_eq!(cron.trigger, "cron");
+            assert!(cron.enabled);
+            let mirror = gate
+                .cards
+                .iter()
+                .find(|card| card.agent == "agent-h")
+                .expect("mirror");
+            assert_eq!(
+                (mirror.id.as_str(), mirror.name.as_str()),
+                ("hostbot", "hostbot")
+            );
+            assert!(!mirror.enabled);
+        }
+        // Keychain: only the ready bot, mode 0600, its folder recorded.
+        let hostbot_file = keychain_path(&store_root, "agent-h");
+        let stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&hostbot_file).expect("keychain"))
+                .expect("keychain json");
+        assert_eq!(stored["folder_id"], "hostbot");
+        assert_eq!(stored["key"], "key-agent-h-hostbot");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&hostbot_file)
+                .expect("meta")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        assert!(!keychain_path(&store_root, "agent-c").exists());
+
+        // Second pass: nothing new is created; the chief still waits.
+        let second =
+            ensure_agent_webhook_routines(&agents, &gateway, None, &options).expect("second pass");
         assert_eq!(
-            std::fs::read_to_string(sessions.join("hostbot.json")).expect("reread"),
-            hostbot
+            status_of(&second, "agent-c"),
+            Some(WakeStatus::AwaitingBackend)
         );
         assert_eq!(
-            std::fs::read_to_string(sessions.join("chief.json")).expect("reread"),
-            chief
+            state.lock().expect("gate").creates,
+            4,
+            "only the clash bot retries"
         );
-        let gate = state.lock().expect("state");
-        let creates_after_first = gate.creates;
-        assert_eq!(creates_after_first, 3);
-        let agents: Vec<&str> = gate.cards.iter().map(|card| card.agent.as_str()).collect();
-        assert!(agents.contains(&"agent-hostbot"));
-        assert!(agents.contains(&"agent-chief"));
-        assert!(agents.contains(&"agent-null"));
-        assert!(!agents.iter().any(|agent| {
-            *agent == "web-hostbot"
-                || *agent == "web-chief"
-                || *agent == "web-null"
-                || *agent == "web-skip"
-        }));
-        drop(gate);
-        let second = load(&sessions).expect("second open");
-        assert_eq!(state.lock().expect("state").creates, creates_after_first);
-        let again = second
+        assert!(state.lock().expect("gate").profiles.is_empty());
+        // Opt-in bootstrap note: only the waiting bot's profile is edited,
+        // name kept, original description kept, note appended.
+        let noted = WakeOptions {
+            profile_note: true,
+            ..options.clone()
+        };
+        ensure_agent_webhook_routines(&agents, &gateway, None, &noted).expect("note pass");
+        {
+            let gate = state.lock().expect("gate");
+            assert_eq!(gate.profiles.len(), 1);
+            let (agent, profile) = &gate.profiles[0];
+            assert_eq!(agent, "agent-c");
+            assert_eq!(profile["name"], "Привет мир");
+            let description = profile["description"].as_str().unwrap_or("");
+            assert!(description.starts_with("about the chief"));
+            assert!(description.contains("routine named \"privet_mir\""));
+            assert!(!description.contains("http"));
+        }
+        state.lock().expect("gate").creates = 4;
+        // The chief creates its own routine; the next pass picks the key up
+        // without another mirror.
+        state
+            .lock()
+            .expect("gate")
+            .backend
+            .insert(("agent-c".into(), "privet-mir".into()));
+        let third =
+            ensure_agent_webhook_routines(&agents, &gateway, None, &options).expect("third pass");
+        assert_eq!(status_of(&third, "agent-c"), Some(WakeStatus::Ready));
+        assert_eq!(state.lock().expect("gate").creates, 5);
+        assert!(keychain_path(&store_root, "agent-c").exists());
+
+        // The env path: the skipped bot is not a session at all.
+        let gateway_path = gateway.display().to_string();
+        let root_text = store_root.display().to_string();
+        let sessions = load_web_agents(&agents, |key| match key {
+            GATEWAY_FILE_ENV => Some(gateway_path.clone()),
+            SKIP_NICKS_ENV => Some("svoi_brauzer".to_string()),
+            crate::STORE_ROOT_ENV => Some(root_text.clone()),
+            _ => None,
+        })
+        .expect("web agents");
+        assert_eq!(sessions.len(), 4);
+        let hostbot = sessions
             .iter()
-            .find(|session| session.session_id == "web-hostbot")
-            .expect("again");
-        assert_eq!(again.routine_url, hostbot_session.routine_url);
-        assert_eq!(again.routine_bearer, hostbot_session.routine_bearer);
-        let missing = dir.join("absent.json");
-        let mut bare = vec![HostSession::new("Hostbot", "web-hostbot")];
-        attach_webhook_routines(&mut bare, &missing, None).expect("absent file");
+            .find(|s| s.session_id == "agent-h")
+            .expect("h");
+        assert!(hostbot
+            .routine_url
+            .as_deref()
+            .unwrap_or("")
+            .starts_with("https://"));
+        assert!(hostbot.routine_bearer.is_some());
+        assert!(!format!("{hostbot:?}").contains("key-"));
+
+        // No gateway file: the keychain answers, but only for the same folder.
+        let mut offline = vec![HostSession::new("Hostbot", "agent-h")];
+        offline[0].agent_id = Some("agent-h".to_string());
+        let mut renamed = HostSession::new("Hostbot Two", "agent-h");
+        renamed.agent_id = Some("agent-h".to_string());
+        offline.push(renamed);
+        attach_webhook_routines(
+            &mut offline,
+            &dir.join("absent.json"),
+            None,
+            Some(&store_root),
+        )
+        .expect("offline");
+        assert_eq!(
+            offline[0].routine_bearer.as_deref(),
+            Some("key-agent-h-hostbot")
+        );
+        assert!(offline[1].routine_url.is_none());
+        let mut bare = vec![HostSession::new("Hostbot", "agent-h")];
+        attach_webhook_routines(&mut bare, &dir.join("absent.json"), None, None).expect("bare");
         assert!(bare[0].routine_url.is_none());
-        assert!(bare[0].routine_bearer.is_none());
+
         done.store(true, Ordering::Relaxed);
         let _ = server.join();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wake_note_is_appended_once_and_replaced_in_place() {
+        let first = with_wake_note("Runs the hostbot.", "hostbot").expect("added");
+        assert!(first.starts_with("Runs the hostbot.\n\n<!-- mail4agent:wake -->"));
+        assert!(first.ends_with("<!-- /mail4agent:wake -->"));
+        assert!(with_wake_note(&first, "hostbot").is_none());
+        let renamed = with_wake_note(&first, "hostbot_two").expect("replaced");
+        assert_eq!(renamed.matches("<!-- mail4agent:wake -->").count(), 1);
+        assert!(renamed.contains("\"hostbot_two\""));
+        assert!(!renamed.contains("\"hostbot\""));
+        assert!(renamed.starts_with("Runs the hostbot."));
+        assert_eq!(with_wake_note("", "carol").expect("empty"), wake_note("carol"));
     }
 
     #[test]
@@ -1803,7 +2310,11 @@ mod tests {
         .expect("profile");
         std::fs::write(
             chief.join("profile.json"),
-            concat!("{\"name\":\"", "Привет мир", "\",\"description\":\"x\"}"),
+            concat!(
+                "{\"name\":\"",
+                "Привет мир",
+                "\",\"description\":\"x\"}"
+            ),
         )
         .expect("profile");
         std::fs::write(dir.join("active-agent.json"), "{}").expect("skip file");
@@ -1812,10 +2323,16 @@ mod tests {
         assert_eq!(loaded[0].session_id, "agent-chief");
         assert_eq!(loaded[0].agent_id.as_deref(), Some("agent-chief"));
         assert_eq!(loaded[0].bot_name, "Привет мир");
-        assert_eq!(routine_name_for(&loaded[0]), "privet_mir");
-        assert_ne!(routine_name_for(&loaded[0]), loaded[0].session_id);
+        assert_eq!(
+            routine_name_for(&loaded[0]).as_deref(),
+            Some("privet_mir")
+        );
+        assert_ne!(
+            routine_name_for(&loaded[0]).as_deref(),
+            Some(loaded[0].session_id.as_str())
+        );
         assert_eq!(loaded[1].bot_name, "Hostbot");
-        assert_eq!(routine_name_for(&loaded[1]), "Hostbot");
+        assert_eq!(routine_name_for(&loaded[1]).as_deref(), Some("hostbot"));
         assert!(loaded.iter().all(|session| session.routine_url.is_none()));
         let _ = std::fs::remove_dir_all(&dir);
     }

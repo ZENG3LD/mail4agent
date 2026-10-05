@@ -43,6 +43,40 @@ pub fn nick_from_display_name(display_name: &str) -> Result<String, ShellError> 
     Ok(nick)
 }
 
+/// Folder id the Grok Bot routine store gives a routine named `name`.
+///
+/// Same rule as the host's routine slug, used both by the bot's own
+/// `UpdateRoutine` and by the gateway's `createAgentAutomation`: lowercase,
+/// every run of characters outside `[a-z0-9]` becomes one `-`, leading and
+/// trailing `-` are trimmed, then the result is cut to 48 characters. So the
+/// nick `privet_mir` lives in folder `privet-mir`, never
+/// `privet_mir`. The host falls back to a timestamped name when the
+/// slug is empty; that is not reproducible, so this returns `None` instead.
+/// A second routine with the same name gets `-2`, `-3`, ...; callers treat
+/// that as a mismatch, not as the bot's routine.
+pub fn routine_folder_id(name: &str) -> Option<String> {
+    let mut slug = String::new();
+    let mut pending_dash = false;
+    for ch in name.to_lowercase().chars() {
+        if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
+            if pending_dash && !slug.is_empty() {
+                slug.push('-');
+            }
+            pending_dash = false;
+            slug.push(ch);
+        } else {
+            pending_dash = true;
+        }
+    }
+    // The host trims before it cuts, so a cut can end on `-`. Keep it.
+    let slug: String = slug.chars().take(48).collect();
+    if slug.is_empty() {
+        None
+    } else {
+        Some(slug)
+    }
+}
+
 /// A directory lookup key. A string that is already a nick is used as-is
 /// (the server compares case-insensitively). Anything else is treated as a
 /// display name and derived, so `Привет мир` finds `privet_mir`.
@@ -180,5 +214,48 @@ mod tests {
         assert!(nick_from_display_name("...").is_err());
         assert_eq!(lookup_nick("Привет мир").unwrap(), "privet_mir");
         assert_eq!(lookup_nick("Hostbot").unwrap(), "Hostbot");
+    }
+
+    #[test]
+    fn routine_folder_matches_the_host_slug() {
+        // nick -> folder, the way UpdateRoutine and createAgentAutomation name it.
+        assert_eq!(routine_folder_id("hostbot").as_deref(), Some("hostbot"));
+        assert_eq!(
+            routine_folder_id("privet_mir").as_deref(),
+            Some("privet-mir")
+        );
+        assert_eq!(
+            routine_folder_id("sample_bot").as_deref(),
+            Some("sample-bot")
+        );
+        assert_eq!(
+            routine_folder_id("foobar").as_deref(),
+            Some("foobar")
+        );
+        assert_eq!(
+            routine_folder_id("foo+bar").as_deref(),
+            Some("foo-bar")
+        );
+        assert_eq!(routine_folder_id("Hostbot").as_deref(), Some("hostbot"));
+        assert_eq!(routine_folder_id("__a__b__").as_deref(), Some("a-b"));
+        assert_eq!(routine_folder_id("Привет"), None);
+        assert_eq!(routine_folder_id("___"), None);
+        assert_eq!(
+            routine_folder_id(&"x".repeat(60)).map(|s| s.len()),
+            Some(48)
+        );
+        assert_eq!(
+            routine_folder_id(&format!("{}_b", "a".repeat(47))).as_deref(),
+            Some(format!("{}-", "a".repeat(47)).as_str())
+        );
+        // Display name -> nick -> folder for the names on a typical box.
+        let chain = |name: &str| routine_folder_id(&nick_from_display_name(name).unwrap());
+        assert_eq!(
+            chain("Привет мир").as_deref(),
+            Some("privet-mir")
+        );
+        assert_eq!(chain("foo+bar").as_deref(), Some("foobar"));
+        assert_eq!(chain("Sample Bot").as_deref(), Some("sample-bot"));
+        assert_eq!(chain("carol").as_deref(), Some("carol"));
     }
 }

@@ -44,13 +44,15 @@
 //! [`nick_from_display_name`] of that display name. Mail between sessions
 //! this client holds is in process
 //! ([`MachineClient::set_local_delivery`]). A peer that is not in the list
-//! uses the homeserver. Wake is one webhook routine per agent, created
-//! through the local gateway and kept in memory. A routine name that
-//! already exists is not created again.
-//! [`ensure_agent_webhook_routines`] creates the cards without opening
-//! stores. [`MachineClient::poll_agent_directory`] rescans for new bots.
-//! The URL and key are not read from disk, not written back, and not
-//! logged. This path does not read [`LEADER_SOCK_ENV`].
+//! uses the homeserver. Wake is the bot's own webhook routine, named by
+//! its nick, which only the bot can create (`UpdateRoutine`). This process
+//! keeps a disabled local mirror in the same folder so the gateway hands
+//! out that routine's URL and key; a null key is retried, never replaced
+//! by a second routine. [`ensure_agent_webhook_routines`] does that without
+//! opening stores. [`MachineClient::poll_agent_directory`] retries and
+//! rescans for new bots. The URL and key live in memory and in the
+//! session's keychain file under the store root, and are not logged. This
+//! path does not read [`LEADER_SOCK_ENV`].
 //!
 //! A node is [`OpenedStore::connect_node_from_env`]. One CLI session, woken
 //! by ACP on [`LEADER_SOCK_ENV`]. A routine URL or bearer in the environment
@@ -82,14 +84,15 @@ use zeroize::Zeroizing;
 
 pub use machine::{
     ensure_agent_webhook_routines, ensure_agent_webhook_routines_from_env, load_agents_dir,
-    load_session_records, HostSession, MachineClient, AGENTS_DIR_ENV, AGENT_RESCAN_SECS_ENV,
-    DEFAULT_AGENTS_DIR, SESSIONS_DIR_ENV,
+    load_session_records, HostSession, MachineClient, RoutineReport, WakeOptions, WakeStatus,
+    AGENTS_DIR_ENV, AGENT_RESCAN_SECS_ENV, DEFAULT_AGENTS_DIR, PROFILE_NOTE_ENV, SESSIONS_DIR_ENV,
+    SKIP_NICKS_ENV, WAKE_KEYCHAIN_FILE,
 };
 pub use mail4agent_messenger::{
     CreateRoomKind, DeviceId, MessageKind, MessengerCommand, OutgoingMessage, RoomId, RoomKind,
     UserId,
 };
-pub use nick::nick_from_display_name;
+pub use nick::{nick_from_display_name, routine_folder_id};
 pub use push::PushedRoomEvent;
 
 /// SHA-256 of `session_id`'s UTF-8 bytes. That digest is the check that this
