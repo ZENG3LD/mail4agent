@@ -530,9 +530,27 @@ pub fn post_decrypted_with_bearer(
     wake: &DecryptedWake<'_>,
     bearer: Option<&str>,
 ) -> Result<(), ShellError> {
+    let bytes = routine_json(wake)?;
+    post_routine_bytes(url, bytes, bearer)
+}
+
+/// [`post_decrypted_with_bearer`] with any JSON object as the body: the
+/// machine client's own events (`kind` = `peer_joined`) go to a bot's
+/// routine this way. Same headers, one attempt, 8 seconds, 200 or error.
+/// The key and the URL are not included in the error.
+pub fn post_routine_json(
+    url: &str,
+    body: &serde_json::Value,
+    bearer: Option<&str>,
+) -> Result<(), ShellError> {
+    let bytes = serde_json::to_vec(body)
+        .map_err(|err| ShellError::RoutineTransport(clip_public(err.to_string())))?;
+    post_routine_bytes(url, bytes, bearer)
+}
+
+fn post_routine_bytes(url: &str, bytes: Vec<u8>, bearer: Option<&str>) -> Result<(), ShellError> {
     let target = parse_routine_url(url)?;
     let client = routine_client()?;
-    let bytes = routine_json(wake)?;
     let token = bearer.map(str::trim).filter(|token| !token.is_empty());
     let mut builder = client
         .post(target)
@@ -1186,6 +1204,19 @@ impl OpenedStore {
             .map(Zeroizing::new);
         self.leader_sock = wake.leader_sock.filter(|path| !path.as_os_str().is_empty());
         self.leader_cwd = wake.leader_cwd.filter(|cwd| !cwd.is_empty());
+    }
+
+    /// Whether this store has a routine to wake (URL set).
+    pub fn has_routine(&self) -> bool {
+        self.routine_url.is_some()
+    }
+
+    /// Routine URL and key, for the machine client's own events. Memory
+    /// only; never logged.
+    pub(crate) fn routine_target(&self) -> Option<(String, Option<String>)> {
+        let url = self.routine_url.clone()?;
+        let bearer = self.routine_bearer.as_ref().map(|token| token.as_str().to_string());
+        Some((url, bearer))
     }
 
     /// Last wake failure that did not drop the room text. `None` if the

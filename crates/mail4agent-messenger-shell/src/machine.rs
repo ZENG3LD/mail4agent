@@ -30,11 +30,14 @@
 //! routine. A mirror that lands in any other folder is deleted again.
 //! [`SKIP_NICKS_ENV`] lists bots to leave alone. A ready URL and key stay
 //! in memory and in the session's keychain file ([`WAKE_KEYCHAIN_FILE`],
-//! mode 0600, under the sealed store root); they are never logged. A
-//! record with no agent id gets no wake. One URL is not shared across
-//! sessions. [`ensure_agent_webhook_routines`] is the same path without
-//! opening sealed stores. [`crate::LEADER_SOCK_ENV`] is not this path. The
-//! node CLI does not create a routine.
+//! mode 0600, under the sealed store root); they are never logged. When a
+//! bot first becomes ready, this client POSTs `kind=peer_joined` once to
+//! every other ready bot's webhook ([`crate::post_routine_json`]); URLs
+//! and keys stay out of the log. A record with no agent id gets no wake.
+//! One URL is not shared across sessions.
+//! [`ensure_agent_webhook_routines`] is the same path without opening
+//! sealed stores. [`crate::LEADER_SOCK_ENV`] is not this path. The node
+//! CLI does not create a routine.
 //!
 //! Each session still seals under [`crate::session_store_dir`]. Olm pickles
 //! are not shared. While [`MachineClient::set_local_delivery`] is set, the
@@ -1663,6 +1666,19 @@ impl MachineClient {
                     }
                 }
                 self.ready_agents.insert(agent_id.clone());
+                if let Some(user_id) = self
+                    .sessions
+                    .iter()
+                    .find(|store| {
+                        store
+                            .nick()
+                            .map(|n| n.eq_ignore_ascii_case(&nick))
+                            .unwrap_or(false)
+                    })
+                    .map(|store| store.user_id().to_string())
+                {
+                    self.announce_peer_joined(&nick, &user_id);
+                }
             }
             reports.push(RoutineReport {
                 agent_id,
@@ -1826,6 +1842,7 @@ impl MachineClient {
         if let Some(agent_id) = session.agent_id.clone() {
             if item.routine_url.is_some() && item.routine_bearer.is_some() {
                 self.ready_agents.insert(agent_id);
+                self.announce_peer_joined(nick, &item.user_id);
             } else {
                 // Ask the gateway again so the wake lands on this session.
                 self.ready_agents.remove(&agent_id);
@@ -1856,6 +1873,39 @@ impl MachineClient {
                     .cloned()
                     .collect(),
             );
+        }
+    }
+
+    /// POSTs `kind=peer_joined` once to every other ready bot's webhook.
+    /// Called when `joined_nick` first becomes ready. Failures are logged
+    /// without the URL or key.
+    fn announce_peer_joined(&self, joined_nick: &str, joined_user_id: &str) {
+        let body = serde_json::json!({
+            "kind": "peer_joined",
+            "nick": joined_nick,
+            "user_id": joined_user_id,
+        });
+        for store in &self.sessions {
+            let Some(nick) = store.nick() else {
+                continue;
+            };
+            if nick.eq_ignore_ascii_case(joined_nick) {
+                continue;
+            }
+            if !store.has_routine() {
+                continue;
+            }
+            let Some((url, bearer)) = store.routine_target() else {
+                continue;
+            };
+            match crate::post_routine_json(&url, &body, bearer.as_deref()) {
+                Ok(()) => {
+                    eprintln!("mail4agent: peer_joined {joined_nick} -> {nick} status=200")
+                }
+                Err(err) => {
+                    eprintln!("mail4agent: peer_joined {joined_nick} -> {nick}: {err}")
+                }
+            }
         }
     }
 
