@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
@@ -147,7 +147,7 @@ async fn unrecognized() -> MatrixError {
 mod tests {
     use super::*;
     use axum::body::{to_bytes, Body};
-    use axum::http::Request;
+    use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
     #[tokio::test]

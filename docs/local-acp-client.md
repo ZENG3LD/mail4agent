@@ -148,7 +148,7 @@ Required for open:
 | `M4A_BOT_NAME` | Display name; nick is derived |
 | `M4A_SESSION_ID` | Session / device identity for the seal and ACP `sessionId` |
 | `M4A_STORE_ROOT` | Shared store root; each session seals under a subdir |
-| `M4A_LEADER_SOCK` | Path to an already-running Grok `leader.sock` |
+| `M4A_LEADER_SOCK` | Leader path. Unix: existing socket file. Windows: path grok hashes; the file is not created |
 
 Optional:
 
@@ -173,13 +173,19 @@ Optional:
 Delivered on branch `local-acp-client`:
 
 1. Refuses webhook env via `SessionWake::node_cli` / `NodeClient::from_env`.
-2. Requires `M4A_LEADER_SOCK` to exist before register.
+2. Requires the leader named by `M4A_LEADER_SOCK` to be listening before register.
 3. Opens once (auto-register + key publish), opens push WS, listens for
    `m4a-send`, runs drive/push/tick loop with ACP wake on decrypt.
 4. Unit tests stub a fake ACP peer for wake framing; they do not start a
    long-running grok process.
 
 Operator bootstrap for the Grok side: [local-grok-bootstrap.md](local-grok-bootstrap.md).
+
+## Windows
+
+- `M4A_LEADER_SOCK` stays the path grok hashes (`%USERPROFILE%\.grok\leader.sock`). The file itself is not created. The node client checks the named pipe, not file existence.
+- The settings file loader uses `HOME`, then `USERPROFILE`, then `~/.config/mail4agent/node-client.env` under that home. `M4A_ENV_FILE` still overrides when set.
+- `m4a-send` on Windows is loopback TCP. The path file contains `127.0.0.1:{port}` and a newline, nothing else. Unix stays a mode-0600 domain socket. Same env names (`M4A_SEND_SOCK`, default `node-client.sock` under the store root).
 
 ## Code map
 

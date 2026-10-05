@@ -11,6 +11,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::ipc::{SendListener, SendStream};
 use crate::machine::{
     load_device_bearer, lock_store, save_device_bearer, KEYCHAIN_DIR_ENV,
 };
@@ -32,7 +33,7 @@ const SEND_JOIN_WAIT_SECS: u64 = 120;
 pub struct NodeClient {
     store: OpenedStore,
     push: PushLink,
-    send_listener: Option<std::os::unix::net::UnixListener>,
+    send_listener: Option<SendListener>,
     send_sock: Option<PathBuf>,
     send_queue: Vec<PendingSend>,
     last_full_drive: Instant,
@@ -41,7 +42,7 @@ pub struct NodeClient {
 }
 
 struct PendingSend {
-    stream: std::os::unix::net::UnixStream,
+    stream: SendStream,
     request: SendRequest,
     started: Instant,
     room: Option<String>,
@@ -73,9 +74,11 @@ pub struct NodeTickReport {
 }
 
 impl NodeClient {
-    /// Open from the process environment: refuse webhook env, require an
-    /// existing [`LEADER_SOCK_ENV`] path, register + first key drive, open
-    /// the push socket. Does not start `grok` and does not invent a leader.
+    /// Open from the process environment: refuse webhook env, require the
+    /// leader named by [`LEADER_SOCK_ENV`] to be listening, register + first
+    /// key drive, open the push socket. Does not start `grok` and does not
+    /// invent a leader. On Windows the path is only what grok hashes into
+    /// a named pipe; the file does not have to exist.
     pub fn from_env() -> Result<Self, ShellError> {
         let wake = SessionWake::node_cli()?;
         let sock = wake.leader_sock.as_ref().ok_or_else(|| {
@@ -83,11 +86,10 @@ impl NodeClient {
                 "node client requires {LEADER_SOCK_ENV} (ACP leader.sock)"
             ))
         })?;
-        if !sock.exists() {
-            return Err(ShellError::SessionList(format!(
-                "{LEADER_SOCK_ENV} path is set but does not exist yet; \
-                 start the Grok leader before opening the node client"
-            )));
+        if !mail4agent_grok::leader_is_listening(sock) {
+            return Err(ShellError::SessionList(
+                "the leader is not listening; start grok with [cli] use_leader = true".to_string(),
+            ));
         }
 
         // Host keychain may hold a previously minted bearer.
@@ -168,25 +170,20 @@ impl NodeClient {
         self.store.wake_note()
     }
 
-    /// Listen for `m4a-send` on `path` (mode 0600). Replaces a stale socket
-    /// file; refuses if another live client already holds it.
+    /// Listen for `m4a-send` on `path`. Replaces a stale socket file and
+    /// refuses when another live client already holds it. Unix is a mode
+    /// 0600 domain socket. Windows writes `127.0.0.1:{port}` and listens
+    /// on that loopback port.
     pub fn listen_for_sends(&mut self, path: &Path) -> Result<(), ShellError> {
-        if path.exists() {
-            if std::os::unix::net::UnixStream::connect(path).is_ok() {
-                return Err(ShellError::SessionList(
+        let listener = SendListener::bind(path).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::AlreadyExists {
+                ShellError::SessionList(
                     "another client already listens on the send socket".to_string(),
-                ));
+                )
+            } else {
+                ShellError::Io(err)
             }
-            std::fs::remove_file(path)?;
-        }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let listener = std::os::unix::net::UnixListener::bind(path)?;
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        }
+        })?;
         listener.set_nonblocking(true)?;
         self.send_listener = Some(listener);
         self.send_sock = Some(path.to_path_buf());
@@ -351,7 +348,7 @@ impl NodeClient {
         if let Some(listener) = &self.send_listener {
             loop {
                 match listener.accept() {
-                    Ok((mut stream, _)) => match crate::send::read_request(&mut stream) {
+                    Ok(mut stream) => match crate::send::read_request(&mut stream) {
                         Ok(request) => self.send_queue.push(PendingSend {
                             stream,
                             request,

@@ -3,18 +3,21 @@
 //! The running web client ([`crate::MachineClient`]) holds every bot's
 //! sealed store, so `m4a-send` does not open that store a second time
 //! while it runs: it writes one JSON line to the client's local socket
-//! ([`SEND_SOCK_ENV`], default [`DEFAULT_SOCK_NAME`] under the store root,
-//! mode 0600) and the client sends the encrypted DM from the `--as`
+//! ([`SEND_SOCK_ENV`], default [`DEFAULT_SOCK_NAME`] under the store root;
+//! a mode-0600 domain socket on Unix, a loopback TCP address file on
+//! Windows) and the client sends the encrypted DM from the `--as`
 //! session, through the configured homeserver. With no client running,
 //! `m4a-send` opens that one session itself (the store lock keeps the two
 //! from overlapping). No URL, key, or bearer is passed in arguments or
 //! printed.
 
 use serde::{Deserialize, Serialize};
+use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+use crate::ipc::SendStream;
 
 /// Path of the web client's local send socket.
 pub const SEND_SOCK_ENV: &str = "M4A_SEND_SOCK";
@@ -98,17 +101,20 @@ pub fn load_env_file() -> Option<PathBuf> {
 }
 
 /// Like [`load_env_file`], but the default under
-/// `$HOME/.config/mail4agent/` is `default_name` (node uses
-/// `node-client.env`). [`ENV_FILE_ENV`] still wins when set.
+/// `<home>/.config/mail4agent/` is `default_name` (node uses
+/// `node-client.env`). Home is `HOME` when non-empty, otherwise
+/// `USERPROFILE`. [`ENV_FILE_ENV`] still wins when set.
 pub fn load_env_file_named(default_name: &str) -> Option<PathBuf> {
     let path = std::env::var(ENV_FILE_ENV)
         .ok()
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .or_else(|| {
-            std::env::var("HOME").ok().map(|home| {
-                PathBuf::from(home).join(".config/mail4agent").join(default_name)
-            })
+            home_dir_from(
+                std::env::var_os("HOME").as_deref(),
+                std::env::var_os("USERPROFILE").as_deref(),
+            )
+            .map(|home| home.join(".config/mail4agent").join(default_name))
         })?;
     let text = std::fs::read_to_string(&path).ok()?;
     for (key, value) in parse_env_lines(&text) {
@@ -117,6 +123,16 @@ pub fn load_env_file_named(default_name: &str) -> Option<PathBuf> {
         }
     }
     Some(path)
+}
+
+/// `HOME` when it is non-empty, otherwise `USERPROFILE` when that is
+/// non-empty. Both missing or empty is `None`. Does not read the process
+/// environment.
+fn home_dir_from(home: Option<&OsStr>, userprofile: Option<&OsStr>) -> Option<PathBuf> {
+    let chosen = home
+        .filter(|value| !value.is_empty())
+        .or_else(|| userprofile.filter(|value| !value.is_empty()))?;
+    Some(PathBuf::from(chosen))
 }
 
 fn parse_env_lines(text: &str) -> Vec<(String, String)> {
@@ -152,7 +168,7 @@ pub fn send_via_socket(
     request: &SendRequest,
     wait: Duration,
 ) -> std::io::Result<SendReply> {
-    let mut stream = UnixStream::connect(sock)?;
+    let mut stream = SendStream::connect(sock)?;
     stream.set_read_timeout(Some(wait))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let mut line = serde_json::to_vec(request)?;
@@ -173,7 +189,7 @@ pub fn send_via_socket(
 }
 
 /// Reads one request line from an accepted socket connection.
-pub(crate) fn read_request(stream: &mut UnixStream) -> Result<SendRequest, String> {
+pub(crate) fn read_request(stream: &mut SendStream) -> Result<SendRequest, String> {
     stream
         .set_nonblocking(false)
         .map_err(|err| err.to_string())?;
@@ -181,7 +197,7 @@ pub(crate) fn read_request(stream: &mut UnixStream) -> Result<SendRequest, Strin
         .set_read_timeout(Some(Duration::from_secs(3)))
         .map_err(|err| err.to_string())?;
     let mut buf = Vec::new();
-    let mut limited = (&*stream).take((MAX_SEND_BYTES * 2 + 1024) as u64);
+    let mut limited = stream.take((MAX_SEND_BYTES * 2 + 1024) as u64);
     let mut reader = BufReader::new(&mut limited);
     reader
         .read_until(b'\n', &mut buf)
@@ -198,7 +214,7 @@ pub(crate) fn read_request(stream: &mut UnixStream) -> Result<SendRequest, Strin
 }
 
 /// Writes one answer line. Errors are ignored: the sender may have gone.
-pub(crate) fn write_reply(stream: &mut UnixStream, reply: &SendReply) {
+pub(crate) fn write_reply(stream: &mut SendStream, reply: &SendReply) {
     if let Ok(mut line) = serde_json::to_vec(reply) {
         line.push(b'\n');
         let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
@@ -209,6 +225,8 @@ pub(crate) fn write_reply(stream: &mut UnixStream, reply: &SendReply) {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
+
     use super::*;
 
     #[test]
@@ -223,6 +241,30 @@ mod tests {
                 ("M4A_B".to_string(), "two words".to_string()),
                 ("M4A_C".to_string(), "x".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn home_dir_prefers_home_then_userprofile() {
+        assert_eq!(
+            home_dir_from(
+                Some(OsStr::new("/from-home")),
+                Some(OsStr::new("/from-profile"))
+            ),
+            Some(PathBuf::from("/from-home"))
+        );
+        assert_eq!(
+            home_dir_from(None, Some(OsStr::new("/from-profile"))),
+            Some(PathBuf::from("/from-profile"))
+        );
+        assert_eq!(
+            home_dir_from(Some(OsStr::new("")), Some(OsStr::new("/from-profile"))),
+            Some(PathBuf::from("/from-profile"))
+        );
+        assert_eq!(home_dir_from(None, None), None);
+        assert_eq!(
+            home_dir_from(Some(OsStr::new("")), Some(OsStr::new(""))),
+            None
         );
     }
 

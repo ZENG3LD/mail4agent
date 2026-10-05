@@ -61,6 +61,7 @@
 //! built; it is not either of those open paths and it does not read a wake
 //! from the environment.
 
+mod ipc;
 mod machine;
 mod nick;
 mod node;
@@ -642,10 +643,13 @@ fn bearer_header(token: &str) -> Result<reqwest::header::HeaderValue, ShellError
 }
 
 fn routine_client() -> Result<reqwest::blocking::Client, ShellError> {
+    // Workspace feature unification also turns on native-tls. Without this,
+    // Windows uses schannel and a localized chain error instead of rustls.
     reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(8))
         .redirect(reqwest::redirect::Policy::none())
         .http1_only()
+        .use_rustls_tls()
         .build()
         .map_err(|err| ShellError::RoutineTransport(public_reqwest(&err)))
 }
@@ -893,6 +897,7 @@ impl OpenedStore {
         Self::connect_with_wake(&SessionConfig::from_env()?, wake)
     }
 
+    #[cfg(test)]
     pub(crate) fn connect_node_from_lookup(
         mut get: impl FnMut(&str) -> Option<String>,
         toml_text: Option<&str>,

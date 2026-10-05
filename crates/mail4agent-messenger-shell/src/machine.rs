@@ -70,6 +70,7 @@ use std::sync::{Arc, Mutex};
 use tower::util::ServiceExt;
 use zeroize::Zeroizing;
 
+use crate::ipc::{SendListener, SendStream};
 use crate::{
     clip_public, percent_encode, perform_http, register_session, DeviceId, OpenedStore,
     SessionConfig, SessionWake, ShellError, HOMESERVER_URL_ENV, STORE_ROOT_ENV,
@@ -1228,7 +1229,7 @@ pub struct MachineClient {
     /// Exclusive locks on every open session directory ([`STORE_LOCK_FILE`]).
     _locks: Vec<File>,
     /// Local socket `m4a-send` writes to ([`MachineClient::listen_for_sends`]).
-    send_listener: Option<std::os::unix::net::UnixListener>,
+    send_listener: Option<SendListener>,
     send_sock: Option<PathBuf>,
     /// Sends waiting for the peer to join the DM.
     send_queue: Vec<PendingSend>,
@@ -1250,7 +1251,7 @@ const LATE_OPEN_RETRY_SECS: u64 = 60;
 
 /// One `m4a-send` request still in progress.
 struct PendingSend {
-    stream: std::os::unix::net::UnixStream,
+    stream: SendStream,
     request: crate::SendRequest,
     started: std::time::Instant,
     room: Option<String>,
@@ -2041,27 +2042,22 @@ impl MachineClient {
     }
 
     /// Listens on `path` for `m4a-send` requests (one JSON line each, see
-    /// [`crate::SendRequest`]). A stale socket file is replaced; the socket
-    /// is mode 0600 and removed when the client drops. [`Self::tick`]
-    /// answers requests: the `as` session opens (or reuses) the encrypted
-    /// DM with `to`, waits up to two minutes for `to` to join, and sends.
+    /// [`crate::SendRequest`]). A stale socket file is replaced; a live
+    /// listener is refused. Unix is mode 0600. Windows is loopback TCP and
+    /// the file holds `127.0.0.1:{port}`. The file is removed when the
+    /// client drops. [`Self::tick`] answers requests: the `as` session
+    /// opens (or reuses) the encrypted DM with `to`, waits up to two
+    /// minutes for `to` to join, and sends.
     pub fn listen_for_sends(&mut self, path: &Path) -> Result<(), ShellError> {
-        if path.exists() {
-            if std::os::unix::net::UnixStream::connect(path).is_ok() {
-                return Err(ShellError::SessionList(
+        let listener = SendListener::bind(path).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::AlreadyExists {
+                ShellError::SessionList(
                     "another client already listens on the send socket".to_string(),
-                ));
+                )
+            } else {
+                ShellError::Io(err)
             }
-            std::fs::remove_file(path)?;
-        }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let listener = std::os::unix::net::UnixListener::bind(path)?;
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        }
+        })?;
         listener.set_nonblocking(true)?;
         self.send_listener = Some(listener);
         self.send_sock = Some(path.to_path_buf());
@@ -2188,7 +2184,7 @@ impl MachineClient {
         if let Some(listener) = &self.send_listener {
             loop {
                 match listener.accept() {
-                    Ok((mut stream, _)) => match crate::send::read_request(&mut stream) {
+                    Ok(mut stream) => match crate::send::read_request(&mut stream) {
                         Ok(request) => self.send_queue.push(PendingSend {
                             stream,
                             request,

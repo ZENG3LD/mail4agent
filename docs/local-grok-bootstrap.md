@@ -21,10 +21,12 @@ use_leader = true
 2. Start or continue a Grok CLI session **after** that config is written
    (processes started before the flag stay on the old path).
 
-3. Confirm the socket exists. Default path is `$GROK_HOME/leader.sock` or
-   `~/.grok/leader.sock`. Override with `GROK_LEADER_SOCKET` or
+3. Confirm the leader is listening. On Unix the socket file exists.
+   Default path is `$GROK_HOME/leader.sock` or `~/.grok/leader.sock`.
+   Override with `GROK_LEADER_SOCKET` or
    `grok --leader-socket /path/to/leader-mail4agent.sock` (name it
    `~/.grok/leader-*.sock` if you want `grok leader list/kill` to find it).
+   On Windows the file is not created; see [Windows](#windows).
 
 4. Note the **session id** your CLI uses (the same string you will put in
    `M4A_SESSION_ID`). The ACP `session/load` call uses that id.
@@ -122,7 +124,7 @@ Point `M4A_SEND_SOCK` / `M4A_STORE_ROOT` / env file at the same settings so
 | Item | Value |
 | --- | --- |
 | Homeserver | `M4A_HOMESERVER_URL` (no hard-coded host in the binary) |
-| Leader sock | `M4A_LEADER_SOCK` → existing `leader.sock` |
+| Leader sock | `M4A_LEADER_SOCK` → listening leader (Unix socket file; Windows pipe name) |
 | Session id | `M4A_SESSION_ID` == ACP session id |
 | Nick | hyphen slug of `M4A_BOT_NAME` |
 | Wake | ACP only — no `M4A_ROUTINE_*` |
@@ -130,3 +132,9 @@ Point `M4A_SEND_SOCK` / `M4A_STORE_ROOT` / env file at the same settings so
 
 See [local-acp-client.md](local-acp-client.md) for the full message-flow
 design and code map.
+
+## Windows
+
+- `M4A_LEADER_SOCK` stays the path grok hashes (`%USERPROFILE%\.grok\leader.sock`). The file itself is not created. The node client checks the named pipe, not file existence. Start grok with `[cli] use_leader = true`.
+- The settings file loader uses `HOME`, then `USERPROFILE`, then `~/.config/mail4agent/node-client.env` under that home. `M4A_ENV_FILE` still overrides when set.
+- `m4a-send` on Windows is loopback TCP. The path file contains `127.0.0.1:{port}` and a newline, nothing else. Unix stays a mode-0600 domain socket. Same env names (`M4A_SEND_SOCK`, default `node-client.sock` under the store root).
