@@ -37,12 +37,23 @@
 //! A Grok Bot web session registers itself with [`OpenedStore::connect`].
 //! The nick is derived from the bot display name ([`BOT_NAME_ENV`]), not
 //! from a slug. This path is not the local grok CLI.
+//!
+//! One process on a machine is a [`MachineClient`]. The host passes the
+//! sessions that live there ([`MachineClient::open`], or a directory of
+//! session records at [`SESSIONS_DIR_ENV`]). There is no host API that
+//! enumerates live bot processes. Each session keeps the sealed store
+//! [`session_store_dir`] already uses. Mail between two of those sessions
+//! is performed in process. The homeserver is used only when the peer is
+//! not one of them. The existing drive loop does that work; nothing here
+//! starts a second sync daemon.
 
+mod machine;
 mod nick;
 
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -56,6 +67,7 @@ use mail4agent_messenger::{
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+pub use machine::{load_session_records, HostSession, MachineClient, SESSIONS_DIR_ENV};
 pub use mail4agent_messenger::{
     CreateRoomKind, DeviceId, MessageKind, MessengerCommand, OutgoingMessage, RoomId, RoomKind,
     UserId,
@@ -297,6 +309,11 @@ impl SessionConfig {
     pub fn store_dir(&self) -> PathBuf {
         session_store_dir(&self.store_root, &self.session_id)
     }
+
+    /// Session id the host assigned. Not a secret.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
 }
 
 impl std::fmt::Debug for SessionConfig {
@@ -536,6 +553,12 @@ pub struct OpenedStore {
     leader_sent: HashSet<String>,
     /// Last wake failure, clipped. No bearer and no message body.
     wake_note: Option<String>,
+    /// In-process bus for sessions this machine's client already holds.
+    /// `None` on a store opened by itself: every request goes to the homeserver.
+    bus: Option<Arc<machine::LocalBus>>,
+    /// Nick and mxid of the other sessions in that client. Lookup does not
+    /// ask the homeserver.
+    local_peers: Vec<(String, String)>,
 }
 
 struct SyncFlight {
@@ -647,6 +670,8 @@ impl OpenedStore {
             routine_sent: HashSet::new(),
             leader_sent: HashSet::new(),
             wake_note: None,
+            bus: None,
+            local_peers: Vec::new(),
         };
         opened.set_wake(SessionWake::from_env());
         // History already on disk is not a new inbound text.
@@ -701,6 +726,40 @@ impl OpenedStore {
         self.nick.as_deref()
     }
 
+    /// Directory this store seals into. Not shared with another session.
+    pub fn store_dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Homeserver calls this store's client has counted. In-process bus
+    /// calls are not included. Zero when this store has no bus.
+    pub fn homeserver_hits(&self) -> u64 {
+        self.bus.as_ref().map(|bus| bus.hits()).unwrap_or(0)
+    }
+
+    pub(crate) fn attach_bus(&mut self, bus: Arc<machine::LocalBus>) {
+        self.bus = Some(bus);
+    }
+
+    pub(crate) fn set_registered_nick(&mut self, nick: String) {
+        self.nick = Some(nick);
+    }
+
+    pub(crate) fn set_local_peers(&mut self, peers: Vec<(String, String)>) {
+        self.local_peers = peers;
+    }
+
+    /// Drops a `/sync` left on the wire by [`Self::drive`] so the next drive
+    /// is not blocked on that poll. The engine retries the sync later. This
+    /// does not start another poll.
+    pub(crate) fn abandon_inflight_sync(&mut self, now_ms: i64) -> Result<(), ShellError> {
+        if let Some(flight) = self.sync_flight.take() {
+            self.core.on_transport_error(&flight.id, now_ms);
+            self.persist_core()?;
+        }
+        Ok(())
+    }
+
     /// This account's Matrix user id.
     pub fn user_id(&self) -> &str {
         self.core.user_id().as_str()
@@ -731,6 +790,16 @@ impl OpenedStore {
         now_ms: i64,
     ) -> Result<FoundSession, ShellError> {
         let needle = nick::lookup_nick(name_or_nick)?;
+        if let Some((nick, user_id)) = self
+            .local_peers
+            .iter()
+            .find(|(nick, _)| nick.eq_ignore_ascii_case(&needle))
+        {
+            return Ok(FoundSession {
+                nick: nick.clone(),
+                user_id: user_id.clone(),
+            });
+        }
         self.dispatch(
             MessengerCommand::SearchUsers {
                 term: needle.clone(),
@@ -1144,7 +1213,7 @@ impl OpenedStore {
     }
 
     fn roundtrip(&mut self, request: &OutgoingRequest, now_ms: i64) -> Result<(), ShellError> {
-        match perform_http(&self.client, &self.base_url, &self.device_token, request) {
+        match self.fulfill(request) {
             Ok(response) => {
                 self.http_trace.push((request.kind, response.status));
                 self.core.on_response(request.id.clone(), response, now_ms);
@@ -1154,6 +1223,27 @@ impl OpenedStore {
                 self.core.on_transport_error(&request.id, now_ms);
                 Err(err)
             }
+        }
+    }
+
+    fn fulfill(&self, request: &OutgoingRequest) -> Result<HttpResponseDescriptor, ShellError> {
+        if let Some(bus) = &self.bus {
+            bus.fulfill(
+                &self.client,
+                &self.base_url,
+                self.device_token.as_str(),
+                self.core.user_id().as_str(),
+                request,
+                None,
+            )
+            .map(|(response, _hit_remote)| response)
+        } else {
+            perform_http(
+                &self.client,
+                &self.base_url,
+                self.device_token.as_str(),
+                request,
+            )
         }
     }
 
@@ -1167,14 +1257,29 @@ impl OpenedStore {
         let client = self.client.clone();
         let base_url = self.base_url.clone();
         let token = self.device_token.clone();
+        let bus = self.bus.clone();
+        let force_local = self.bus.as_ref().map(|bus| bus.local_only());
+        let user_id = self.core.user_id().as_str().to_string();
         let id = request.id.clone();
         let (tx, rx) = mpsc::channel();
         let worker = thread::spawn(move || {
-            let result =
-                perform_http(&client, &base_url, &token, &request).map_err(|err| match err {
-                    ShellError::Http(text) => text,
-                    other => clip_public(other.to_string()),
-                });
+            let result = if let Some(bus) = &bus {
+                bus.fulfill(
+                    &client,
+                    &base_url,
+                    token.as_str(),
+                    &user_id,
+                    &request,
+                    force_local,
+                )
+                .map(|(response, _hit_remote)| response)
+            } else {
+                perform_http(&client, &base_url, token.as_str(), &request)
+            };
+            let result = result.map_err(|err| match err {
+                ShellError::Http(text) => text,
+                other => clip_public(other.to_string()),
+            });
             let _ = tx.send(result);
         });
         self.sync_flight = Some(SyncFlight {
@@ -1629,6 +1734,9 @@ pub enum ShellError {
     /// The display name did not yield a nick.
     #[error("nick could not be derived from the bot display name")]
     Nick,
+    /// The host's session list was missing or refused. No bearer is included.
+    #[error("session list: {0}")]
+    SessionList(String),
     /// Homeserver register failed. The text is a status and errcode, not a bearer.
     #[error("homeserver register failed: {0}")]
     Register(String),

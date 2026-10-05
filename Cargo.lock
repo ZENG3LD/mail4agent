@@ -1290,14 +1290,19 @@ dependencies = [
 name = "mail4agent-messenger-shell"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "mail4agent-grok",
  "mail4agent-messenger",
+ "mail4agent-server",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",
  "thiserror",
+ "tokio",
  "toml",
+ "tower",
  "zeroize",
 ]
 
