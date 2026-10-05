@@ -78,7 +78,7 @@ fn latin_piece(ch: char) -> Option<&'static str> {
         'ж' => "zh",
         'з' => "z",
         'и' => "i",
-        'й' => "y",
+        'й' => "i",
         'к' => "k",
         'л' => "l",
         'м' => "m",
@@ -163,6 +163,10 @@ mod tests {
         assert_eq!(
             nick_from_display_name("Привет мир").unwrap(),
             "privet_mir"
+        );
+        assert_eq!(
+            nick_from_display_name("Свой браузер").unwrap(),
+            "svoi_brauzer"
         );
         assert_ne!(
             nick_from_display_name("Привет мир").unwrap(),

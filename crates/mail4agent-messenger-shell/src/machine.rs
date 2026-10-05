@@ -404,11 +404,16 @@ fn automation_slug(name: &str) -> String {
     slug
 }
 
-/// Routine name for one session. `bot_name` when it has a stable slug,
-/// otherwise `session_id`. Both already live on the session record.
+/// Routine name for a new card. An ASCII display name is kept as written
+/// so an existing card such as `Hostbot` is not minted again. A name with
+/// no ASCII slug, including Cyrillic, uses the same transliteration as the
+/// nick (`Привет мир` -> `privet_mir`). The session id is only
+/// the fallback when that transliteration is empty. This does not rename a
+/// card that already exists.
 fn routine_name_for(session: &HostSession) -> String {
     if automation_slug(&session.bot_name).is_empty() {
-        session.session_id.clone()
+        crate::nick::nick_from_display_name(session.bot_name.trim())
+            .unwrap_or_else(|_| session.session_id.clone())
     } else {
         session.bot_name.clone()
     }
@@ -1807,7 +1812,8 @@ mod tests {
         assert_eq!(loaded[0].session_id, "agent-chief");
         assert_eq!(loaded[0].agent_id.as_deref(), Some("agent-chief"));
         assert_eq!(loaded[0].bot_name, "Привет мир");
-        assert_eq!(routine_name_for(&loaded[0]), "agent-chief");
+        assert_eq!(routine_name_for(&loaded[0]), "privet_mir");
+        assert_ne!(routine_name_for(&loaded[0]), loaded[0].session_id);
         assert_eq!(loaded[1].bot_name, "Hostbot");
         assert_eq!(routine_name_for(&loaded[1]), "Hostbot");
         assert!(loaded.iter().all(|session| session.routine_url.is_none()));
