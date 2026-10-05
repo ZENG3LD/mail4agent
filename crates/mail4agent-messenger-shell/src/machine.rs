@@ -4,10 +4,11 @@
 //! ([`crate::OpenedStore::connect_node_from_env`]). The host passes the
 //! list, or this process reads [`SESSIONS_DIR_ENV`]. A record is the bot
 //! display name and the session id. A routine URL or a bearer in the file
-//! is refused. [`MachineClient::from_env`] copies [`crate::ROUTINE_URL_ENV`]
-//! and [`crate::ROUTINE_BEARER_ENV`] from the process environment onto
-//! those sessions, in memory only. It does not write them back and it does
-//! not log them. [`crate::LEADER_SOCK_ENV`] is not this path.
+//! is refused. [`MachineClient::from_env`] creates one webhook routine per
+//! session through the local gateway and keeps the URL and key in memory.
+//! It does not write them back and it does not log them. One URL is not
+//! shared across sessions. [`crate::LEADER_SOCK_ENV`] is not this path.
+//! The node CLI does not create a routine.
 //!
 //! Each session still seals under [`crate::session_store_dir`]. Olm pickles
 //! are not shared. While [`MachineClient::set_local_delivery`] is set, the
@@ -17,7 +18,8 @@
 //! Room text from the homeserver is not a second sync loop either.
 //! [`MachineClient::open`] opens one socket for every session it
 //! registered. The homeserver pushes an event down that socket. This
-//! process delivers it to that session. It does not POST a routine.
+//! process delivers it to that session. A routine POST is the later
+//! drive, and only for a session that has its own webhook.
 
 use mail4agent_messenger::{HttpResponseDescriptor, OutgoingRequest, OutgoingRequestKind};
 use mail4agent_server::http::{hash_token, router, Homeserver};
@@ -146,20 +148,327 @@ pub fn load_session_records(dir: &Path) -> Result<Vec<HostSession>, ShellError> 
     Ok(out)
 }
 
-/// [`load_session_records`] plus the host-injected routine. `get` is the
-/// process environment on [`MachineClient::from_env`]. A leader socket from
-/// `get` is not copied. The json files are not rewritten.
+/// [`load_session_records`] plus one webhook routine per session.
+///
+/// `get` is the process environment on [`MachineClient::from_env`]. A
+/// shared [`crate::ROUTINE_URL_ENV`] is not copied onto every session.
+/// [`GATEWAY_FILE_ENV`] names the gateway file. When that lookup is empty,
+/// this does not look for a gateway, so a test that did not point at one
+/// does not create a routine. The json files are not rewritten.
 fn load_web_sessions(
     dir: &Path,
-    get: impl FnMut(&str) -> Option<String>,
+    mut get: impl FnMut(&str) -> Option<String>,
 ) -> Result<Vec<HostSession>, ShellError> {
     let mut sessions = load_session_records(dir)?;
-    let wake = crate::SessionWake::web_from_lookup(get);
-    for session in &mut sessions {
-        session.routine_url = wake.routine_url.clone();
-        session.routine_bearer = wake.routine_bearer.clone();
-    }
+    let Some(path) = get(GATEWAY_FILE_ENV).filter(|value| !value.is_empty()) else {
+        return Ok(sessions);
+    };
+    let token = get(GATEWAY_TOKEN_ENV).filter(|value| !value.is_empty());
+    attach_webhook_routines(&mut sessions, Path::new(&path), token.as_deref())?;
     Ok(sessions)
+}
+
+/// Gateway file the host already runs. [`GATEWAY_FILE_ENV`] overrides it.
+/// The listener is loopback; the `host` field in the file is not used.
+const DEFAULT_GATEWAY_FILE: &str = "/srv/agent-data/gateway.json";
+
+/// Path of the gateway file. Unset on [`MachineClient::from_env`] uses
+/// [`DEFAULT_GATEWAY_FILE`].
+pub const GATEWAY_FILE_ENV: &str = "M4A_GATEWAY_FILE";
+
+/// Gateway bearer. When set, this replaces the token in the gateway file.
+/// It is never written to disk.
+pub const GATEWAY_TOKEN_ENV: &str = "M4A_GATEWAY_TOKEN";
+
+/// Saved prompt for the webhook routine. The wake body is still the JSON
+/// object [`crate::routine_json`] posts. No host name and no key.
+const WEBHOOK_ROUTINE_PROMPT: &str = "A mail4agent room message woke this routine. The webhook JSON has body, from, event_id, and nick only when the sender display name is already known. Read that message.";
+
+#[derive(serde::Deserialize)]
+struct GatewayFile {
+    port: u16,
+    scheme: String,
+    #[serde(default)]
+    token: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct AutomationCard {
+    id: String,
+    name: String,
+}
+
+#[derive(serde::Deserialize)]
+struct WebhookCredential {
+    url: String,
+    key: Option<String>,
+}
+
+/// Folder slug the gateway uses for a new routine name. ASCII letters and
+/// digits only, matching the gateway's slug. Empty when `name` has none.
+fn automation_slug(name: &str) -> String {
+    let mut slug = String::new();
+    let mut pending_dash = false;
+    for ch in name.to_lowercase().chars() {
+        if ch.is_ascii_alphanumeric() {
+            if pending_dash && !slug.is_empty() {
+                slug.push('-');
+            }
+            pending_dash = false;
+            slug.push(ch);
+        } else if !slug.is_empty() {
+            pending_dash = true;
+        }
+    }
+    if slug.len() > 48 {
+        slug.truncate(48);
+    }
+    slug
+}
+
+/// Routine name for one session. `bot_name` when it has a stable slug,
+/// otherwise `session_id`. Both already live on the session record.
+fn routine_name_for(session: &HostSession) -> String {
+    if automation_slug(&session.bot_name).is_empty() {
+        session.session_id.clone()
+    } else {
+        session.bot_name.clone()
+    }
+}
+
+/// Creates each session's webhook routine, or reads the credential when
+/// that name already exists. A missing gateway file leaves the sessions
+/// unchanged. The URL and key stay on `sessions` and are not logged.
+fn attach_webhook_routines(
+    sessions: &mut [HostSession],
+    gateway_file: &Path,
+    token_override: Option<&str>,
+) -> Result<(), ShellError> {
+    if !gateway_file.is_file() {
+        return Ok(());
+    }
+    let text = std::fs::read_to_string(gateway_file)
+        .map_err(|_| ShellError::Gateway("gateway file is unreadable".to_string()))?;
+    let file: GatewayFile = serde_json::from_str(&text)
+        .map_err(|_| ShellError::Gateway("gateway file is unreadable".to_string()))?;
+    let scheme = file.scheme.trim();
+    if scheme != "http" && scheme != "https" {
+        return Err(ShellError::Gateway(
+            "gateway scheme is not http or https".to_string(),
+        ));
+    }
+    if file.port == 0 {
+        return Err(ShellError::Gateway("gateway port is unset".to_string()));
+    }
+    let token = token_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or(file.token.filter(|value| !value.trim().is_empty()));
+    let Some(token) = token else {
+        return Err(ShellError::Gateway("gateway token is unset".to_string()));
+    };
+    // The gateway listens on loopback only. Do not use the file's host.
+    let base = format!("{scheme}://127.0.0.1:{}", file.port);
+    let client = gateway_client()?;
+    for session in sessions.iter_mut() {
+        if session.routine_url.is_some() && session.routine_bearer.is_some() {
+            continue;
+        }
+        let name = routine_name_for(session);
+        let slug = automation_slug(&name);
+        if slug.is_empty() || session.session_id.is_empty() {
+            return Err(ShellError::Gateway(
+                "session has no routine name".to_string(),
+            ));
+        }
+        match read_webhook_credential(&client, &base, &token, &session.session_id, &slug)? {
+            CredentialRead::Ready { url, key } => {
+                session.routine_url = Some(url);
+                session.routine_bearer = Some(key);
+                continue;
+            }
+            CredentialRead::MintFailed => continue,
+            CredentialRead::Missing => {}
+        }
+        let cards = create_webhook_routine(&client, &base, &token, &session.session_id, &name)?;
+        let Some(card) = pick_created_card(&cards, &name, &slug) else {
+            return Err(ShellError::Gateway(
+                "gateway create did not return the routine".to_string(),
+            ));
+        };
+        match read_webhook_credential(&client, &base, &token, &session.session_id, &card.id)? {
+            CredentialRead::Ready { url, key } => {
+                session.routine_url = Some(url);
+                session.routine_bearer = Some(key);
+            }
+            CredentialRead::MintFailed | CredentialRead::Missing => {}
+        }
+    }
+    Ok(())
+}
+
+enum CredentialRead {
+    Ready {
+        url: String,
+        key: String,
+    },
+    /// The routine exists and the gateway did not return a key.
+    MintFailed,
+    Missing,
+}
+
+fn gateway_client() -> Result<reqwest::blocking::Client, ShellError> {
+    reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .redirect(reqwest::redirect::Policy::none())
+        .http1_only()
+        .build()
+        .map_err(|_| ShellError::Gateway("gateway client could not start".to_string()))
+}
+
+fn gateway_post(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    token: &str,
+    method: &str,
+    body: &serde_json::Value,
+) -> Result<(u16, Vec<u8>), ShellError> {
+    let url = format!("{base}/api/{method}");
+    let authorization = crate::bearer_header(token).map_err(|_| {
+        ShellError::Gateway("gateway token is not a single header value".to_string())
+    })?;
+    let bytes = serde_json::to_vec(body)
+        .map_err(|_| ShellError::Gateway("gateway request was not json".to_string()))?;
+    let response = client
+        .post(&url)
+        .header(reqwest::header::AUTHORIZATION, authorization)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(bytes)
+        .send()
+        .map_err(|_| ShellError::Gateway("gateway request failed".to_string()))?;
+    let status = response.status().as_u16();
+    let body = response
+        .bytes()
+        .map_err(|_| ShellError::Gateway("gateway response failed".to_string()))?;
+    Ok((status, body.to_vec()))
+}
+
+fn read_webhook_credential(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    token: &str,
+    agent_id: &str,
+    automation_id: &str,
+) -> Result<CredentialRead, ShellError> {
+    let (status, body) = gateway_post(
+        client,
+        base,
+        token,
+        "getAutomationWebhookCredential",
+        &serde_json::json!({
+            "id": agent_id,
+            "automationId": automation_id,
+        }),
+    )?;
+    if status == 200 {
+        let parsed: WebhookCredential = serde_json::from_slice(&body).map_err(|_| {
+            ShellError::Gateway("gateway credential was not understood".to_string())
+        })?;
+        let key = parsed.key.filter(|key| !key.is_empty());
+        if parsed.url.is_empty() {
+            return Err(ShellError::Gateway(
+                "gateway credential was not understood".to_string(),
+            ));
+        }
+        return Ok(match key {
+            Some(key) => CredentialRead::Ready {
+                url: parsed.url,
+                key,
+            },
+            None => CredentialRead::MintFailed,
+        });
+    }
+    if credential_is_missing(status, &body) {
+        return Ok(CredentialRead::Missing);
+    }
+    Err(ShellError::Gateway(format!(
+        "gateway credential status {status}"
+    )))
+}
+
+/// A missing routine is not a 200. The gateway reports that as 404 or as
+/// 500 with its not-found error. Any other failure is not treated as
+/// "create another one".
+fn credential_is_missing(status: u16, body: &[u8]) -> bool {
+    if status == 404 {
+        return true;
+    }
+    if status != 500 {
+        return false;
+    }
+    std::str::from_utf8(body)
+        .map(|text| text.contains("Automation not found"))
+        .unwrap_or(false)
+}
+
+fn create_webhook_routine(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    token: &str,
+    agent_id: &str,
+    name: &str,
+) -> Result<Vec<AutomationCard>, ShellError> {
+    let (status, body) = gateway_post(
+        client,
+        base,
+        token,
+        "createAgentAutomation",
+        &serde_json::json!({
+            "id": agent_id,
+            "spec": {
+                "name": name,
+                "prompt": WEBHOOK_ROUTINE_PROMPT,
+                "trigger": { "type": "webhook" },
+                "isEnabled": true,
+            },
+        }),
+    )?;
+    if status != 200 {
+        return Err(ShellError::Gateway(format!(
+            "gateway create status {status}"
+        )));
+    }
+    serde_json::from_slice(&body)
+        .map_err(|_| ShellError::Gateway("gateway create was not understood".to_string()))
+}
+
+fn pick_created_card<'a>(
+    cards: &'a [AutomationCard],
+    name: &str,
+    slug: &str,
+) -> Option<&'a AutomationCard> {
+    let matches = cards.iter().filter(|card| card.name == name);
+    if let Some(exact) = cards
+        .iter()
+        .find(|card| card.name == name && card.id == slug)
+    {
+        return Some(exact);
+    }
+    matches.max_by(|left, right| slug_rank(&left.id, slug).cmp(&slug_rank(&right.id, slug)))
+}
+
+fn slug_rank(id: &str, slug: &str) -> u32 {
+    if id == slug {
+        return 1;
+    }
+    let Some(rest) = id
+        .strip_prefix(slug)
+        .and_then(|rest| rest.strip_prefix('-'))
+    else {
+        return 0;
+    };
+    rest.parse::<u32>().unwrap_or(0)
 }
 
 struct Prepared {
@@ -297,10 +606,12 @@ impl MachineClient {
     /// Web machine client open path.
     ///
     /// [`HOMESERVER_URL_ENV`], [`STORE_ROOT_ENV`], and [`SESSIONS_DIR_ENV`].
-    /// The routine URL and bearer are the host injection
-    /// ([`crate::ROUTINE_URL_ENV`], [`crate::ROUTINE_BEARER_ENV`]), applied
-    /// to every session in this process. They are not read from the json
-    /// files. [`crate::LEADER_SOCK_ENV`] is not read.
+    /// One webhook routine per session, from the gateway file
+    /// ([`GATEWAY_FILE_ENV`], or the host gateway file when that is unset).
+    /// The token is the file's token, or [`GATEWAY_TOKEN_ENV`] when the
+    /// host injected one. A missing file leaves routines unset and does
+    /// not fail this open. URLs and keys are not read from the json files
+    /// and are not written back. [`crate::LEADER_SOCK_ENV`] is not read.
     pub fn from_env() -> Result<Self, ShellError> {
         let homeserver_url = std::env::var(HOMESERVER_URL_ENV)
             .ok()
@@ -315,6 +626,12 @@ impl MachineClient {
             .filter(|value| !value.is_empty())
             .ok_or_else(|| ShellError::SessionList("session directory is unset".to_string()))?;
         let sessions = load_web_sessions(Path::new(&sessions_dir), |key| {
+            if key == GATEWAY_FILE_ENV {
+                return std::env::var(GATEWAY_FILE_ENV)
+                    .ok()
+                    .filter(|value| !value.is_empty())
+                    .or_else(|| Some(DEFAULT_GATEWAY_FILE.to_string()));
+            }
             std::env::var(key).ok().filter(|value| !value.is_empty())
         })?;
         Self::open(&homeserver_url, Path::new(&store_root), sessions)
@@ -738,7 +1055,7 @@ mod tests {
     }
 
     #[test]
-    fn web_client_takes_the_routine_from_the_host_and_node_cli_refuses_it() {
+    fn web_client_does_not_copy_one_routine_onto_every_session_and_node_cli_refuses_it() {
         let dir = std::env::temp_dir().join(format!(
             "m4a-split-{}-{}",
             std::process::id(),
@@ -761,8 +1078,8 @@ mod tests {
         })
         .expect("web sessions");
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].routine_url.as_deref(), Some(routine));
-        assert_eq!(sessions[0].routine_bearer.as_deref(), Some(bearer));
+        assert!(sessions[0].routine_url.is_none());
+        assert!(sessions[0].routine_bearer.is_none());
         assert_eq!(std::fs::read_to_string(&record).expect("reread"), body);
         let wake = crate::SessionWake::web_from_lookup(|key| match key {
             crate::ROUTINE_URL_ENV => Some(routine.to_string()),
@@ -814,6 +1131,268 @@ mod tests {
             Some(std::path::Path::new("/tmp/node-leader.sock"))
         );
         assert_eq!(node.leader_cwd.as_deref(), Some("/tmp/node"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_sessions_get_two_webhook_routines_and_a_second_open_does_not_mint() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        struct Card {
+            agent: String,
+            id: String,
+            name: String,
+            key: Option<String>,
+        }
+        struct Gateway {
+            creates: usize,
+            cards: Vec<Card>,
+        }
+
+        fn read_http(sock: &mut std::net::TcpStream) -> Option<(String, Vec<u8>)> {
+            let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 2048];
+            loop {
+                let n = sock.read(&mut tmp).unwrap_or(0);
+                if n == 0 && buf.is_empty() {
+                    return None;
+                }
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                let header_end = buf.windows(4).position(|window| window == b"\r\n\r\n")?;
+                let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                let length = headers.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    if name.eq_ignore_ascii_case("content-length") {
+                        value.trim().parse::<usize>().ok()
+                    } else {
+                        None
+                    }
+                })?;
+                if buf.len() >= header_end + 4 + length {
+                    let body = buf[header_end + 4..header_end + 4 + length].to_vec();
+                    return Some((headers, body));
+                }
+            }
+            None
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let port = listener.local_addr().expect("addr").port();
+        let state = Arc::new(Mutex::new(Gateway {
+            creates: 0,
+            cards: Vec::new(),
+        }));
+        let recorded = Arc::clone(&state);
+        let token = "gw-test-token";
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&done);
+        let server = thread::spawn(move || {
+            while !flag.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut sock, _)) => {
+                        let _ = sock.set_nonblocking(false);
+                        let Some((headers, body)) = read_http(&mut sock) else {
+                            continue;
+                        };
+                        let lower = headers.to_ascii_lowercase();
+                        assert!(
+                            !lower.contains("x-automation-key"),
+                            "gateway call must not send the routine key"
+                        );
+                        let authorized = headers.lines().any(|line| {
+                            line.eq_ignore_ascii_case(&format!("authorization: Bearer {token}"))
+                                || line == format!("Authorization: Bearer {token}")
+                        });
+                        let response = if !authorized {
+                            b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+                        } else if lower.starts_with("post /api/createagentautomation ") {
+                            let request: serde_json::Value =
+                                serde_json::from_slice(&body).expect("create json");
+                            let agent = request["id"].as_str().unwrap_or("").to_string();
+                            let name = request["spec"]["name"].as_str().unwrap_or("").to_string();
+                            let trigger = request["spec"]["trigger"]["type"].as_str().unwrap_or("");
+                            assert_eq!(trigger, "webhook");
+                            assert!(request["spec"]["isEnabled"].as_bool().unwrap_or(false));
+                            assert!(!request["spec"]["prompt"].as_str().unwrap_or("").is_empty());
+                            let mut gate = recorded.lock().expect("gate");
+                            gate.creates += 1;
+                            let slug = automation_slug(&name);
+                            let taken = gate
+                                .cards
+                                .iter()
+                                .any(|card| card.agent == agent && card.id == slug);
+                            let id = if taken { format!("{slug}-2") } else { slug };
+                            let key = if name == "web-null" {
+                                None
+                            } else {
+                                Some(format!("k-{id}"))
+                            };
+                            gate.cards.push(Card {
+                                agent: agent.clone(),
+                                id: id.clone(),
+                                name: name.clone(),
+                                key,
+                            });
+                            let list: Vec<serde_json::Value> = gate
+                                .cards
+                                .iter()
+                                .filter(|card| card.agent == agent)
+                                .map(|card| serde_json::json!({"id": card.id, "name": card.name}))
+                                .collect();
+                            drop(gate);
+                            let payload = serde_json::to_vec(&list).expect("list");
+                            let mut out = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        payload.len()
+                    )
+                    .into_bytes();
+                            out.extend(payload);
+                            out
+                        } else if lower.starts_with("post /api/getautomationwebhookcredential ") {
+                            let request: serde_json::Value =
+                                serde_json::from_slice(&body).expect("cred json");
+                            let agent = request["id"].as_str().unwrap_or("");
+                            let automation = request["automationId"].as_str().unwrap_or("");
+                            let gate = recorded.lock().expect("gate");
+                            let found = gate
+                                .cards
+                                .iter()
+                                .find(|card| card.agent == agent && card.id == automation);
+                            let out = if let Some(card) = found {
+                                let payload = serde_json::to_vec(&serde_json::json!({
+                            "url": format!("https://127.0.0.1/automations/webhook/{}/{}", card.agent, card.id),
+                            "key": card.key,
+                        }))
+                        .expect("cred");
+                                let mut bytes = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            payload.len()
+                        )
+                        .into_bytes();
+                                bytes.extend(payload);
+                                bytes
+                            } else {
+                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+                            };
+                            out
+                        } else {
+                            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+                        };
+                        let _ = sock.write_all(&response);
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!(
+            "m4a-gw-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_millis()
+        ));
+        let sessions = dir.join("sessions");
+        std::fs::create_dir_all(&sessions).expect("dir");
+        let hostbot = r#"{"bot_name":"Hostbot","session_id":"web-hostbot"}"#;
+        let chief = "{\"bot_name\":\"Привет мир\",\"session_id\":\"web-chief\"}";
+        let null_bot = r#"{"bot_name":"web-null","session_id":"web-null"}"#;
+        std::fs::write(sessions.join("hostbot.json"), hostbot).expect("hostbot");
+        std::fs::write(sessions.join("chief.json"), chief).expect("chief");
+        std::fs::write(sessions.join("null.json"), null_bot).expect("null");
+        let gateway = dir.join("gateway-file.json");
+        std::fs::write(
+            &gateway,
+            format!(
+                r#"{{"host":"192.0.2.1","port":{port},"scheme":"http","token":"{token}","pid":1}}"#
+            ),
+        )
+        .expect("gateway");
+        let gateway_path = gateway.display().to_string();
+        let load = |sessions: &std::path::Path| {
+            load_web_sessions(sessions, |key| match key {
+                GATEWAY_FILE_ENV => Some(gateway_path.clone()),
+                _ => None,
+            })
+        };
+        let first = load(&sessions).expect("first open");
+        assert_eq!(first.len(), 3);
+        let hostbot_session = first
+            .iter()
+            .find(|session| session.session_id == "web-hostbot")
+            .expect("hostbot");
+        let chief_session = first
+            .iter()
+            .find(|session| session.session_id == "web-chief")
+            .expect("chief");
+        let null_session = first
+            .iter()
+            .find(|session| session.session_id == "web-null")
+            .expect("null");
+        assert_ne!(
+            hostbot_session.routine_url.as_deref(),
+            chief_session.routine_url.as_deref()
+        );
+        assert!(hostbot_session
+            .routine_url
+            .as_deref()
+            .unwrap_or("")
+            .starts_with("https://"));
+        assert!(chief_session
+            .routine_url
+            .as_deref()
+            .unwrap_or("")
+            .starts_with("https://"));
+        assert!(hostbot_session.routine_bearer.is_some());
+        assert!(chief_session.routine_bearer.is_some());
+        assert_ne!(
+            hostbot_session.routine_bearer.as_deref(),
+            chief_session.routine_bearer.as_deref()
+        );
+        assert!(null_session.routine_url.is_none());
+        assert!(null_session.routine_bearer.is_none());
+        let shown = format!("{hostbot_session:?} {chief_session:?}");
+        assert!(!shown.contains("k-"));
+        assert!(!shown.contains("automations/webhook"));
+        assert!(!shown.contains(token));
+        assert_eq!(
+            std::fs::read_to_string(sessions.join("hostbot.json")).expect("reread"),
+            hostbot
+        );
+        assert_eq!(
+            std::fs::read_to_string(sessions.join("chief.json")).expect("reread"),
+            chief
+        );
+        let creates_after_first = state.lock().expect("state").creates;
+        assert_eq!(creates_after_first, 3);
+        let second = load(&sessions).expect("second open");
+        assert_eq!(state.lock().expect("state").creates, creates_after_first);
+        let again = second
+            .iter()
+            .find(|session| session.session_id == "web-hostbot")
+            .expect("again");
+        assert_eq!(again.routine_url, hostbot_session.routine_url);
+        assert_eq!(again.routine_bearer, hostbot_session.routine_bearer);
+        let missing = dir.join("absent.json");
+        let mut bare = vec![HostSession::new("Hostbot", "web-hostbot")];
+        attach_webhook_routines(&mut bare, &missing, None).expect("absent file");
+        assert!(bare[0].routine_url.is_none());
+        assert!(bare[0].routine_bearer.is_none());
+        done.store(true, Ordering::Relaxed);
+        let _ = server.join();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

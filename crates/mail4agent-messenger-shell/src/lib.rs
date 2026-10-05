@@ -41,10 +41,10 @@
 //! The nick is [`nick_from_display_name`] of that display name. Mail
 //! between sessions this client holds is in process
 //! ([`MachineClient::set_local_delivery`]). A peer that is not in the list
-//! uses the homeserver. Wake is the webhook the host injected as
-//! [`ROUTINE_URL_ENV`] and [`ROUTINE_BEARER_ENV`]. Those are not read from
-//! the session json, not written back, and not logged. This path does not
-//! read [`LEADER_SOCK_ENV`].
+//! uses the homeserver. Wake is one webhook routine per session, created
+//! through the local gateway and kept in memory. The URL and key are not
+//! read from the session json, not written back, and not logged. This path
+//! does not read [`LEADER_SOCK_ENV`].
 //!
 //! A node is [`OpenedStore::connect_node_from_env`]. One CLI session, woken
 //! by ACP on [`LEADER_SOCK_ENV`]. A routine URL or bearer in the environment
@@ -466,10 +466,12 @@ pub fn post_decrypted(url: &str, wake: &DecryptedWake<'_>) -> Result<(), ShellEr
     post_decrypted_with_bearer(url, wake, None)
 }
 
-/// [`post_decrypted`] plus an optional bearer. `bearer` is attached as
-/// `Authorization: Bearer` only when it is `Some` and non-empty. The
-/// value must come from the process environment, not from source. It is
-/// not included in errors.
+/// [`post_decrypted`] plus the routine key. When `bearer` is `Some` and
+/// non-empty, that same value is sent as `Authorization: Bearer` and as
+/// `X-Automation-Key`. `Content-Type` is `application/json`. One JSON body.
+/// One attempt, 8 seconds. A 200 means the routine woke. Anything else is
+/// a failure and is not retried here. The key and the URL are not included
+/// in the error. The value must come from memory, not from source.
 pub fn post_decrypted_with_bearer(
     url: &str,
     wake: &DecryptedWake<'_>,
@@ -478,21 +480,37 @@ pub fn post_decrypted_with_bearer(
     let target = parse_routine_url(url)?;
     let client = routine_client()?;
     let bytes = routine_json(wake)?;
+    let token = bearer.map(str::trim).filter(|token| !token.is_empty());
     let mut builder = client
         .post(target)
         .header(reqwest::header::CONTENT_TYPE, "application/json");
-    if let Some(token) = bearer.filter(|token| !token.is_empty()) {
-        builder = builder.header(reqwest::header::AUTHORIZATION, bearer_header(token)?);
+    if let Some(token) = token {
+        let authorization = bearer_header(token)?;
+        let mut automation_key =
+            reqwest::header::HeaderValue::from_str(token).map_err(|_| ShellError::RoutineBearer)?;
+        automation_key.set_sensitive(true);
+        builder = builder
+            .header(reqwest::header::AUTHORIZATION, authorization)
+            .header("x-automation-key", automation_key);
     }
-    let response = builder
-        .body(bytes)
-        .send()
-        .map_err(|err| ShellError::RoutineTransport(public_reqwest(&err)))?;
+    let response = builder.body(bytes).send().map_err(|err| {
+        ShellError::RoutineTransport(redact_wake(public_reqwest(&err), url, token))
+    })?;
     let status = response.status().as_u16();
-    if !(200..300).contains(&status) {
+    if status != 200 {
         return Err(ShellError::RoutineStatus(status));
     }
     Ok(())
+}
+
+fn redact_wake(mut text: String, url: &str, bearer: Option<&str>) -> String {
+    if !url.is_empty() {
+        text = text.replace(url, "[redacted]");
+    }
+    if let Some(token) = bearer.filter(|token| token.len() >= 4) {
+        text = text.replace(token, "[redacted]");
+    }
+    text
 }
 
 fn routine_json(wake: &DecryptedWake<'_>) -> Result<Vec<u8>, ShellError> {
@@ -534,7 +552,8 @@ fn bearer_header(token: &str) -> Result<reqwest::header::HeaderValue, ShellError
 
 fn routine_client() -> Result<reqwest::blocking::Client, ShellError> {
     reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(8))
+        .redirect(reqwest::redirect::Policy::none())
         .http1_only()
         .build()
         .map_err(|err| ShellError::RoutineTransport(public_reqwest(&err)))
@@ -1849,6 +1868,9 @@ pub enum ShellError {
     /// Node CLI open path saw a routine URL or bearer. The value is not included.
     #[error("node cli does not take a routine url")]
     NodeRoutine,
+    /// The local gateway did not yield a routine. No token, URL, or key.
+    #[error("gateway: {0}")]
+    Gateway(String),
     /// The routine bearer is not a single header value. The value is not included.
     #[error("routine bearer is empty or not a single header value")]
     RoutineBearer,
@@ -2159,7 +2181,7 @@ mod tests {
                     if buf.len() >= header_end + 4 + length {
                         let body = buf[header_end + 4..header_end + 4 + length].to_vec();
                         let _ = sock.write_all(
-                            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                         );
                         return (headers, body);
                     }
@@ -2192,6 +2214,10 @@ mod tests {
         assert!(
             !headers.to_ascii_lowercase().contains("authorization"),
             "routine post must not add a bearer"
+        );
+        assert!(
+            !headers.to_ascii_lowercase().contains("x-automation-key"),
+            "routine post must not add a key without a bearer"
         );
         assert!(!headers.contains("/mail/send"), "{headers}");
         assert_wake_json(
@@ -2635,7 +2661,7 @@ mod tests {
                         if let Some((headers, body)) = read_http(&mut sock) {
                             recorded.lock().expect("hits").push(Hit { headers, body });
                             let _ = sock.write_all(
-                                b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                             );
                         }
                     }
@@ -2705,6 +2731,12 @@ mod tests {
         assert!(
             !hit.headers.to_ascii_lowercase().contains("authorization"),
             "no bearer was passed, so the routine post must not send one"
+        );
+        assert!(
+            !hit.headers
+                .to_ascii_lowercase()
+                .contains("x-automation-key"),
+            "no bearer was passed, so the routine post must not send a key"
         );
         assert!(!hit.headers.contains("/mail/send"));
         assert!(!hit.headers.contains("/admin/listener"));
@@ -2789,9 +2821,8 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut sock, _) = listener.accept().expect("accept");
             let (headers, body) = read_http(&mut sock).expect("request");
-            let _ = sock.write_all(
-                b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            );
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
             (headers, body)
         });
         let bearer = "env-bearer";
@@ -2814,10 +2845,24 @@ mod tests {
         let (name, value) = line.split_once(':').expect("header");
         assert!(name.eq_ignore_ascii_case("authorization"));
         assert_eq!(value.trim(), format!("Bearer {bearer}"));
+        let automation = headers
+            .lines()
+            .find(|line| line.to_ascii_lowercase().starts_with("x-automation-key:"))
+            .expect("automation key header");
+        let (name, value) = automation.split_once(':').expect("header");
+        assert!(name.eq_ignore_ascii_case("x-automation-key"));
+        assert_eq!(value.trim(), bearer);
         assert_eq!(
             headers
                 .lines()
                 .filter(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            headers
+                .lines()
+                .filter(|line| line.to_ascii_lowercase().starts_with("x-automation-key:"))
                 .count(),
             1
         );
@@ -2843,8 +2888,12 @@ mod tests {
                     !headers.to_ascii_lowercase().contains("authorization"),
                     "no bearer was passed"
                 );
+                assert!(
+                    !headers.to_ascii_lowercase().contains("x-automation-key"),
+                    "no bearer was passed"
+                );
                 let _ = sock.write_all(
-                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 );
                 bodies.push(body);
             }
