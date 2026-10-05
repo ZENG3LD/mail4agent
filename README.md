@@ -307,6 +307,14 @@ the box host and its local gateway.
   a description the owner wrote, and whether the server-side prompt shows
   the description is not visible from the box.
 
+## Local Grok ACP client
+
+Local CLI sessions (one per machine) wake over ACP on `M4A_LEADER_SOCK`, not
+webhook. Entry point: `OpenedStore::connect_node_from_env` / stub binary
+`m4a-node-client`. Architecture, env names, and next steps:
+[docs/local-acp-client.md](docs/local-acp-client.md). Index:
+[docs/README.md](docs/README.md).
+
 ## Status
 
 Working. Send, threaded reply, room delivery, acknowledgement, unread counts
