@@ -339,6 +339,34 @@ fn attach_routines_from_env(
     Ok(())
 }
 
+/// Sessions in `found`, minus skipped nicks, with session-id aliases
+/// applied, that no open session holds (by store dir or nick). Each comes
+/// with its nick.
+fn unopened_agent_sessions(
+    found: Vec<HostSession>,
+    skip: &[String],
+    aliases: &[(String, String)],
+    store_root: &Path,
+    held: &[(PathBuf, Option<String>)],
+) -> Vec<(HostSession, String)> {
+    let mut sessions = drop_skipped(found, skip);
+    apply_session_ids(&mut sessions, aliases);
+    sessions
+        .into_iter()
+        .filter_map(|session| {
+            let nick = routine_name_for(&session)?;
+            let dir = crate::session_store_dir(store_root, &session.session_id);
+            let taken = held.iter().any(|(held_dir, held_nick)| {
+                *held_dir == dir
+                    || held_nick
+                        .as_deref()
+                        .is_some_and(|held| held.eq_ignore_ascii_case(&nick))
+            });
+            (!taken).then_some((session, nick))
+        })
+        .collect()
+}
+
 /// Comma-separated `agent_id=session_id` pairs. An agent listed here uses
 /// that mail session id instead of its agent id, for a bot whose session
 /// was registered before agent-id sessions. Machine-specific, so it lives
@@ -1201,7 +1229,21 @@ pub struct MachineClient {
     send_sock: Option<PathBuf>,
     /// Sends waiting for the peer to join the DM.
     send_queue: Vec<PendingSend>,
+    /// Homeserver the sessions registered on; a bot found by
+    /// [`Self::poll_agent_directory`] registers there too.
+    homeserver_url: String,
+    /// [`KEYCHAIN_DIR_ENV`] as read at open.
+    keychain_dir: Option<PathBuf>,
+    /// Next local-bus user row for a session opened after start.
+    bus_next_user: i64,
+    /// Session ids whose late open failed, and when. Retried after
+    /// [`LATE_OPEN_RETRY_SECS`].
+    failed_opens: HashMap<String, std::time::Instant>,
 }
+
+/// How long [`MachineClient::poll_agent_directory`] waits before trying
+/// again to open a newly found bot's session after a failure.
+const LATE_OPEN_RETRY_SECS: u64 = 60;
 
 /// One `m4a-send` request still in progress.
 struct PendingSend {
@@ -1394,6 +1436,10 @@ impl MachineClient {
             send_listener: None,
             send_sock: None,
             send_queue: Vec::new(),
+            homeserver_url: homeserver_url.to_string(),
+            keychain_dir: None,
+            bus_next_user: prepared.len() as i64 + 1,
+            failed_opens: HashMap::new(),
         })
     }
 
@@ -1525,6 +1571,7 @@ impl MachineClient {
             }
         }
         client.store_root = Some(PathBuf::from(&store_root));
+        client.keychain_dir = keychain_dir;
         client.skip_nicks = options.skip_nicks;
         client.profile_note = options.profile_note;
         client.session_ids = options.session_ids;
@@ -1559,6 +1606,7 @@ impl MachineClient {
             }
         }
         self.last_agent_poll = std::time::Instant::now();
+        self.open_new_agent_sessions(&agents_dir);
         let gateway = self
             .gateway_file
             .clone()
@@ -1624,6 +1672,191 @@ impl MachineClient {
             });
         }
         Ok(reports)
+    }
+
+    /// Registers and opens a session for every bot in `agents_dir` that is
+    /// not skipped and has no open session yet, the same way open does:
+    /// nick = slug, sealed store under the store root, device bearer to the
+    /// keychain dir. A failure is logged and retried after
+    /// [`LATE_OPEN_RETRY_SECS`].
+    fn open_new_agent_sessions(&mut self, agents_dir: &Path) {
+        let Some(store_root) = self.store_root.clone() else {
+            return;
+        };
+        let found = match load_agents_dir(agents_dir) {
+            Ok(found) => found,
+            Err(err) => {
+                eprintln!("mail4agent: agent rescan: {err}");
+                return;
+            }
+        };
+        let held: Vec<(PathBuf, Option<String>)> = self
+            .sessions
+            .iter()
+            .map(|store| {
+                (
+                    store.store_dir().to_path_buf(),
+                    store.nick().map(str::to_string),
+                )
+            })
+            .collect();
+        let fresh = unopened_agent_sessions(
+            found,
+            &self.skip_nicks,
+            &self.session_ids,
+            &store_root,
+            &held,
+        );
+        for (session, nick) in fresh {
+            if let Some(failed_at) = self.failed_opens.get(&session.session_id) {
+                if failed_at.elapsed().as_secs() < LATE_OPEN_RETRY_SECS {
+                    continue;
+                }
+            }
+            let session_id = session.session_id.clone();
+            match self.open_late_session(&store_root, session, &nick) {
+                Ok(()) => {
+                    self.failed_opens.remove(&session_id);
+                    println!("mail4agent: session {nick} registered and open");
+                }
+                Err(err) => {
+                    eprintln!("mail4agent: session {nick} not opened: {err}");
+                    self.failed_opens
+                        .insert(session_id, std::time::Instant::now());
+                }
+            }
+        }
+    }
+
+    fn open_late_session(
+        &mut self,
+        store_root: &Path,
+        mut session: HostSession,
+        nick: &str,
+    ) -> Result<(), ShellError> {
+        if session.device_token.is_none() {
+            if let Some(dir) = self.keychain_dir.as_deref() {
+                session.device_token = load_device_bearer(dir, &session.session_id);
+            }
+        }
+        let loaded = session.device_token.clone();
+        if session.routine_url.is_none() || session.routine_bearer.is_none() {
+            if let Some(folder) = crate::nick::routine_folder_id(nick) {
+                if let Some((url, key)) = load_wake(store_root, &session.session_id, &folder) {
+                    session.routine_url = Some(url);
+                    session.routine_bearer = Some(key);
+                }
+            }
+        }
+        let config = SessionConfig::new(
+            &self.homeserver_url,
+            &session.bot_name,
+            &session.session_id,
+            store_root,
+            session.device_token.clone(),
+        )?;
+        let lock = lock_store(&config.store_dir())?;
+        let registered = register_session(&config)?;
+        if let Some(first) = self.sessions.first() {
+            if server_name_of(&registered.user_id)? != server_name_of(first.user_id())? {
+                return Err(ShellError::SessionList(
+                    "sessions disagree on the homeserver name".to_string(),
+                ));
+            }
+        }
+        let item = Prepared {
+            config,
+            user_id: registered.user_id,
+            device_id: registered.device_id,
+            bearer: registered.bearer,
+            routine_url: session.routine_url.clone(),
+            routine_bearer: session.routine_bearer.clone(),
+        };
+        self.bus.seed(self.bus_next_user, &item)?;
+        self.bus_next_user += 1;
+        let mut store = OpenedStore::open(
+            &item.config.store_dir(),
+            item.config.session_id(),
+            item.device_id.clone(),
+            &item.user_id,
+            server_name_of(&item.user_id)?,
+            &item.config.homeserver_url,
+            item.bearer.as_str(),
+        )?;
+        store.set_registered_nick(item.config.nick().to_string());
+        store.attach_bus(Arc::clone(&self.bus));
+        store.set_wake(SessionWake {
+            routine_url: item.routine_url.clone(),
+            routine_bearer: item.routine_bearer.clone(),
+            leader_sock: None,
+            leader_cwd: None,
+        });
+        store.drive(1_000, false)?;
+        store.abandon_inflight_sync(1_000)?;
+        if let Some(dir) = self.keychain_dir.as_deref() {
+            if loaded.as_deref() != Some(store.device_bearer()) {
+                save_device_bearer(dir, &session.session_id, store.device_bearer());
+            }
+        }
+        self.sessions.push(store);
+        self._locks.push(lock);
+        self.refresh_local_peers();
+        let tokens: Vec<String> = self
+            .sessions
+            .iter()
+            .map(|store| store.device_bearer().to_string())
+            .collect();
+        match crate::push::PushLink::open(&self.homeserver_url, tokens) {
+            Ok(push) => {
+                let old = std::mem::replace(&mut self.push, push);
+                for (recipient, event) in old.drain() {
+                    if let Some(store) = self
+                        .sessions
+                        .iter_mut()
+                        .find(|store| store.user_id() == recipient)
+                    {
+                        store.record_push(event);
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!("mail4agent: push socket not reopened for {nick}: {err}");
+            }
+        }
+        if let Some(agent_id) = session.agent_id.clone() {
+            if item.routine_url.is_some() && item.routine_bearer.is_some() {
+                self.ready_agents.insert(agent_id);
+            } else {
+                // Ask the gateway again so the wake lands on this session.
+                self.ready_agents.remove(&agent_id);
+                if !self.pending_wakes.iter().any(|p| p.agent_id == agent_id) {
+                    self.pending_wakes.push(PendingWake {
+                        store_dir: item.config.store_dir(),
+                        agent_id,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Every open session sees every other one as a local peer.
+    fn refresh_local_peers(&mut self) {
+        let peers: Vec<(String, String)> = self
+            .sessions
+            .iter()
+            .filter_map(|store| Some((store.nick()?.to_string(), store.user_id().to_string())))
+            .collect();
+        for store in self.sessions.iter_mut() {
+            let own = store.nick().unwrap_or("").to_string();
+            store.set_local_peers(
+                peers
+                    .iter()
+                    .filter(|(nick, _)| *nick != own)
+                    .cloned()
+                    .collect(),
+            );
+        }
     }
 
     /// Agent ids of open sessions that still have no wake.
@@ -1849,9 +2082,24 @@ impl MachineClient {
             }
         };
         if peer.is_none() {
-            match store.find_nick(to, now_ms) {
-                Ok(found) => *peer = Some(found.user_id),
-                Err(err) => return Some(crate::SendReply::failed(format!("find {to}: {err}"))),
+            // Local peers first, then the homeserver user directory
+            // (find_nick); the directory answer may need another drive.
+            let mut last_err = None;
+            for attempt in 0..3 {
+                if attempt > 0 {
+                    let _ = store.drive(now_ms, false);
+                }
+                match store.find_nick(to, now_ms) {
+                    Ok(found) => {
+                        *peer = Some(found.user_id);
+                        last_err = None;
+                        break;
+                    }
+                    Err(err) => last_err = Some(err),
+                }
+            }
+            if let Some(err) = last_err {
+                return Some(crate::SendReply::failed(format!("find {to}: {err}")));
             }
         }
         if room.is_none() {
@@ -2038,6 +2286,13 @@ impl LocalBus {
             hits: AtomicU64::new(0),
             cursors: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Adds one session opened after start, as [`Self::open`] seeds each.
+    fn seed(&self, user_row: i64, item: &Prepared) -> Result<(), ShellError> {
+        let _gate = self.gate.lock().unwrap_or_else(|err| err.into_inner());
+        let conn = self.state.conn.lock().unwrap_or_else(|err| err.into_inner());
+        seed_session(&conn, user_row, item)
     }
 
     fn set_local_only(&self, enabled: bool) {
@@ -2263,6 +2518,36 @@ fn seed_session(conn: &Connection, user_id: i64, item: &Prepared) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rescan_opens_only_bots_without_a_session() {
+        let root = Path::new("/tmp/m4a-rescan-test");
+        let agent = |name: &str, id: &str| {
+            let mut session = HostSession::new(name, id);
+            session.agent_id = Some(id.to_string());
+            session
+        };
+        let found = vec![
+            agent("hostbot", "a-hatch"),
+            agent("m4a-proba2", "a-proba2"),
+            agent("skipme", "a-skip"),
+            agent("aliased", "a-alias"),
+        ];
+        let held = vec![
+            (crate::session_store_dir(root, "a-hatch"), Some("hostbot".to_string())),
+            (crate::session_store_dir(root, "old-alias"), None),
+        ];
+        let fresh = unopened_agent_sessions(
+            found,
+            &["skipme".to_string()],
+            &[("a-alias".to_string(), "old-alias".to_string())],
+            root,
+            &held,
+        );
+        let nicks: Vec<&str> = fresh.iter().map(|(_, nick)| nick.as_str()).collect();
+        assert_eq!(nicks, vec!["m4a-proba2"]);
+        assert_eq!(fresh[0].0.session_id, "a-proba2");
+    }
 
     #[test]
     fn session_directory_is_name_and_id_only() {
