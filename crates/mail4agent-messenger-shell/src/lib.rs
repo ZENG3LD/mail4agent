@@ -37,12 +37,15 @@
 //! Two open paths, one shell. This is not a second product.
 //!
 //! The web machine client is [`MachineClient::from_env`]. One process
-//! reads [`SESSIONS_DIR_ENV`]: each record is `bot_name` and `session_id`.
-//! The nick is [`nick_from_display_name`] of that display name. Mail
-//! between sessions this client holds is in process
+//! reads [`SESSIONS_DIR_ENV`]: each record is `bot_name`, `session_id`,
+//! and `agent_id` when the session has a Grok Bot agent. The nick is
+//! [`nick_from_display_name`] of that display name. Mail between sessions
+//! this client holds is in process
 //! ([`MachineClient::set_local_delivery`]). A peer that is not in the list
-//! uses the homeserver. Wake is one webhook routine per session, created
-//! through the local gateway and kept in memory. The URL and key are not
+//! uses the homeserver. Wake is one webhook routine per session that has
+//! an `agent_id`, created through the local gateway and kept in memory.
+//! The gateway agent id is that field, not the mail session id. A record
+//! without `agent_id` does not create a routine. The URL and key are not
 //! read from the session json, not written back, and not logged. This path
 //! does not read [`LEADER_SOCK_ENV`].
 //!

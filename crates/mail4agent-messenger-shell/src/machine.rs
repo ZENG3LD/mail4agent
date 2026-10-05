@@ -3,9 +3,11 @@
 //! This is not the homeserver, and it is not the node CLI
 //! ([`crate::OpenedStore::connect_node_from_env`]). The host passes the
 //! list, or this process reads [`SESSIONS_DIR_ENV`]. A record is the bot
-//! display name and the session id. A routine URL or a bearer in the file
-//! is refused. [`MachineClient::from_env`] creates one webhook routine per
-//! session through the local gateway and keeps the URL and key in memory.
+//! display name, the mail session id, and the Grok Bot agent id when this
+//! session has one. A routine URL or a bearer in the file is refused.
+//! [`MachineClient::from_env`] creates one webhook routine per session that
+//! has an agent id, through the local gateway, and keeps the URL and key
+//! in memory. A record with no agent id does not create a routine.
 //! It does not write them back and it does not log them. One URL is not
 //! shared across sessions. [`crate::LEADER_SOCK_ENV`] is not this path.
 //! The node CLI does not create a routine.
@@ -39,9 +41,9 @@ use crate::{
     SessionConfig, SessionWake, ShellError, HOMESERVER_URL_ENV, STORE_ROOT_ENV,
 };
 
-/// Directory of session records. Each `*.json` file is `bot_name` and
-/// `session_id` only. Unset means the host passed the list to
-/// [`MachineClient::open`] instead.
+/// Directory of session records. Each `*.json` file is `bot_name`,
+/// `session_id`, and an optional `agent_id`. Unset means the host passed
+/// the list to [`MachineClient::open`] instead.
 pub const SESSIONS_DIR_ENV: &str = "M4A_SESSIONS_DIR";
 
 /// One bot session the host says lives on this machine.
@@ -51,8 +53,12 @@ pub const SESSIONS_DIR_ENV: &str = "M4A_SESSIONS_DIR";
 pub struct HostSession {
     /// Display name the host already shows (`Hostbot`, `Привет мир`).
     pub bot_name: String,
-    /// Session id the host already assigned.
+    /// Session id the host already assigned. This is the mail session, not
+    /// the Grok Bot agent id.
     pub session_id: String,
+    /// Grok Bot agent id for [`createAgentAutomation`]. Absent means this
+    /// session does not get a webhook routine.
+    pub agent_id: Option<String>,
     /// Routine URL for this session, if the host has one. Not a file.
     pub routine_url: Option<String>,
     /// Bearer for that routine POST. Memory only.
@@ -68,6 +74,7 @@ impl HostSession {
         Self {
             bot_name: bot_name.into(),
             session_id: session_id.into(),
+            agent_id: None,
             routine_url: None,
             routine_bearer: None,
             device_token: None,
@@ -93,6 +100,7 @@ impl std::fmt::Debug for HostSession {
         f.debug_struct("HostSession")
             .field("bot_name", &self.bot_name)
             .field("session_id", &self.session_id)
+            .field("agent_id", &self.agent_id)
             .field("routine_url", &self.routine_url.as_ref().map(|_| "[set]"))
             .field(
                 "routine_bearer",
@@ -111,11 +119,14 @@ impl std::fmt::Debug for HostSession {
 struct SessionFile {
     bot_name: String,
     session_id: String,
+    /// Grok Bot agent id. Missing or blank skips routine creation.
+    #[serde(default)]
+    agent_id: Option<String>,
 }
 
 /// Reads `*.json` session records from `dir`. A file that carries anything
-/// besides `bot_name` and `session_id` is refused, so a webhook URL or a
-/// bearer cannot ride along in a world-readable record.
+/// besides `bot_name`, `session_id`, and `agent_id` is refused, so a
+/// webhook URL or a bearer cannot ride along in a world-readable record.
 pub fn load_session_records(dir: &Path) -> Result<Vec<HostSession>, ShellError> {
     if !dir.is_dir() {
         return Err(ShellError::SessionList(
@@ -143,7 +154,12 @@ pub fn load_session_records(dir: &Path) -> Result<Vec<HostSession>, ShellError> 
             .map_err(|err| ShellError::SessionList(clip_public(err.to_string())))?;
         let file: SessionFile = serde_json::from_str(&text)
             .map_err(|err| ShellError::SessionList(clip_public(err.to_string())))?;
-        out.push(HostSession::new(file.bot_name, file.session_id));
+        let mut session = HostSession::new(file.bot_name, file.session_id);
+        session.agent_id = file
+            .agent_id
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty());
+        out.push(session);
     }
     Ok(out)
 }
@@ -275,6 +291,12 @@ fn attach_webhook_routines(
         if session.routine_url.is_some() && session.routine_bearer.is_some() {
             continue;
         }
+        // createAgentAutomation's id is the Grok Bot agent, not the mail
+        // session id. No agent id means no routine, not a call with the
+        // wrong id.
+        let Some(agent_id) = session.agent_id.clone().filter(|id| !id.is_empty()) else {
+            continue;
+        };
         let name = routine_name_for(session);
         let slug = automation_slug(&name);
         if slug.is_empty() || session.session_id.is_empty() {
@@ -282,7 +304,7 @@ fn attach_webhook_routines(
                 "session has no routine name".to_string(),
             ));
         }
-        match read_webhook_credential(&client, &base, &token, &session.session_id, &slug)? {
+        match read_webhook_credential(&client, &base, &token, &agent_id, &slug)? {
             CredentialRead::Ready { url, key } => {
                 session.routine_url = Some(url);
                 session.routine_bearer = Some(key);
@@ -291,13 +313,13 @@ fn attach_webhook_routines(
             CredentialRead::MintFailed => continue,
             CredentialRead::Missing => {}
         }
-        let cards = create_webhook_routine(&client, &base, &token, &session.session_id, &name)?;
+        let cards = create_webhook_routine(&client, &base, &token, &agent_id, &name)?;
         let Some(card) = pick_created_card(&cards, &name, &slug) else {
             return Err(ShellError::Gateway(
                 "gateway create did not return the routine".to_string(),
             ));
         };
-        match read_webhook_credential(&client, &base, &token, &session.session_id, &card.id)? {
+        match read_webhook_credential(&client, &base, &token, &agent_id, &card.id)? {
             CredentialRead::Ready { url, key } => {
                 session.routine_url = Some(url);
                 session.routine_bearer = Some(key);
@@ -1038,6 +1060,8 @@ mod tests {
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].bot_name, "Привет мир");
         assert_eq!(loaded[1].bot_name, "Hostbot");
+        assert!(loaded[0].agent_id.is_none());
+        assert!(loaded[1].agent_id.is_none());
         assert!(loaded[0].routine_url.is_none());
         assert!(loaded[0].routine_bearer.is_none());
         assert!(loaded[0].device_token.is_none());
@@ -1307,12 +1331,15 @@ mod tests {
         ));
         let sessions = dir.join("sessions");
         std::fs::create_dir_all(&sessions).expect("dir");
-        let hostbot = r#"{"bot_name":"Hostbot","session_id":"web-hostbot"}"#;
-        let chief = "{\"bot_name\":\"Привет мир\",\"session_id\":\"web-chief\"}";
-        let null_bot = r#"{"bot_name":"web-null","session_id":"web-null"}"#;
+        let hostbot =
+            r#"{"bot_name":"Hostbot","session_id":"web-hostbot","agent_id":"agent-hostbot"}"#;
+        let chief = "{\"bot_name\":\"Привет мир\",\"session_id\":\"web-chief\",\"agent_id\":\"agent-chief\"}";
+        let null_bot = r#"{"bot_name":"web-null","session_id":"web-null","agent_id":"agent-null"}"#;
+        let skip = r#"{"bot_name":"Skipper","session_id":"web-skip"}"#;
         std::fs::write(sessions.join("hostbot.json"), hostbot).expect("hostbot");
         std::fs::write(sessions.join("chief.json"), chief).expect("chief");
         std::fs::write(sessions.join("null.json"), null_bot).expect("null");
+        std::fs::write(sessions.join("skip.json"), skip).expect("skip");
         let gateway = dir.join("gateway-file.json");
         std::fs::write(
             &gateway,
@@ -1329,7 +1356,7 @@ mod tests {
             })
         };
         let first = load(&sessions).expect("first open");
-        assert_eq!(first.len(), 3);
+        assert_eq!(first.len(), 4);
         let hostbot_session = first
             .iter()
             .find(|session| session.session_id == "web-hostbot")
@@ -1342,6 +1369,16 @@ mod tests {
             .iter()
             .find(|session| session.session_id == "web-null")
             .expect("null");
+        let skip_session = first
+            .iter()
+            .find(|session| session.session_id == "web-skip")
+            .expect("skip");
+        assert_eq!(hostbot_session.agent_id.as_deref(), Some("agent-hostbot"));
+        assert_eq!(chief_session.agent_id.as_deref(), Some("agent-chief"));
+        assert_ne!(
+            hostbot_session.agent_id.as_deref(),
+            Some(hostbot_session.session_id.as_str())
+        );
         assert_ne!(
             hostbot_session.routine_url.as_deref(),
             chief_session.routine_url.as_deref()
@@ -1364,6 +1401,9 @@ mod tests {
         );
         assert!(null_session.routine_url.is_none());
         assert!(null_session.routine_bearer.is_none());
+        assert!(skip_session.agent_id.is_none());
+        assert!(skip_session.routine_url.is_none());
+        assert!(skip_session.routine_bearer.is_none());
         let shown = format!("{hostbot_session:?} {chief_session:?}");
         assert!(!shown.contains("k-"));
         assert!(!shown.contains("automations/webhook"));
@@ -1376,8 +1416,20 @@ mod tests {
             std::fs::read_to_string(sessions.join("chief.json")).expect("reread"),
             chief
         );
-        let creates_after_first = state.lock().expect("state").creates;
+        let gate = state.lock().expect("state");
+        let creates_after_first = gate.creates;
         assert_eq!(creates_after_first, 3);
+        let agents: Vec<&str> = gate.cards.iter().map(|card| card.agent.as_str()).collect();
+        assert!(agents.contains(&"agent-hostbot"));
+        assert!(agents.contains(&"agent-chief"));
+        assert!(agents.contains(&"agent-null"));
+        assert!(!agents.iter().any(|agent| {
+            *agent == "web-hostbot"
+                || *agent == "web-chief"
+                || *agent == "web-null"
+                || *agent == "web-skip"
+        }));
+        drop(gate);
         let second = load(&sessions).expect("second open");
         assert_eq!(state.lock().expect("state").creates, creates_after_first);
         let again = second
