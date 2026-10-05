@@ -14,6 +14,10 @@
 //! existing drive performs requests against an in-process bus instead of
 //! the homeserver. Turn it off to reach a session that is not in the list.
 //! The bus is called from that drive. It is not a second sync loop.
+//! Room text from the homeserver is not a second sync loop either.
+//! [`MachineClient::open`] opens one socket for every session it
+//! registered. The homeserver pushes an event down that socket. This
+//! process delivers it to that session. It does not POST a routine.
 
 use mail4agent_messenger::{HttpResponseDescriptor, OutgoingRequest, OutgoingRequestKind};
 use mail4agent_server::http::{hash_token, router, Homeserver};
@@ -172,6 +176,7 @@ struct Prepared {
 pub struct MachineClient {
     sessions: Vec<OpenedStore>,
     bus: Arc<LocalBus>,
+    push: crate::push::PushLink,
 }
 
 impl MachineClient {
@@ -266,9 +271,15 @@ impl MachineClient {
             store.abandon_inflight_sync(1_000)?;
             opened.push(store);
         }
+        let tokens: Vec<String> = prepared
+            .iter()
+            .map(|item| item.bearer.as_str().to_string())
+            .collect();
+        let push = crate::push::PushLink::open(&prepared[0].config.homeserver_url, tokens)?;
         Ok(Self {
             sessions: opened,
             bus,
+            push,
         })
     }
 
@@ -355,6 +366,26 @@ impl MachineClient {
             })
             .map(|store| store.store_dir().to_path_buf())
             .ok_or(ShellError::UnknownNick)
+    }
+
+    /// Hands pushed room text to the session named by `recipient`.
+    /// Another session on this client does not receive it. This does not
+    /// start `/sync` and it does not post a routine.
+    pub fn deliver_pushed(&mut self) -> usize {
+        let batch = self.push.drain();
+        let mut delivered = 0;
+        for (recipient, event) in batch {
+            let Some(session) = self
+                .sessions
+                .iter_mut()
+                .find(|store| store.user_id() == recipient)
+            else {
+                continue;
+            };
+            session.record_push(event);
+            delivered += 1;
+        }
+        delivered
     }
 
     /// Whether `name_or_nick` is a session this client holds.

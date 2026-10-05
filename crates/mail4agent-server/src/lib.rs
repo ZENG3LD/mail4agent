@@ -20,6 +20,7 @@ pub mod keys;
 pub mod live;
 pub mod messaging;
 pub mod nick;
+mod push;
 pub mod rooms;
 pub mod store;
 pub mod sync;

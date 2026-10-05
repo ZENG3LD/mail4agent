@@ -27,6 +27,7 @@ mod keys;
 mod messaging;
 mod register;
 mod rooms;
+mod push;
 mod sync;
 
 pub struct Caller {
@@ -40,6 +41,7 @@ pub struct Homeserver {
     pub live: LiveRegistry,
     pub typing: TypingRegistry,
     pub claim_rate: ClaimRateLimiter,
+    pub push: crate::push::PushHub,
 }
 
 impl Homeserver {
@@ -49,6 +51,7 @@ impl Homeserver {
             live: LiveRegistry::new(),
             typing: TypingRegistry::new(),
             claim_rate: ClaimRateLimiter::new(),
+            push: crate::push::PushHub::new(),
         }
     }
 }
@@ -107,6 +110,7 @@ pub fn router(state: Arc<Homeserver>) -> Router {
         .merge(register::routes())
         .merge(keys::routes())
         .merge(sync::routes())
+        .merge(push::routes())
         .fallback(unrecognized)
         .with_state(state)
 }

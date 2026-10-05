@@ -41,7 +41,7 @@ async fn send_event(
     let mxid = caller.mxid;
     let device_id = caller.device_id;
     let state_db = Arc::clone(&state);
-    let (event_id, wake_ids) = tokio::task::spawn_blocking(move || -> Result<(String, HashSet<i64>), MatrixError> {
+    let (event_id, wake_ids, room_text) = tokio::task::spawn_blocking(move || -> Result<(String, HashSet<i64>, Option<crate::push::RoomTextPush>), MatrixError> {
         let mut conn = lock_conn(&state_db);
         let room = store::get_room(&conn, &room_id)?.ok_or_else(|| MatrixError::not_found("no such room"))?;
         let now = chrono::Utc::now().to_rfc3339();
@@ -60,12 +60,29 @@ async fn send_event(
             &now,
             origin_ts,
         )?;
-        Ok((outcome.event.event_id, outcome.wake_ids))
+        let room_text = if outcome.is_new {
+            crate::push::recipients_for_room_text(
+                &conn,
+                &event_type,
+                &content_str,
+                &room_id,
+                user_id,
+                &mxid,
+                &outcome.event.event_id,
+                &outcome.wake_ids,
+            )?
+        } else {
+            None
+        };
+        Ok((outcome.event.event_id, outcome.wake_ids, room_text))
     })
     .await
     .map_err(|_| MatrixError::internal())??;
 
     wake_users(&state, wake_ids);
+    if let Some(room_text) = room_text {
+        state.push.publish_room_text(&room_text);
+    }
     Ok(Json(serde_json::json!({ "event_id": event_id })))
 }
 

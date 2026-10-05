@@ -6,10 +6,12 @@ use std::io::Read;
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use mail4agent_messenger_shell::{
-    load_session_records, session_store_dir, MachineClient, OpenedStore, SessionConfig,
+    load_session_records, session_store_dir, CreateRoomKind, MachineClient, MessageKind,
+    MessengerCommand, OpenedStore, OutgoingMessage, RoomId, SessionConfig,
 };
 
 struct StopServer(Option<Child>);
@@ -470,6 +472,282 @@ fn one_client_local_dm_skips_homeserver_remote_session_uses_it() {
 
     println!(
         "local_hits_before={hits_before_local} local_hits_after={hits_after_local} remote_hits_before={hits_before_remote} remote_hits_after={hits_after_remote} local_event_id={local_event} remote_event_id={remote_event}"
+    );
+
+    if let Some(child) = server.0.as_mut() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    server.0 = None;
+}
+
+fn drive_quiet(shell: &mut OpenedStore, now: &mut i64) {
+    *now += 2_000;
+    shell
+        .drive(*now, false)
+        .unwrap_or_else(|err| panic!("drive: {err}; {}", describe(shell)));
+}
+
+fn stable_hits(client: &MachineClient) -> u64 {
+    let start = Instant::now();
+    let mut last = client.homeserver_hits();
+    let mut since = Instant::now();
+    loop {
+        thread::sleep(Duration::from_millis(40));
+        let hits = client.homeserver_hits();
+        if hits != last {
+            last = hits;
+            since = Instant::now();
+        }
+        if since.elapsed() >= Duration::from_millis(300)
+            && start.elapsed() >= Duration::from_millis(300)
+        {
+            return last;
+        }
+        if start.elapsed() > Duration::from_secs(5) {
+            return client.homeserver_hits();
+        }
+    }
+}
+
+/// Server has a plaintext room event for session B. The one socket this
+/// machine client opened receives it. Session A does not. The client does
+/// not POST.
+#[test]
+fn one_socket_pushes_session_b_and_not_session_a() {
+    let temp = TempDb {
+        dir: PathBuf::from(format!(
+            "/tmp/mail4agent-push-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_millis()
+        )),
+    };
+    std::fs::create_dir_all(&temp.dir).expect("tmpdir");
+    let db = temp.dir.join("messenger.db");
+    let key_hex = random_key_hex();
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+    let port = probe.local_addr().expect("addr").port();
+    drop(probe);
+    let addr = format!("127.0.0.1:{port}");
+    let base = format!("http://{addr}");
+
+    let child = Command::new(server_bin())
+        .args([
+            "--bind",
+            &addr,
+            "--db",
+            db.to_str().expect("utf-8"),
+            "--server-name",
+            "localhost",
+        ])
+        .env("M4A_DB_KEY_HEX", &key_hex)
+        .env_remove("M4A_BOOTSTRAP_PUBLIC_ID")
+        .env_remove("M4A_BOOTSTRAP_NICK")
+        .env_remove("M4A_BOOTSTRAP_TOKEN")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn server");
+    let mut server = StopServer(Some(child));
+    wait_until_accepts(&addr);
+
+    let root = temp.dir.join("stores");
+    std::fs::create_dir_all(&root).expect("store root");
+    let sessions = vec![
+        mail4agent_messenger_shell::HostSession::new("Hostbot", "web-hostbot"),
+        mail4agent_messenger_shell::HostSession::new("Привет мир", "web-chief"),
+    ];
+    let mut client =
+        MachineClient::open(&base, &root, sessions).expect("one client opens one socket");
+    assert!(client.holds("hostbot"));
+    assert!(client.holds("privet_mir"));
+
+    let mut courier = OpenedStore::connect(
+        &SessionConfig::new(&base, "Courier", "web-courier", &root, None).expect("courier config"),
+    )
+    .expect("courier");
+    let mut courier_now = 10_000_i64;
+    for _ in 0..6 {
+        drive_quiet(&mut courier, &mut courier_now);
+    }
+    courier
+        .dispatch(
+            MessengerCommand::CreateRoom {
+                kind: CreateRoomKind::Channel {
+                    name: "push-channel".to_string(),
+                    topic: None,
+                },
+            },
+            courier_now,
+        )
+        .expect("create channel");
+    let mut room_id = None;
+    for _ in 0..8 {
+        drive_quiet(&mut courier, &mut courier_now);
+        courier
+            .drive(courier_now, true)
+            .unwrap_or_else(|err| panic!("catch up: {err}; {}", describe(&courier)));
+        room_id = courier
+            .rooms()
+            .into_iter()
+            .find(|room| room.membership == "join" && !room.encrypted)
+            .map(|room| room.room_id);
+        if room_id.is_some() {
+            break;
+        }
+    }
+    let room_id = room_id.unwrap_or_else(|| panic!("unencrypted channel; {}", describe(&courier)));
+    let mut chief_now = 20_000_i64;
+    client
+        .session_mut("privet_mir")
+        .expect("session b")
+        .dispatch(
+            MessengerCommand::JoinRoom {
+                room_id: RoomId::parse(&room_id).expect("room id"),
+            },
+            chief_now,
+        )
+        .expect("session b joins");
+    let mut joined = false;
+    for _ in 0..8 {
+        chief_now += 2_000;
+        client
+            .session_mut("privet_mir")
+            .expect("session b")
+            .drive(chief_now, true)
+            .unwrap_or_else(|err| panic!("session b sync: {err}"));
+        joined = client
+            .session_mut("privet_mir")
+            .expect("session b")
+            .rooms()
+            .iter()
+            .any(|room| room.room_id == room_id && room.membership == "join");
+        if joined {
+            break;
+        }
+    }
+    assert!(
+        joined,
+        "session b did not join; {}",
+        describe(client.session_mut("privet_mir").expect("b"))
+    );
+
+    let hits = stable_hits(&client);
+    let trace_a = client
+        .session_mut("hostbot")
+        .expect("a")
+        .http_trace()
+        .len();
+    let trace_b = client
+        .session_mut("privet_mir")
+        .expect("b")
+        .http_trace()
+        .len();
+    let sender = courier.user_id().to_string();
+    let body = "push-for-session-b";
+    courier
+        .dispatch(
+            MessengerCommand::SendMessage {
+                room_id: RoomId::parse(&room_id).expect("room"),
+                message: OutgoingMessage {
+                    kind: MessageKind::Text,
+                    body: body.to_string(),
+                    reply_to: None,
+                    edit_of: None,
+                },
+                txn_id: None,
+            },
+            courier_now,
+        )
+        .expect("send");
+    let mut sent = false;
+    for _ in 0..12 {
+        drive_quiet(&mut courier, &mut courier_now);
+        if courier
+            .texts()
+            .iter()
+            .any(|row| row.body == body && row.outcome == "sent")
+        {
+            sent = true;
+            break;
+        }
+    }
+    assert!(
+        sent,
+        "channel send was not accepted; {}",
+        describe(&courier)
+    );
+
+    let start = Instant::now();
+    loop {
+        client.deliver_pushed();
+        let got = client
+            .session_mut("privet_mir")
+            .expect("b")
+            .pushed_room_events()
+            .iter()
+            .any(|event| event.body == body);
+        if got || start.elapsed() > Duration::from_secs(5) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+    let pushed_b: Vec<_> = client
+        .session_mut("privet_mir")
+        .expect("b")
+        .pushed_room_events()
+        .to_vec();
+    let pushed_a: Vec<_> = client
+        .session_mut("hostbot")
+        .expect("a")
+        .pushed_room_events()
+        .to_vec();
+    assert!(
+        pushed_a.is_empty(),
+        "session a received a push: {pushed_a:?}"
+    );
+    assert_eq!(pushed_b.len(), 1, "session b push count: {pushed_b:?}");
+    let event = &pushed_b[0];
+    assert_eq!(event.room, room_id);
+    assert_eq!(event.sender, sender);
+    assert_eq!(event.body, body);
+    assert!(
+        event.event_id.starts_with('$'),
+        "event id {}",
+        event.event_id
+    );
+    assert_eq!(
+        client.homeserver_hits(),
+        hits,
+        "the machine client posted during push"
+    );
+    assert_eq!(
+        client
+            .session_mut("hostbot")
+            .expect("a")
+            .http_trace()
+            .len(),
+        trace_a
+    );
+    assert_eq!(
+        client
+            .session_mut("privet_mir")
+            .expect("b")
+            .http_trace()
+            .len(),
+        trace_b
+    );
+    assert!(
+        client
+            .session_mut("privet_mir")
+            .expect("b")
+            .texts()
+            .iter()
+            .all(|text| text.body != body),
+        "session b learned the text from sync, not from the push"
     );
 
     if let Some(child) = server.0.as_mut() {

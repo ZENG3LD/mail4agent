@@ -55,6 +55,7 @@
 
 mod machine;
 mod nick;
+mod push;
 
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
@@ -79,6 +80,7 @@ pub use mail4agent_messenger::{
     UserId,
 };
 pub use nick::nick_from_display_name;
+pub use push::PushedRoomEvent;
 
 /// SHA-256 of `session_id`'s UTF-8 bytes. That digest is the check that this
 /// session may open the store. The bytes are not written to disk.
@@ -603,6 +605,8 @@ pub struct OpenedStore {
     /// Nick and mxid of the other sessions in that client. Lookup does not
     /// ask the homeserver.
     local_peers: Vec<(String, String)>,
+    /// Room texts pushed on the machine socket for this session. Not `/sync`.
+    pushed_room_events: Vec<PushedRoomEvent>,
 }
 
 struct SyncFlight {
@@ -717,6 +721,7 @@ impl OpenedStore {
             wake_note: None,
             bus: None,
             local_peers: Vec::new(),
+            pushed_room_events: Vec::new(),
         };
         // History already on disk is not a new inbound text.
         opened.note_already_present();
@@ -805,6 +810,15 @@ impl OpenedStore {
     /// calls are not included. Zero when this store has no bus.
     pub fn homeserver_hits(&self) -> u64 {
         self.bus.as_ref().map(|bus| bus.hits()).unwrap_or(0)
+    }
+
+    /// Room texts this session received on the machine push socket.
+    pub fn pushed_room_events(&self) -> &[PushedRoomEvent] {
+        &self.pushed_room_events
+    }
+
+    pub(crate) fn record_push(&mut self, event: PushedRoomEvent) {
+        self.pushed_room_events.push(event);
     }
 
     pub(crate) fn attach_bus(&mut self, bus: Arc<machine::LocalBus>) {
