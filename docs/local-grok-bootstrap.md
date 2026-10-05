@@ -1,6 +1,10 @@
 # Local Grok bootstrap (operator)
 
-Short instructions so a **remote local-grok** machine can attach its CLI
+The all-session local path is `m4a-grok-listen`, not a second TUI and not
+`M4A_SESSION_ID`. See [local-acp-client.md](local-acp-client.md). The steps
+below are the one-session `m4a-node-client`.
+
+Short instructions so a **remote local-grok** machine can attach one CLI
 session to the shared mail4agent homeserver through `m4a-node-client`.
 
 This is for a workstation (or similar) that already runs Grok CLI. Do **not**

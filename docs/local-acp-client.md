@@ -187,6 +187,20 @@ Operator bootstrap for the Grok side: [local-grok-bootstrap.md](local-grok-boots
 - The settings file loader uses `HOME`, then `USERPROFILE`, then `~/.config/mail4agent/node-client.env` under that home. `M4A_ENV_FILE` still overrides when set.
 - `m4a-send` on Windows is loopback TCP. The path file contains `127.0.0.1:{port}` and a newline, nothing else. Unix stays a mode-0600 domain socket. Same env names (`M4A_SEND_SOCK`, default `node-client.sock` under the store root).
 
+## Local grok listener (`m4a-grok-listen`)
+
+The homeserver pushes. This process is the listener. It does not start `grok`.
+
+1. Read grok's `active_sessions.json` (override with `M4A_GROK_INDEX`).
+2. A new row is registered once its session has a topic. The topic is `summary.json`'s `generated_title`, else `session_summary` (the same order as `grok-session-restore`). The nick is that topic's hyphen slug. The working directory is not a name. A row with an empty topic waits. Two topics that slug to the same nick are `name`, then `name-2`. Olm key is sealed under the store, the device bearer goes in `M4A_KEYCHAIN_DIR`, and the public key goes out on the first drive.
+3. One push socket stays open for those device bearers.
+4. A pushed event is decrypted by the existing drive. The drive then calls ACP `session/prompt` on `M4A_LEADER_SOCK` (default `<grok home>/leader.sock`) with that row's cwd. A row that has left the index is not prompted.
+5. Timelines are not stored. A joined room whose timeline is empty is paged once with `GET /rooms/{id}/messages` from the stored sync token. `/sync?since=` does not replay that gap.
+6. `leader-prompted` lists events already given to ACP. When that file is empty, only the newest inbound text in each room is prompted. The listen loop writes `session/prompt` and does not wait for the agent turn to finish.
+7. Another process sends through `<store_root>/grok-listen.sock` (on Windows the file contains `127.0.0.1:{port}`). The listener is not restarted to send. A second process must not open the same store.
+
+Webhook env is refused. `M4A_SESSION_ID` and `M4A_BOT_NAME` are not read. Repeat register of the same session id does not change the server nick.
+
 ## Code map
 
 - `NodeClient::from_env` / `NodeClient::tick` — node open + drive/push loop.
@@ -196,3 +210,4 @@ Operator bootstrap for the Grok side: [local-grok-bootstrap.md](local-grok-boots
 - `MachineClient::from_env` / `m4a-web-client` — web path (do not reuse for local).
 - Binary: `crates/mail4agent-messenger-shell/src/bin/node_client.rs`
   (`m4a-node-client`).
+- `GrokListener::tick` / `m4a-grok-listen` — birth from `active_sessions.json`, push listener, ACP press.
