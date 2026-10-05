@@ -84,9 +84,9 @@ use zeroize::Zeroizing;
 
 pub use machine::{
     ensure_agent_webhook_routines, ensure_agent_webhook_routines_from_env, load_agents_dir,
-    load_session_records, HostSession, MachineClient, RoutineReport, WakeOptions, WakeStatus,
-    AGENTS_DIR_ENV, AGENT_RESCAN_SECS_ENV, DEFAULT_AGENTS_DIR, PROFILE_NOTE_ENV, SESSIONS_DIR_ENV,
-    SKIP_NICKS_ENV, WAKE_KEYCHAIN_FILE,
+    load_session_records, HostSession, MachineClient, RoutineReport, TickReport, WakeOptions,
+    WakeStatus, AGENTS_DIR_ENV, AGENT_RESCAN_SECS_ENV, DEFAULT_AGENTS_DIR, KEYCHAIN_DIR_ENV,
+    PROFILE_NOTE_ENV, SESSIONS_DIR_ENV, SESSION_IDS_ENV, SKIP_NICKS_ENV, WAKE_KEYCHAIN_FILE,
 };
 pub use mail4agent_messenger::{
     CreateRoomKind, DeviceId, MessageKind, MessengerCommand, OutgoingMessage, RoomId, RoomKind,
@@ -170,6 +170,16 @@ fn hex_encode(bytes: &[u8]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+/// One routine POST: the Matrix event id it carried and the HTTP status
+/// (`None` when no response arrived). `200` means the routine woke.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeAttempt {
+    /// Event id of the room text that was posted.
+    pub event_id: String,
+    /// HTTP status of the POST, if one came back.
+    pub status: Option<u16>,
 }
 
 /// One URL per bot, already created. Neighbors are addressed by nick or mxid
@@ -631,6 +641,7 @@ pub struct OpenedStore {
     leader_sent: HashSet<String>,
     /// Last wake failure, clipped. No bearer and no message body.
     wake_note: Option<String>,
+    wake_log: Vec<WakeAttempt>,
     /// In-process bus for sessions this machine's client already holds.
     /// `None` on a store opened by itself: every request goes to the homeserver.
     bus: Option<Arc<machine::LocalBus>>,
@@ -751,6 +762,7 @@ impl OpenedStore {
             routine_sent: HashSet::new(),
             leader_sent: HashSet::new(),
             wake_note: None,
+            wake_log: Vec::new(),
             bus: None,
             local_peers: Vec::new(),
             pushed_room_events: Vec::new(),
@@ -1138,6 +1150,12 @@ impl OpenedStore {
     /// the plaintext are not included.
     pub fn wake_note(&self) -> Option<&str> {
         self.wake_note.as_deref()
+    }
+
+    /// Routine POSTs this store attempted since open, oldest first. Holds
+    /// the event id and the HTTP status only: no URL, key, or body.
+    pub fn wake_log(&self) -> &[WakeAttempt] {
+        &self.wake_log
     }
 
     /// Queues `command` on the engine. It does not perform HTTP; [`Self::drive`]
@@ -1563,8 +1581,20 @@ impl OpenedStore {
                     ) {
                         Ok(()) => {
                             self.routine_sent.insert(item.key.clone());
+                            self.wake_log.push(WakeAttempt {
+                                event_id: item.event_id.clone(),
+                                status: Some(200),
+                            });
                         }
                         Err(err) => {
+                            let status = match &err {
+                                ShellError::RoutineStatus(code) => Some(*code),
+                                _ => None,
+                            };
+                            self.wake_log.push(WakeAttempt {
+                                event_id: item.event_id.clone(),
+                                status,
+                            });
                             self.wake_note = Some(clip_public(err.to_string()));
                         }
                     }
@@ -2001,7 +2031,7 @@ mod tests {
             None,
         )
         .expect("config");
-        assert_eq!(config.nick(), "privet_mir");
+        assert_eq!(config.nick(), "privet-mir");
         assert_eq!(
             config.store_dir(),
             session_store_dir(Path::new("/tmp/m4a-root"), "web-session-1")

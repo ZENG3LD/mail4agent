@@ -167,8 +167,8 @@ fanned out into sessions.
 
 `mail4agent-messenger-shell`'s machine client (`MachineClient::from_env`) is
 one process for every bot on a Grok Bot box. It holds one messenger session
-per bot (the session id is the bot's agent id, the nick is derived from the
-display name), keeps one push socket to the server (`/client/v3/push`), and
+per bot (the session id is the bot's agent id unless `M4A_SESSION_IDS`
+maps it to an existing session, the nick is derived from the display name), keeps one push socket to the server (`/client/v3/push`), and
 turns room text addressed to a bot into a POST to that bot's webhook
 routine. Wake routines work like this; every step below was checked against
 the box host and its local gateway.
@@ -182,7 +182,7 @@ the box host and its local gateway.
   outside `[a-z0-9]` into one `-`, trim leading/trailing `-`, cut to 48.
   The bot's own `UpdateRoutine` and the gateway's `createAgentAutomation`
   use this same rule; a second routine with the same name gets `-2`, `-3`.
-  So the routine named `privet_mir` lives in folder
+  So a routine named `privet_mir` would live in folder
   `privet-mir`. `mail4agent_messenger_shell::routine_folder_id`
   implements it.
 - **Who can create it.** Bots on a box are server-hosted (`temporal`
@@ -199,14 +199,22 @@ the box host and its local gateway.
   host data directory). If no backend routine has that id, the mint fails
   and `key` is `null`. So a disabled local mirror with the same folder id
   as the bot's own routine is enough to obtain that routine's key.
-- **Scheme.** Each bot's wake routine is named by its nick
-  (`nick_from_display_name`: Cyrillic transliterated, lowercase, spaces to
-  `_`, other characters dropped, at most 32), e.g. `hostbot`,
-  `privet_mir`. The client keeps a mirror for every bot in the agents
-  directory: same name, webhook trigger, **disabled**, created through
-  `createAgentAutomation`, and checked to have landed in exactly
-  `routine_folder_id(nick)` (a mirror in any other folder is deleted
-  again). Then it reads the credential. A ready URL and key stay in memory
+- **One string: nick == routine name == folder id.**
+  `nick_from_display_name` transliterates Cyrillic to lowercase Latin
+  (`ь`/`ъ` vanish), then applies the folder rule above: every run of
+  anything outside `[a-z0-9]` becomes one `-`, trimmed, at most 32. So
+  `Привет мир` -> `privet-mir`, `Sample bot` -> `sample-bot`,
+  `foo+bar` -> `foo-bar`, `Hostbot` -> `hostbot`, and
+  `routine_folder_id(nick) == nick`. The server accepts nicks of
+  `[A-Za-z0-9_-]` (1..=32); a server still running the older
+  `[A-Za-z0-9_]` rule rejects hyphen nicks at register with 400 until it
+  is redeployed. Users already registered under the older underscore nicks
+  stay as they are; new sessions register under the hyphen nick.
+- **Scheme.** Each bot's wake routine is named by its nick. The client
+  keeps a mirror for every bot in the agents directory: same name, webhook
+  trigger, **disabled**, created through `createAgentAutomation`, and
+  checked to have landed in exactly the nick as folder id (a mirror in any
+  other folder is deleted again). Then it reads the credential. A ready URL and key stay in memory
   and in the session's keychain file (`routine-wake.json`, mode 0600, in the
   session's sealed directory under `M4A_STORE_ROOT`), never in git and never
   in logs. A `null` key means the bot has not created its own routine yet:
@@ -214,13 +222,32 @@ the box host and its local gateway.
   another routine. `M4A_SKIP_NICKS` (comma-separated) lists bots the client
   leaves alone. `m4a-ensure-agent-webhooks` runs the same pass once and
   prints `nick<TAB>folder<TAB>status`.
+- **Sessions and bearers.** `M4A_SESSION_IDS` (`agent_id=session_id`,
+  comma-separated) reuses an existing session for a bot instead of its
+  agent id, e.g. a session registered before this client. The server
+  returns a device bearer only on the register call that creates the
+  device; with `M4A_KEYCHAIN_DIR` set the client reads each session's
+  bearer from `<dir>/<session hash>/device-bearer` and stores a newly
+  minted one there (mode 0600, directory 0700). The keychain directory is
+  separate from `M4A_STORE_ROOT`: no bearer is written next to sealed
+  records.
+- **Running it.** `m4a-web-client` opens every session (`from_env`), then
+  loops `MachineClient::tick`: pushed events are handed to their session,
+  which syncs, decrypts, and POSTs the wake; every `M4A_DRIVE_SECS`
+  (default 15) all sessions are driven once, which joins DM invites and
+  catches up a missed push. It prints `push`, `joined`, and
+  `wake <nick> event=<id> status=<http>` lines only. `M4A_RUN_SECS` makes it
+  exit after that many seconds. `examples/wake_test_sender.rs` registers a
+  throwaway session (`waketestsender`), opens an encrypted DM with
+  `M4A_TEST_TARGET` (default `hostbot`), waits for the join, and sends one
+  text.
 - **Bootstrap.** The bot still has to create its routine once. The only
   box-side channel into a server-hosted bot's own context, short of
   messaging it, is its profile: `updateAgent` on the gateway writes the
   local profile and the host pushes the edit to the server copy. With
   `M4A_BOOTSTRAP_PROFILE_NOTE=1` the client appends a marked note to the
   description of each bot that has no key yet, asking it to keep one
-  webhook routine named by its nick. It is off by default because it edits
+  webhook routine named by its nick (which is also its folder id). It is off by default because it edits
   a description the owner wrote, and whether the server-side prompt shows
   the description is not visible from the box.
 

@@ -157,7 +157,7 @@ fn two_web_sessions_register_and_one_finds_the_other_by_nick() {
     let chief_cfg = SessionConfig::new(&base, "Привет мир", "web-chief", &root, None)
         .expect("chief config");
     assert_eq!(hostbot_cfg.nick(), "hostbot");
-    assert_eq!(chief_cfg.nick(), "privet_mir");
+    assert_eq!(chief_cfg.nick(), "privet-mir");
     assert_ne!(chief_cfg.nick(), "nachshtab");
     let hostbot_dir = hostbot_cfg.store_dir();
     let chief_dir = chief_cfg.store_dir();
@@ -168,7 +168,7 @@ fn two_web_sessions_register_and_one_finds_the_other_by_nick() {
     let mut hostbot = connect_web(&base, "Hostbot", "web-hostbot", &root);
     let mut chief = connect_web(&base, "Привет мир", "web-chief", &root);
     assert_eq!(hostbot.nick(), Some("hostbot"));
-    assert_eq!(chief.nick(), Some("privet_mir"));
+    assert_eq!(chief.nick(), Some("privet-mir"));
     assert!(
         bearer_is_absent(&hostbot_dir, hostbot.device_bearer()),
         "hostbot bearer was written under the store"
@@ -181,8 +181,8 @@ fn two_web_sessions_register_and_one_finds_the_other_by_nick() {
     let found = hostbot
         .find_nick("Привет мир", 3_000)
         .expect("hostbot finds the chief by display name");
-    assert_eq!(found.nick, "privet_mir");
-    assert_eq!(found.user_id, "@privet_mir:localhost");
+    assert_eq!(found.nick, "privet-mir");
+    assert_eq!(found.user_id, "@privet-mir:localhost");
     let found = chief
         .find_nick("hostbot", 4_000)
         .expect("chief finds hostbot by nick");
@@ -225,9 +225,9 @@ fn two_web_sessions_register_and_one_finds_the_other_by_nick() {
     .expect("same session reopens");
     assert_eq!(hostbot.nick(), Some("hostbot"));
     let found = hostbot
-        .find_nick("privet_mir", 5_000)
+        .find_nick("privet-mir", 5_000)
         .expect("reopened session still finds the chief by nick");
-    assert_eq!(found.user_id, "@privet_mir:localhost");
+    assert_eq!(found.user_id, "@privet-mir:localhost");
     assert!(bearer_is_absent(&hostbot_dir, hostbot.device_bearer()));
 
     if let Some(child) = server.0.as_mut() {

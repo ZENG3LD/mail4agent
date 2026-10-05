@@ -5,7 +5,8 @@
 //! live agents directory ([`AGENTS_DIR_ENV`], or
 //! [`DEFAULT_AGENTS_DIR`] when that folder exists): each child folder is a
 //! Grok Bot agent id and `profile.json` carries the display name. The mail
-//! session id is that agent id. The host may still pass a list, or this
+//! session id is that agent id, unless [`SESSION_IDS_ENV`] maps the agent
+//! to an existing session id. The host may still pass a list, or this
 //! process may read [`SESSIONS_DIR_ENV`] when no agents directory is
 //! present. A session record is the bot display name, the mail session id,
 //! and the Grok Bot agent id when this session has one. A routine URL or a
@@ -13,9 +14,12 @@
 //!
 //! Wake routines. Every bot here is server-hosted, so only the bot itself
 //! can put a routine on the backend, with its own `UpdateRoutine`. The
-//! routine is named by the bot's nick and so lives in folder
-//! [`crate::routine_folder_id`] of that nick (`privet_mir` ->
-//! `privet-mir`). Its backend id is
+//! bot's nick, the routine's name, and its folder id are one string
+//! (`privet-mir`): the nick already follows the host slug rule, so
+//! [`crate::routine_folder_id`] leaves it unchanged. A homeserver that
+//! still enforces the older `[A-Za-z0-9_]` nick rule refuses such a nick
+//! at register (400) until it is redeployed; users already registered under
+//! underscore nicks are left as they are. Its backend id is
 //! `stableAutomationId(agentId, folderId)`. The local gateway hands out a
 //! webhook key only for a routine it finds locally, and mints it for that
 //! same id, so [`MachineClient::from_env`] keeps a disabled local mirror
@@ -42,6 +46,13 @@
 //! registered. The homeserver pushes an event down that socket. This
 //! process delivers it to that session. A routine POST is the later
 //! drive, and only for a session that has its own webhook.
+//! [`MachineClient::tick`] is that loop step; the `m4a-web-client` binary
+//! runs it.
+//!
+//! Device bearers. The homeserver returns one only when register creates
+//! the device. With [`KEYCHAIN_DIR_ENV`] set, [`MachineClient::from_env`]
+//! reads and stores each session's bearer in that directory (0600), which
+//! is kept apart from the sealed stores. Unset, bearers stay in memory.
 
 use mail4agent_messenger::{HttpResponseDescriptor, OutgoingRequest, OutgoingRequestKind};
 use mail4agent_server::http::{hash_token, router, Homeserver};
@@ -302,6 +313,10 @@ fn load_web_agents(
 ) -> Result<Vec<HostSession>, ShellError> {
     let sessions = load_agents_dir(dir)?;
     let mut sessions = drop_skipped(sessions, &skip_nicks(&mut get));
+    apply_session_ids(
+        &mut sessions,
+        &parse_session_ids(get(SESSION_IDS_ENV).as_deref().unwrap_or("")),
+    );
     attach_routines_from_env(&mut sessions, &mut get)?;
     Ok(sessions)
 }
@@ -322,6 +337,34 @@ fn attach_routines_from_env(
         store_root.as_deref(),
     )?;
     Ok(())
+}
+
+/// Comma-separated `agent_id=session_id` pairs. An agent listed here uses
+/// that mail session id instead of its agent id, for a bot whose session
+/// was registered before agent-id sessions. Machine-specific, so it lives
+/// in the environment.
+pub const SESSION_IDS_ENV: &str = "M4A_SESSION_IDS";
+
+fn parse_session_ids(raw: &str) -> Vec<(String, String)> {
+    raw.split(',')
+        .filter_map(|pair| {
+            let (agent, session) = pair.split_once('=')?;
+            let (agent, session) = (agent.trim(), session.trim());
+            (!agent.is_empty() && !session.is_empty())
+                .then(|| (agent.to_string(), session.to_string()))
+        })
+        .collect()
+}
+
+fn apply_session_ids(sessions: &mut [HostSession], aliases: &[(String, String)]) {
+    for session in sessions.iter_mut() {
+        let Some(agent_id) = session.agent_id.as_deref() else {
+            continue;
+        };
+        if let Some((_, alias)) = aliases.iter().find(|(agent, _)| agent == agent_id) {
+            session.session_id = alias.clone();
+        }
+    }
 }
 
 /// Comma-separated nicks this client leaves alone: no session, no mirror,
@@ -372,9 +415,10 @@ pub enum WakeStatus {
 pub struct RoutineReport {
     /// Grok Bot agent id.
     pub agent_id: String,
-    /// Bot nick, which is also the routine name.
+    /// Bot nick.
     pub nick: String,
-    /// Routine folder id: [`crate::routine_folder_id`] of the nick.
+    /// Routine name and folder id: [`crate::routine_folder_id`] of the
+    /// nick, which equals the nick.
     pub folder_id: String,
     /// Outcome.
     pub status: WakeStatus,
@@ -391,6 +435,8 @@ pub struct WakeOptions {
     /// Write the bootstrap note into the profile description of a bot that
     /// has no routine yet ([`PROFILE_NOTE_ENV`]). Off unless asked for.
     pub profile_note: bool,
+    /// `agent_id -> session_id` overrides ([`SESSION_IDS_ENV`]).
+    pub session_ids: Vec<(String, String)>,
 }
 
 impl WakeOptions {
@@ -400,6 +446,7 @@ impl WakeOptions {
             skip_nicks: skip_nicks(&mut get),
             store_root: get(STORE_ROOT_ENV).map(PathBuf::from),
             profile_note: get(PROFILE_NOTE_ENV).as_deref() == Some("1"),
+            session_ids: parse_session_ids(get(SESSION_IDS_ENV).as_deref().unwrap_or("")),
         }
     }
 }
@@ -418,7 +465,8 @@ pub fn ensure_agent_webhook_routines(
     options: &WakeOptions,
 ) -> Result<Vec<RoutineReport>, ShellError> {
     let store_root = options.store_root.as_deref();
-    let sessions = drop_skipped(load_agents_dir(agents_dir)?, &options.skip_nicks);
+    let mut sessions = drop_skipped(load_agents_dir(agents_dir)?, &options.skip_nicks);
+    apply_session_ids(&mut sessions, &options.session_ids);
     let Some(gate) = open_gateway(gateway_file, token_override)? else {
         return Err(ShellError::Gateway("gateway file is missing".to_string()));
     };
@@ -465,8 +513,8 @@ pub fn ensure_agent_webhook_routines_from_env() -> Result<Vec<RoutineReport>, Sh
 /// Set to `1` to write the bootstrap note into the profile description of
 /// each bot that has no routine yet, through the gateway's `updateAgent`
 /// (the host pushes profile edits to the server copy of the bot). The note
-/// asks the bot to create its own routine named by its nick on its next
-/// turn. Off by default: it edits a description the owner wrote.
+/// asks the bot to create its own routine named
+/// [`crate::routine_folder_id`] of its nick on its next turn. Off by default: it edits a description the owner wrote.
 pub const PROFILE_NOTE_ENV: &str = "M4A_BOOTSTRAP_PROFILE_NOTE";
 
 const NOTE_OPEN: &str = "<!-- mail4agent:wake -->";
@@ -474,18 +522,19 @@ const NOTE_CLOSE: &str = "<!-- /mail4agent:wake -->";
 /// Host limit on a profile description.
 const DESCRIPTION_MAX: usize = 20_000;
 
-/// The bootstrap note for `nick`. No host name, no key, no agent id.
-fn wake_note(nick: &str) -> String {
+/// The bootstrap note for routine name `routine` (already hyphenated). No
+/// host name, no key, no agent id.
+fn wake_note(routine: &str) -> String {
     format!(
-        "{NOTE_OPEN}\nmail4agent wake: keep exactly one routine named \"{nick}\" with a webhook trigger, enabled. If it is missing, create it with UpdateRoutine: name \"{nick}\", trigger webhook, prompt \"A mail4agent room message woke this routine. The webhook JSON has body, from, event_id, and nick. Read that message.\" Do not rename it and do not create a second one.\n{NOTE_CLOSE}"
+        "{NOTE_OPEN}\nmail4agent wake: keep exactly one routine named \"{routine}\" with a webhook trigger, enabled. If it is missing, create it with UpdateRoutine: name \"{routine}\", trigger webhook, prompt \"A mail4agent room message woke this routine. The webhook JSON has body, from, event_id, and nick. Read that message.\" Do not rename it and do not create a second one.\n{NOTE_CLOSE}"
     )
 }
 
-/// `description` with the note for `nick` in place: an older note block is
+/// `description` with the note for `routine` in place: an older note block is
 /// replaced, otherwise the note is appended after a blank line. `None`
 /// when the description already carries exactly this note.
-fn with_wake_note(description: &str, nick: &str) -> Option<String> {
-    let note = wake_note(nick);
+fn with_wake_note(description: &str, routine: &str) -> Option<String> {
+    let note = wake_note(routine);
     if description.contains(&note) {
         return None;
     }
@@ -531,7 +580,9 @@ fn ensure_profile_note(
     let Some(name) = field("name").filter(|name| !name.trim().is_empty()) else {
         return Err(ShellError::Gateway("profile has no name".to_string()));
     };
-    let Some(description) = with_wake_note(field("description").unwrap_or(""), nick) else {
+    let routine = crate::nick::routine_folder_id(nick)
+        .ok_or_else(|| ShellError::Gateway("nick has no routine name".to_string()))?;
+    let Some(description) = with_wake_note(field("description").unwrap_or(""), &routine) else {
         return Ok(false);
     };
     if description.chars().count() > DESCRIPTION_MAX {
@@ -630,10 +681,10 @@ struct StoredWake {
     key: String,
 }
 
-/// Routine name for a bot: its nick ([`crate::nick_from_display_name`] of
-/// the display name, so `Hostbot` -> `hostbot`, `Привет мир` ->
-/// `privet_mir`). The bot names its own routine the same way, and
-/// the folder id follows from the name. `None` when no nick derives.
+/// The bot's nick ([`crate::nick_from_display_name`] of the display name,
+/// so `Hostbot` -> `hostbot`, `Привет мир` -> `privet-mir`).
+/// The routine name and folder are the same string.
+/// `None` when no nick derives.
 fn routine_name_for(session: &HostSession) -> Option<String> {
     crate::nick::nick_from_display_name(session.bot_name.trim()).ok()
 }
@@ -736,15 +787,14 @@ fn ensure_wake(gate: &GatewayConn, agent_id: &str, nick: &str) -> WakeOutcome {
         }
         Some(_) => {}
         None => {
-            let after = match create_mirror_routine(gate, agent_id, nick) {
+            let after = match create_mirror_routine(gate, agent_id, &folder) {
                 Ok(cards) => cards,
                 Err(err) => return WakeOutcome::Failed(err.to_string()),
             };
             if !after.iter().any(|card| card.id == folder) {
-                for stray in after
-                    .iter()
-                    .filter(|card| card.name == nick && !before.iter().any(|old| old.id == card.id))
-                {
+                for stray in after.iter().filter(|card| {
+                    card.name == folder && !before.iter().any(|old| old.id == card.id)
+                }) {
                     let _ = delete_agent_automation(gate, agent_id, &stray.id);
                 }
                 return WakeOutcome::Failed(
@@ -820,6 +870,71 @@ fn attach_webhook_routines(
     Ok(())
 }
 
+/// Keychain directory for device bearers, kept apart from the sealed
+/// stores (a bearer is never written next to sealed records). The
+/// homeserver returns a device bearer only once, on the call that creates
+/// the device; with this set, [`MachineClient::from_env`] reads each
+/// session's bearer from `<dir>/<session hash>/device-bearer` (mode 0600)
+/// and writes a newly minted one there. Unset: bearers stay in memory and
+/// the host injects them. Never logged.
+pub const KEYCHAIN_DIR_ENV: &str = "M4A_KEYCHAIN_DIR";
+
+/// File name of one session's device bearer under [`KEYCHAIN_DIR_ENV`].
+pub const DEVICE_KEYCHAIN_FILE: &str = "device-bearer";
+
+/// Writes `bytes` to `path` atomically, file 0600, parent created 0700.
+fn write_secret_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("no parent"))?;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("secret");
+    let tmp = dir.join(format!("{name}.tmp"));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp)?;
+    std::io::Write::write_all(&mut file, bytes)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, path)
+}
+
+fn device_bearer_path(keychain_dir: &Path, session_id: &str) -> PathBuf {
+    crate::session_store_dir(keychain_dir, session_id).join(DEVICE_KEYCHAIN_FILE)
+}
+
+fn load_device_bearer(keychain_dir: &Path, session_id: &str) -> Option<String> {
+    let text = std::fs::read_to_string(device_bearer_path(keychain_dir, session_id)).ok()?;
+    let token = text.trim().to_string();
+    (!token.is_empty()).then_some(token)
+}
+
+fn save_device_bearer(keychain_dir: &Path, session_id: &str, token: &str) {
+    if write_secret_file(
+        &device_bearer_path(keychain_dir, session_id),
+        token.as_bytes(),
+    )
+    .is_err()
+    {
+        eprintln!("mail4agent: device keychain write failed for one session");
+    }
+}
+
 fn keychain_path(store_root: &Path, session_id: &str) -> PathBuf {
     crate::session_store_dir(store_root, session_id).join(WAKE_KEYCHAIN_FILE)
 }
@@ -827,30 +942,14 @@ fn keychain_path(store_root: &Path, session_id: &str) -> PathBuf {
 /// Writes the wake atomically with mode 0600. A failure is logged without
 /// the values and does not stop the client: the gateway still has the key.
 fn save_wake(store_root: &Path, session_id: &str, folder_id: &str, url: &str, key: &str) {
-    let path = keychain_path(store_root, session_id);
     let stored = StoredWake {
         folder_id: folder_id.to_string(),
         url: url.to_string(),
         key: key.to_string(),
     };
-    let result = (|| -> std::io::Result<()> {
-        let dir = path.parent().unwrap_or(store_root);
-        std::fs::create_dir_all(dir)?;
-        let tmp = dir.join(format!("{WAKE_KEYCHAIN_FILE}.tmp"));
-        let bytes = serde_json::to_vec(&stored).map_err(std::io::Error::other)?;
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&tmp)?;
-        std::io::Write::write_all(&mut file, &bytes)?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&tmp, &path)
-    })();
+    let result = serde_json::to_vec(&stored)
+        .map_err(std::io::Error::other)
+        .and_then(|bytes| write_secret_file(&keychain_path(store_root, session_id), &bytes));
     if result.is_err() {
         eprintln!("mail4agent: wake keychain write failed for folder {folder_id}");
     }
@@ -983,10 +1082,11 @@ fn credential_is_missing(status: u16, body: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
+/// `routine` is the routine name, equal to its folder id.
 fn create_mirror_routine(
     gate: &GatewayConn,
     agent_id: &str,
-    nick: &str,
+    routine: &str,
 ) -> Result<Vec<AutomationCard>, ShellError> {
     let (status, body) = gateway_post(
         gate,
@@ -994,7 +1094,7 @@ fn create_mirror_routine(
         &serde_json::json!({
             "id": agent_id,
             "spec": {
-                "name": nick,
+                "name": routine,
                 "prompt": MIRROR_ROUTINE_PROMPT,
                 "trigger": { "type": "webhook" },
                 "isEnabled": false,
@@ -1057,11 +1157,27 @@ pub struct MachineClient {
     skip_nicks: Vec<String>,
     /// [`PROFILE_NOTE_ENV`] as read at open.
     profile_note: bool,
+    /// [`SESSION_IDS_ENV`] as read at open.
+    session_ids: Vec<(String, String)>,
+    /// When every session was last driven without a push.
+    last_full_drive: std::time::Instant,
     /// Open sessions whose bot has no key yet. Retried on each poll.
     pending_wakes: Vec<PendingWake>,
     /// Agent ids whose wake is already set on an open session or reported
     /// ready. Not asked again.
     ready_agents: HashSet<String>,
+}
+
+/// What one [`MachineClient::tick`] did. Nicks, event ids, room ids, and
+/// error texts only.
+#[derive(Debug, Default)]
+pub struct TickReport {
+    /// (nick, event id) for each event the push socket delivered.
+    pub pushed: Vec<(String, String)>,
+    /// (nick, room id) for each DM invite joined.
+    pub joined: Vec<(String, String)>,
+    /// (nick, error) for each session whose drive failed.
+    pub errors: Vec<(String, String)>,
 }
 
 /// An open session still waiting for its bot's own routine.
@@ -1179,6 +1295,8 @@ impl MachineClient {
             store_root: None,
             skip_nicks: Vec::new(),
             profile_note: false,
+            session_ids: Vec::new(),
+            last_full_drive: std::time::Instant::now(),
             pending_wakes: Vec::new(),
             ready_agents: HashSet::new(),
         })
@@ -1256,10 +1374,37 @@ impl MachineClient {
             }
         }
         let options = WakeOptions::from_lookup(&mut get);
+        let keychain_dir = get(KEYCHAIN_DIR_ENV).map(PathBuf::from);
+        let mut sessions = sessions;
+        let mut loaded_bearers = Vec::new();
+        if let Some(dir) = keychain_dir.as_deref() {
+            for session in sessions.iter_mut() {
+                if session.device_token.is_none() {
+                    session.device_token = load_device_bearer(dir, &session.session_id);
+                }
+                loaded_bearers.push((
+                    crate::session_store_dir(Path::new(&store_root), &session.session_id),
+                    session.session_id.clone(),
+                    session.device_token.clone(),
+                ));
+            }
+        }
         let mut client = Self::open(&homeserver_url, Path::new(&store_root), sessions)?;
+        if let Some(dir) = keychain_dir.as_deref() {
+            for (store_dir, session_id, loaded) in &loaded_bearers {
+                let Some(store) = client.sessions.iter().find(|s| s.store_dir() == store_dir)
+                else {
+                    continue;
+                };
+                if loaded.as_deref() != Some(store.device_bearer()) {
+                    save_device_bearer(dir, session_id, store.device_bearer());
+                }
+            }
+        }
         client.store_root = Some(PathBuf::from(&store_root));
         client.skip_nicks = options.skip_nicks;
         client.profile_note = options.profile_note;
+        client.session_ids = options.session_ids;
         client.pending_wakes = pending_wakes;
         client.ready_agents = ready_agents;
         client.agents_dir = agents_dir;
@@ -1298,7 +1443,8 @@ impl MachineClient {
         let Some(gate) = open_gateway(&gateway, self.gateway_token.as_deref())? else {
             return Ok(Vec::new());
         };
-        let sessions = drop_skipped(load_agents_dir(&agents_dir)?, &self.skip_nicks);
+        let mut sessions = drop_skipped(load_agents_dir(&agents_dir)?, &self.skip_nicks);
+        apply_session_ids(&mut sessions, &self.session_ids);
         let mut reports = Vec::new();
         for session in &sessions {
             let Some(agent_id) = session.agent_id.clone() else {
@@ -1431,6 +1577,76 @@ impl MachineClient {
             delivered += 1;
         }
         delivered
+    }
+
+    /// One step of the long-running client loop.
+    ///
+    /// Drains the push socket and hands each pushed event to its session,
+    /// then drives exactly those sessions (waiting for the `/sync` the push
+    /// announced), which decrypts the text and POSTs the wake to that
+    /// session's own routine. Every `full_drive_secs` it also drives every
+    /// session once, which is how DM invites get joined
+    /// ([`OpenedStore::accept_direct_invites`]) and how a missed push is
+    /// caught up. Errors are returned per session, without secrets.
+    pub fn tick(&mut self, now_ms: i64, full_drive_secs: u64) -> TickReport {
+        let mut report = TickReport::default();
+        let mut due: Vec<usize> = Vec::new();
+        for (recipient, event) in self.push.drain() {
+            let Some(index) = self
+                .sessions
+                .iter()
+                .position(|store| store.user_id() == recipient)
+            else {
+                continue;
+            };
+            let nick = self.sessions[index].nick().unwrap_or("").to_string();
+            report.pushed.push((nick, event.event_id.clone()));
+            self.sessions[index].record_push(event);
+            if !due.contains(&index) {
+                due.push(index);
+            }
+        }
+        let full = self.last_full_drive.elapsed().as_secs() >= full_drive_secs;
+        if full {
+            self.last_full_drive = std::time::Instant::now();
+        }
+        for index in 0..self.sessions.len() {
+            let pushed = due.contains(&index);
+            if !pushed && !full {
+                continue;
+            }
+            let store = &mut self.sessions[index];
+            let nick = store.nick().unwrap_or("").to_string();
+            if let Err(err) = store.drive(now_ms, pushed) {
+                report.errors.push((nick.clone(), err.to_string()));
+                continue;
+            }
+            match store.accept_direct_invites(now_ms) {
+                Ok(joined) => {
+                    for room in joined {
+                        report.joined.push((nick.clone(), room));
+                    }
+                }
+                Err(err) => report.errors.push((nick, err.to_string())),
+            }
+        }
+        report
+    }
+
+    /// Every routine POST attempted by every session, as (nick, attempt).
+    /// Event ids and HTTP statuses only.
+    pub fn wake_log(&self) -> Vec<(String, crate::WakeAttempt)> {
+        self.sessions
+            .iter()
+            .flat_map(|store| {
+                let nick = store.nick().unwrap_or("").to_string();
+                store
+                    .wake_log()
+                    .iter()
+                    .cloned()
+                    .map(move |attempt| (nick.clone(), attempt))
+            })
+            .collect()
     }
 
     /// Whether `name_or_nick` is a session this client holds.
@@ -2097,12 +2313,13 @@ mod tests {
             format!(r#"{{"host":"192.0.2.1","port":{port},"scheme":"http","token":"{token}"}}"#),
         )
         .expect("gateway");
-        let skip = parse_skip_nicks(" svoi_brauzer , ");
-        assert_eq!(skip, vec!["svoi_brauzer".to_string()]);
+        let skip = parse_skip_nicks(" svoi-brauzer , ");
+        assert_eq!(skip, vec!["svoi-brauzer".to_string()]);
         let options = WakeOptions {
             skip_nicks: skip.clone(),
             store_root: Some(store_root.clone()),
             profile_note: false,
+            session_ids: Vec::new(),
         };
 
         let status_of = |reports: &[RoutineReport], agent: &str| {
@@ -2131,14 +2348,14 @@ mod tests {
             .iter()
             .find(|r| r.agent_id == "agent-c")
             .expect("chief");
-        assert_eq!(chief.nick, "privet_mir");
+        assert_eq!(chief.nick, "privet-mir");
         assert_eq!(chief.folder_id, "privet-mir");
         let shown = format!("{first:?}");
         assert!(!shown.contains("key-"));
         assert!(!shown.contains("automations/webhook"));
         {
             let gate = state.lock().expect("gate");
-            // hostbot, privet_mir, clash_bot. Not the skipped bot,
+            // hostbot, privet-mir, clash-bot. Not the skipped bot,
             // not the folder that already holds a cron routine.
             assert_eq!(gate.creates, 3);
             assert_eq!(gate.deletes, 1);
@@ -2160,6 +2377,14 @@ mod tests {
                 (mirror.id.as_str(), mirror.name.as_str()),
                 ("hostbot", "hostbot")
             );
+            let chief_mirror = gate
+                .cards
+                .iter()
+                .find(|card| card.agent == "agent-c")
+                .expect("chief mirror");
+            // Nick == routine name == folder id, all with hyphens.
+            assert_eq!(chief_mirror.name, "privet-mir");
+            assert_eq!(chief_mirror.id, "privet-mir");
             assert!(!mirror.enabled);
         }
         // Keychain: only the ready bot, mode 0600, its folder recorded.
@@ -2208,7 +2433,7 @@ mod tests {
             assert_eq!(profile["name"], "Привет мир");
             let description = profile["description"].as_str().unwrap_or("");
             assert!(description.starts_with("about the chief"));
-            assert!(description.contains("routine named \"privet_mir\""));
+            assert!(description.contains("routine named \"privet-mir\""));
             assert!(!description.contains("http"));
         }
         state.lock().expect("gate").creates = 4;
@@ -2230,7 +2455,7 @@ mod tests {
         let root_text = store_root.display().to_string();
         let sessions = load_web_agents(&agents, |key| match key {
             GATEWAY_FILE_ENV => Some(gateway_path.clone()),
-            SKIP_NICKS_ENV => Some("svoi_brauzer".to_string()),
+            SKIP_NICKS_ENV => Some("svoi-brauzer".to_string()),
             crate::STORE_ROOT_ENV => Some(root_text.clone()),
             _ => None,
         })
@@ -2281,9 +2506,9 @@ mod tests {
         assert!(first.starts_with("Runs the hostbot.\n\n<!-- mail4agent:wake -->"));
         assert!(first.ends_with("<!-- /mail4agent:wake -->"));
         assert!(with_wake_note(&first, "hostbot").is_none());
-        let renamed = with_wake_note(&first, "hostbot_two").expect("replaced");
+        let renamed = with_wake_note(&first, "hostbot-two").expect("replaced");
         assert_eq!(renamed.matches("<!-- mail4agent:wake -->").count(), 1);
-        assert!(renamed.contains("\"hostbot_two\""));
+        assert!(renamed.contains("\"hostbot-two\""));
         assert!(!renamed.contains("\"hostbot\""));
         assert!(renamed.starts_with("Runs the hostbot."));
         assert_eq!(with_wake_note("", "carol").expect("empty"), wake_note("carol"));
@@ -2325,7 +2550,7 @@ mod tests {
         assert_eq!(loaded[0].bot_name, "Привет мир");
         assert_eq!(
             routine_name_for(&loaded[0]).as_deref(),
-            Some("privet_mir")
+            Some("privet-mir")
         );
         assert_ne!(
             routine_name_for(&loaded[0]).as_deref(),

@@ -7,36 +7,35 @@
 
 use crate::ShellError;
 
-/// Cyrillic (and a few adjacent letters) to Latin, then the nick shape.
+/// Cyrillic (and a few adjacent letters) to Latin, then the host's routine
+/// slug rule, so a bot's nick, its wake routine name, and that routine's
+/// folder id are one string.
 ///
-/// Spaces become `_`. Anything that is not ASCII alphanumeric is dropped
-/// after transliteration, including `ь` and `ъ`. Repeated `_` collapse.
-/// The result is trimmed and cut to 32 characters. ASCII letters are
-/// lowercased so `Hostbot` and `hostbot` are one nick.
+/// Letters are transliterated and lowercased; `ь` and `ъ` vanish. Every run
+/// of anything else (spaces, punctuation, letters with no mapping) becomes
+/// one `-`. Leading and trailing `-` are trimmed. The result is cut to 32
+/// characters (the server's nick limit) and trimmed again, so
+/// [`routine_folder_id`] of the nick is the nick itself.
+/// `Привет мир` -> `privet-mir`, `foo+bar` ->
+/// `foo-bar`, `Hostbot` -> `hostbot`.
 pub fn nick_from_display_name(display_name: &str) -> Result<String, ShellError> {
     let mut out = String::new();
-    let mut word_break = false;
+    let mut pending_dash = false;
     for ch in display_name.chars() {
-        if ch.is_whitespace() {
-            word_break = true;
-            continue;
+        match latin_piece(ch) {
+            Some("") => {}
+            Some(piece) => {
+                if pending_dash && !out.is_empty() {
+                    out.push('-');
+                }
+                pending_dash = false;
+                out.push_str(piece);
+            }
+            None => pending_dash = true,
         }
-        let Some(piece) = latin_piece(ch) else {
-            continue;
-        };
-        if piece.is_empty() {
-            continue;
-        }
-        if word_break && !out.is_empty() && !out.ends_with('_') {
-            out.push('_');
-        }
-        word_break = false;
-        out.push_str(piece);
     }
-    let mut nick: String = out.chars().take(32).collect();
-    while nick.ends_with('_') {
-        nick.pop();
-    }
+    let nick: String = out.chars().take(32).collect();
+    let nick = nick.trim_end_matches('-').to_string();
     if !is_nick_token(&nick) {
         return Err(ShellError::Nick);
     }
@@ -48,12 +47,16 @@ pub fn nick_from_display_name(display_name: &str) -> Result<String, ShellError> 
 /// Same rule as the host's routine slug, used both by the bot's own
 /// `UpdateRoutine` and by the gateway's `createAgentAutomation`: lowercase,
 /// every run of characters outside `[a-z0-9]` becomes one `-`, leading and
-/// trailing `-` are trimmed, then the result is cut to 48 characters. So the
-/// nick `privet_mir` lives in folder `privet-mir`, never
-/// `privet_mir`. The host falls back to a timestamped name when the
-/// slug is empty; that is not reproducible, so this returns `None` instead.
+/// trailing `-` are trimmed, then the result is cut to 48 characters. So a
+/// routine named `privet_mir` would live in folder `privet-mir`;
+/// wake routines avoid the mismatch by using the hyphen nick as the name.
+/// The host falls back to a timestamped name when the slug is empty; that
+/// is not reproducible, so this returns `None` instead.
 /// A second routine with the same name gets `-2`, `-3`, ...; callers treat
 /// that as a mismatch, not as the bot's routine.
+///
+/// For a nick from [`nick_from_display_name`] this returns the nick
+/// unchanged: nick, routine name, and folder id are one string.
 pub fn routine_folder_id(name: &str) -> Option<String> {
     let mut slug = String::new();
     let mut pending_dash = false;
@@ -78,8 +81,9 @@ pub fn routine_folder_id(name: &str) -> Option<String> {
 }
 
 /// A directory lookup key. A string that is already a nick is used as-is
-/// (the server compares case-insensitively). Anything else is treated as a
-/// display name and derived, so `Привет мир` finds `privet_mir`.
+/// (the server compares case-insensitively; older nicks with `_` still
+/// resolve). Anything else is treated as a display name and derived, so
+/// `Привет мир` finds `privet-mir`.
 pub fn lookup_nick(raw: &str) -> Result<String, ShellError> {
     let trimmed = raw.trim();
     if is_nick_token(trimmed) {
@@ -93,7 +97,7 @@ fn is_nick_token(nick: &str) -> bool {
         && nick.len() <= 32
         && nick
             .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
 }
 
 fn latin_piece(ch: char) -> Option<&'static str> {
@@ -196,23 +200,38 @@ mod tests {
         assert_eq!(nick_from_display_name("  Hostbot  ").unwrap(), "hostbot");
         assert_eq!(
             nick_from_display_name("Привет мир").unwrap(),
-            "privet_mir"
+            "privet-mir"
         );
         assert_eq!(
             nick_from_display_name("Свой браузер").unwrap(),
-            "svoi_brauzer"
+            "svoi-brauzer"
+        );
+        assert_eq!(
+            nick_from_display_name("foo+bar").unwrap(),
+            "foo-bar"
+        );
+        assert_eq!(nick_from_display_name("Sample Bot").unwrap(), "sample-bot");
+        assert_eq!(
+            nick_from_display_name("Объём, данные").unwrap(),
+            "obyom-dannye"
+        );
+        assert_eq!(
+            nick_from_display_name(&("x".repeat(31) + " y")).unwrap(),
+            "x".repeat(31)
         );
         assert_ne!(
             nick_from_display_name("Привет мир").unwrap(),
             "nachshtab"
         );
-        assert_eq!(nick_from_display_name("Foo   Bar!!").unwrap(), "foo_bar");
+        assert_eq!(nick_from_display_name("Foo   Bar!!").unwrap(), "foo-bar");
+        assert_eq!(nick_from_display_name("__a__b__").unwrap(), "a-b");
         assert_eq!(
             nick_from_display_name(&"A".repeat(40)).unwrap(),
             "a".repeat(32)
         );
         assert!(nick_from_display_name("...").is_err());
-        assert_eq!(lookup_nick("Привет мир").unwrap(), "privet_mir");
+        assert_eq!(lookup_nick("Привет мир").unwrap(), "privet-mir");
+        assert_eq!(lookup_nick("privet_mir").unwrap(), "privet_mir");
         assert_eq!(lookup_nick("Hostbot").unwrap(), "Hostbot");
     }
 
@@ -248,13 +267,23 @@ mod tests {
             routine_folder_id(&format!("{}_b", "a".repeat(47))).as_deref(),
             Some(format!("{}-", "a".repeat(47)).as_str())
         );
-        // Display name -> nick -> folder for the names on a typical box.
+        // Display name -> nick -> folder: the folder is the nick itself.
         let chain = |name: &str| routine_folder_id(&nick_from_display_name(name).unwrap());
+        for name in [
+            "Hostbot",
+            "Привет мир",
+            "foo+bar",
+            "Sample Bot",
+            "carol",
+        ] {
+            let nick = nick_from_display_name(name).unwrap();
+            assert_eq!(routine_folder_id(&nick).as_deref(), Some(nick.as_str()));
+        }
         assert_eq!(
             chain("Привет мир").as_deref(),
             Some("privet-mir")
         );
-        assert_eq!(chain("foo+bar").as_deref(), Some("foobar"));
+        assert_eq!(chain("foo+bar").as_deref(), Some("foo-bar"));
         assert_eq!(chain("Sample Bot").as_deref(), Some("sample-bot"));
         assert_eq!(chain("carol").as_deref(), Some("carol"));
     }

@@ -21,10 +21,12 @@ pub fn normalize_nick(nick: &str) -> Result<String, MatrixError> {
     let nick = nick.trim();
     if nick.is_empty()
         || nick.len() > 32
-        || !nick.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        || !nick
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     {
         return Err(MatrixError::invalid_param(
-            "nick must be 1..=32 of [A-Za-z0-9_]",
+            "nick must be 1..=32 of [A-Za-z0-9_-]",
         ));
     }
     Ok(nick.to_string())

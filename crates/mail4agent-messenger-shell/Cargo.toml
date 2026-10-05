@@ -31,3 +31,6 @@ rusqlite = "0.32"
 name = "m4a-ensure-agent-webhooks"
 path = "src/bin/ensure_agent_webhooks.rs"
 
+[[bin]]
+name = "m4a-web-client"
+path = "src/bin/web_client.rs"

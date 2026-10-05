@@ -393,7 +393,7 @@ fn one_client_local_dm_skips_homeserver_remote_session_uses_it() {
 
     let mut client = MachineClient::open(&base, &root, sessions).expect("one client");
     assert!(client.holds("Hostbot"));
-    assert!(client.holds("privet_mir"));
+    assert!(client.holds("privet-mir"));
     assert!(!client.holds("courier"));
     let hostbot_dir = client.store_dir("hostbot").expect("hostbot dir");
     let chief_dir = client.store_dir("Привет мир").expect("chief dir");
@@ -408,7 +408,7 @@ fn one_client_local_dm_skips_homeserver_remote_session_uses_it() {
         .device_bearer()
         .to_string();
     let chief_bearer = client
-        .session_mut("privet_mir")
+        .session_mut("privet-mir")
         .expect("chief")
         .device_bearer()
         .to_string();
@@ -428,7 +428,7 @@ fn one_client_local_dm_skips_homeserver_remote_session_uses_it() {
     let local_event = exchange_local(
         &mut client,
         "hostbot",
-        "privet_mir",
+        "privet-mir",
         "local-dm-plaintext",
     );
     let hits_after_local = client.homeserver_hits();
@@ -563,7 +563,7 @@ fn one_socket_pushes_session_b_and_not_session_a() {
     let mut client =
         MachineClient::open(&base, &root, sessions).expect("one client opens one socket");
     assert!(client.holds("hostbot"));
-    assert!(client.holds("privet_mir"));
+    assert!(client.holds("privet-mir"));
 
     let mut courier = OpenedStore::connect(
         &SessionConfig::new(&base, "Courier", "web-courier", &root, None).expect("courier config"),
@@ -602,7 +602,7 @@ fn one_socket_pushes_session_b_and_not_session_a() {
     let room_id = room_id.unwrap_or_else(|| panic!("unencrypted channel; {}", describe(&courier)));
     let mut chief_now = 20_000_i64;
     client
-        .session_mut("privet_mir")
+        .session_mut("privet-mir")
         .expect("session b")
         .dispatch(
             MessengerCommand::JoinRoom {
@@ -615,12 +615,12 @@ fn one_socket_pushes_session_b_and_not_session_a() {
     for _ in 0..8 {
         chief_now += 2_000;
         client
-            .session_mut("privet_mir")
+            .session_mut("privet-mir")
             .expect("session b")
             .drive(chief_now, true)
             .unwrap_or_else(|err| panic!("session b sync: {err}"));
         joined = client
-            .session_mut("privet_mir")
+            .session_mut("privet-mir")
             .expect("session b")
             .rooms()
             .iter()
@@ -632,7 +632,7 @@ fn one_socket_pushes_session_b_and_not_session_a() {
     assert!(
         joined,
         "session b did not join; {}",
-        describe(client.session_mut("privet_mir").expect("b"))
+        describe(client.session_mut("privet-mir").expect("b"))
     );
 
     let hits = stable_hits(&client);
@@ -642,7 +642,7 @@ fn one_socket_pushes_session_b_and_not_session_a() {
         .http_trace()
         .len();
     let trace_b = client
-        .session_mut("privet_mir")
+        .session_mut("privet-mir")
         .expect("b")
         .http_trace()
         .len();
@@ -685,7 +685,7 @@ fn one_socket_pushes_session_b_and_not_session_a() {
     loop {
         client.deliver_pushed();
         let got = client
-            .session_mut("privet_mir")
+            .session_mut("privet-mir")
             .expect("b")
             .pushed_room_events()
             .iter()
@@ -696,7 +696,7 @@ fn one_socket_pushes_session_b_and_not_session_a() {
         thread::sleep(Duration::from_millis(30));
     }
     let pushed_b: Vec<_> = client
-        .session_mut("privet_mir")
+        .session_mut("privet-mir")
         .expect("b")
         .pushed_room_events()
         .to_vec();
@@ -734,7 +734,7 @@ fn one_socket_pushes_session_b_and_not_session_a() {
     );
     assert_eq!(
         client
-            .session_mut("privet_mir")
+            .session_mut("privet-mir")
             .expect("b")
             .http_trace()
             .len(),
@@ -742,7 +742,7 @@ fn one_socket_pushes_session_b_and_not_session_a() {
     );
     assert!(
         client
-            .session_mut("privet_mir")
+            .session_mut("privet-mir")
             .expect("b")
             .texts()
             .iter()
