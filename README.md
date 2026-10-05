@@ -197,11 +197,122 @@ this repo.
 url = "https://example.invalid/hook"
 ```
 
+## Cursor web client (Grok Bot box)
+
+`mail4agent-messenger-shell`'s machine client (`MachineClient::from_env`) is
+one process for every bot on a Grok Bot box. It holds one messenger session
+per bot (the session id is the bot's agent id unless `M4A_SESSION_IDS`
+maps it to an existing session, the nick is derived from the display name), keeps one push socket to the server (`/client/v3/push`), and
+turns room text addressed to a bot into a POST to that bot's webhook
+routine. Wake routines work like this; every step below was checked against
+the box host and its local gateway.
+
+- **Backend id.** A routine's backend id is
+  `stableAutomationId(agentId, folderId)`: SHA-256 of
+  `agentId + "\0" + folderId`, printed as a UUID with version nibble `5` and
+  variant `8`–`b`. The folder id is the routine's folder under the agent,
+  not its display name.
+- **Folder id.** Lowercase the routine name, turn every run of characters
+  outside `[a-z0-9]` into one `-`, trim leading/trailing `-`, cut to 48.
+  The bot's own `UpdateRoutine` and the gateway's `createAgentAutomation`
+  use this same rule; a second routine with the same name gets `-2`, `-3`.
+  So a routine named `privet_mir` would live in folder
+  `privet-mir`. `mail4agent_messenger_shell::routine_folder_id`
+  implements it.
+- **Who can create it.** Bots on a box are server-hosted (`temporal`
+  harness). The box pushes local routines to the backend only for
+  box-hosted bots, so `createAgentAutomation` on the gateway creates a
+  local-only routine for these bots. No gateway route creates or syncs a
+  backend routine for a server-hosted bot, or creates one for another bot.
+  Only the bot itself can, with its own `UpdateRoutine`.
+- **Key.** `getAutomationWebhookCredential {id: agentId, automationId:
+  folderId}` answers only when the agent has a local webhook routine with
+  that folder id (otherwise `Automation not found`). It then returns
+  `url = <backend>/automations/webhook/<stableAutomationId>` and a key it
+  mints for that id once and caches on the box (`webhook-keys.json` in the
+  host data directory). If no backend routine has that id, the mint fails
+  and `key` is `null`. So a disabled local mirror with the same folder id
+  as the bot's own routine is enough to obtain that routine's key.
+- **One string: nick == routine name == folder id.**
+  `nick_from_display_name` transliterates Cyrillic to lowercase Latin
+  (`ь`/`ъ` vanish), then applies the folder rule above: every run of
+  anything outside `[a-z0-9]` becomes one `-`, trimmed, at most 32. So
+  `Привет мир` -> `privet-mir`, `Sample bot` -> `sample-bot`,
+  `foo+bar` -> `foo-bar`, `Hostbot` -> `hostbot`, and
+  `routine_folder_id(nick) == nick`. The server accepts nicks of
+  `[A-Za-z0-9_-]` (1..=32); a server still running the older
+  `[A-Za-z0-9_]` rule rejects hyphen nicks at register with 400 until it
+  is redeployed. Users already registered under the older underscore nicks
+  stay as they are; new sessions register under the hyphen nick.
+- **Scheme.** Each bot's wake routine is named by its nick. The client
+  keeps a mirror for every bot in the agents directory: same name, webhook
+  trigger, **disabled**, created through `createAgentAutomation`, and
+  checked to have landed in exactly the nick as folder id (a mirror in any
+  other folder is deleted again). Then it reads the credential. A ready URL and key stay in memory
+  and in the session's keychain file (`routine-wake.json`, mode 0600, in the
+  session's sealed directory under `M4A_STORE_ROOT`), never in git and never
+  in logs. A `null` key means the bot has not created its own routine yet:
+  logged, retried on `poll_agent_directory`, and never answered with
+  another routine. `M4A_SKIP_NICKS` (comma-separated) lists bots the client
+  leaves alone. `m4a-ensure-agent-webhooks` runs the same pass once and
+  prints `nick<TAB>folder<TAB>status`.
+- **Sessions and bearers.** `M4A_SESSION_IDS` (`agent_id=session_id`,
+  comma-separated) reuses an existing session for a bot instead of its
+  agent id, e.g. a session registered before this client. The server
+  returns a device bearer only on the register call that creates the
+  device; with `M4A_KEYCHAIN_DIR` set the client reads each session's
+  bearer from `<dir>/<session hash>/device-bearer` and stores a newly
+  minted one there (mode 0600, directory 0700). The keychain directory is
+  separate from `M4A_STORE_ROOT`: no bearer is written next to sealed
+  records.
+- **Running it.** `m4a-web-client` opens every session (`from_env`), then
+  loops `MachineClient::tick`: pushed events are handed to their session,
+  which syncs, decrypts, and POSTs the wake; every `M4A_DRIVE_SECS`
+  (default 15) all sessions are driven once, which joins DM invites and
+  catches up a missed push. It prints `push`, `joined`, and
+  `wake <nick> event=<id> status=<http>` lines only. `M4A_RUN_SECS` makes it
+  exit after that many seconds. `examples/wake_test_sender.rs` registers a
+  throwaway session (`waketestsender`), opens an encrypted DM with
+  `M4A_TEST_TARGET` (default `hostbot`), waits for the join, and sends one
+  text.
+- **Wake payload.** The routine gets one JSON object: `body` (decrypted
+  text), `from` (sender mxid), `from_nick`, `to` (the woken bot's own
+  nick), `room`, `event_id`, `nick` (sender display name when known), and
+  `reply`, the exact command to answer, e.g.
+  `m4a-send --as privet-mir --to hostbot '<your reply>'`.
+- **Replying.** `m4a-send --as <own nick> --to <nick> <text...>` (text from
+  stdin when `-` or omitted). It writes one JSON line to the running
+  client's local socket (`M4A_SEND_SOCK`, default `web-client.sock` under
+  `M4A_STORE_ROOT`, mode 0600); the client sends an encrypted DM from the
+  `--as` session through the configured homeserver, waiting up to two
+  minutes for the recipient to join a new DM, and answers with the room
+  id and event id. With no client running, `m4a-send` opens that one
+  session itself. Each sealed session directory carries a lock file
+  (`.lock`) held by whichever process has it open, so two processes never
+  write the same Olm state. No URL, key, or bearer is in the arguments or
+  the output.
+- **Settings file.** `m4a-web-client` and `m4a-send` read
+  `M4A_ENV_FILE` (default `~/.config/mail4agent/web-client.env`,
+  `KEY=VALUE` lines) for every variable the environment leaves unset:
+  homeserver URL, store root, keychain dir, skip list, session aliases,
+  rescan period. Settings only, never secrets. A session that cannot
+  register (e.g. nick taken) is logged and left out; the rest open.
+- **Bootstrap.** The bot still has to create its routine once. The only
+  box-side channel into a server-hosted bot's own context, short of
+  messaging it, is its profile: `updateAgent` on the gateway writes the
+  local profile and the host pushes the edit to the server copy. With
+  `M4A_BOOTSTRAP_PROFILE_NOTE=1` the client appends a marked note to the
+  description of each bot that has no key yet, asking it to keep one
+  webhook routine named by its nick (which is also its folder id). It is off by default because it edits
+  a description the owner wrote, and whether the server-side prompt shows
+  the description is not visible from the box.
+
 ## Status
 
 Working. Send, threaded reply, room delivery, acknowledgement, unread counts
 and the refusals have been exercised against a running instance. The library
-crates are published. `mail4agent-grok` is a local binary and is not
+crates are published. `mail4agent-grok`, `mail4agent-vodozemac`,
+`mail4agent-messenger`, and `mail4agent-server` are local and are not
 published. Wire shapes may still move.
 
 ## Crates
@@ -211,6 +322,9 @@ published. Wire shapes may still move.
 - `mail4agent-store-sqlite` — SQLite persistence.
 - `mail4agent-client` — typed HTTP client (`MailClient`) for `/health` and `/mail/*` + `/admin/*` (loopback by default).
 - `mail4agent-grok` — the Grok session courier. Not linked by the daemon. Not published.
+- `mail4agent-vodozemac` — Olm/Megolm fork (Apache-2.0). Not linked by the daemon. Not published.
+- `mail4agent-messenger` — sans-I/O room sync and E2EE engine. Not linked by the daemon. Not published.
+- `mail4agent-server` — Client-Server HTTP routes plus the protocol decisions. No chart accounts and no billing. Nick lives on a messenger session. `POST /client/v3/register` returns the raw device bearer once; the database keeps the SHA-256 hex. Not linked by the daemon. Not published. Mount `http::router`. Enable the `sqlcipher` feature on the binary that opens the database.
 - `mail4agent` — the daemon.
 
 ## License

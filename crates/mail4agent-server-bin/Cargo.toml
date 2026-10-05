@@ -1,0 +1,27 @@
+[package]
+name = "mail4agent-server-bin"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Loopback process for the mail4agent messenger homeserver. Listens on 127.0.0.1 only."
+
+[[bin]]
+name = "mail4agent-server-bin"
+path = "src/main.rs"
+
+[dependencies]
+mail4agent-server = { path = "../mail4agent-server", version = "0.1.0", features = ["sqlcipher"] }
+# Names the connection type init_messenger_db returns. Features stay on
+# mail4agent-server's sqlcipher flag; this dependency does not add its own.
+rusqlite = "0.32"
+axum = { version = "0.8", features = ["json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+chrono = { version = "0.4", features = ["clock"] }
+
+[dev-dependencies]
+mail4agent-server = { path = "../mail4agent-server", version = "0.1.0", features = ["sqlcipher"] }
+mail4agent-messenger-shell = { path = "../mail4agent-messenger-shell", version = "0.1.0" }
+serde_json = "1"
+tower = { version = "0.5", features = ["util"] }
+tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }

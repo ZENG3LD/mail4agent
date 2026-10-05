@@ -1,0 +1,968 @@
+//! Two messenger shells exchange one private-room text through
+//! `mail4agent-server-bin` on 127.0.0.1. The shells perform the HTTP the
+//! engine releases, including key setup when the room is encrypted.
+//! The database key and the bearer tokens are fixtures generated or named
+//! here and are not printed.
+
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use mail4agent_messenger_shell::{
+    session_store_dir, CreateRoomKind, DeviceId, MessageKind, MessengerCommand, OpenedStore,
+    OutgoingMessage, RoomId, SessionWake,
+};
+use mail4agent_server::http::hash_token;
+use mail4agent_server::keys::{self, CredentialKind};
+use mail4agent_server::nick;
+use mail4agent_server::store::{self, init_messenger_db};
+
+const ALICE_TOKEN: &str = "fake-alice-token";
+const BOB_TOKEN: &str = "fake-bob-token";
+const CAROL_TOKEN: &str = "fake-carol-token";
+const TEXT: &str = "shell-two-device-hello";
+const GROUP_TEXT: &str = "shell-group-hello";
+const CHANNEL_TEXT: &str = "shell-channel-hello";
+const NOW: &str = "2026-10-05T00:00:00+00:00";
+
+struct StopServer(Option<Child>);
+
+impl Drop for StopServer {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+struct TempDb {
+    dir: PathBuf,
+}
+
+impl Drop for TempDb {
+    fn drop(&mut self) {
+        let db = self.dir.join("messenger.db");
+        let path = db.display().to_string();
+        let _ = std::fs::remove_file(&db);
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+        let _ = std::fs::remove_file(format!("{path}-shm"));
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn random_key_hex() -> String {
+    let mut bytes = [0u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .expect("urandom")
+        .read_exact(&mut bytes)
+        .expect("urandom read");
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn ensure_server_name() {
+    match store::set_matrix_server_name("localhost") {
+        Ok(()) => {}
+        Err(_) => assert_eq!(
+            store::matrix_server_name(),
+            "localhost",
+            "matrix server name was already set to a different host"
+        ),
+    }
+}
+
+fn seed(db: &std::path::Path, key_hex: &str) -> (String, String) {
+    ensure_server_name();
+    let conn = init_messenger_db(db.to_str().expect("utf-8"), key_hex).expect("open db");
+    store::ensure_matrix_user(&conn, 1, "alicepub", NOW).expect("alice");
+    store::ensure_matrix_user(&conn, 2, "bobpub", NOW).expect("bob");
+    nick::set_nick(&conn, 1, "alice_nick").expect("alice nick");
+    nick::set_nick(&conn, 2, "bob_nick").expect("bob nick");
+    let alice_device = keys::create_device(
+        &conn,
+        1,
+        CredentialKind::Bearer,
+        &hash_token(ALICE_TOKEN),
+        NOW,
+    )
+    .expect("alice device");
+    let bob_device = keys::create_device(
+        &conn,
+        2,
+        CredentialKind::Bearer,
+        &hash_token(BOB_TOKEN),
+        NOW,
+    )
+    .expect("bob device");
+    conn.execute_batch("PRAGMA wal_checkpoint(FULL);")
+        .expect("checkpoint");
+    (alice_device, bob_device)
+}
+
+fn server_bin() -> PathBuf {
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_mail4agent_server_bin") {
+        if !path.is_empty() {
+            return PathBuf::from(path);
+        }
+    }
+    let exe = std::env::current_exe().expect("test executable");
+    let mut path = exe
+        .parent()
+        .and_then(|dir| dir.parent())
+        .expect("target profile dir")
+        .to_path_buf();
+    path.push("mail4agent-server-bin");
+    assert!(
+        path.is_file(),
+        "mail4agent-server-bin was not built next to the test harness"
+    );
+    path
+}
+
+struct RoutineCapture {
+    url: String,
+    hits: Arc<Mutex<Vec<(String, Vec<u8>)>>>,
+    done: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Drop for RoutineCapture {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn start_routine() -> RoutineCapture {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("routine bind");
+    let addr = listener.local_addr().expect("routine addr");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let hits = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&hits);
+    let done = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&done);
+    let thread = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        while !flag.load(Ordering::Relaxed) && Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut sock, _)) => {
+                    let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 2048];
+                    loop {
+                        let n = sock.read(&mut tmp).unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        let marker = b"\r\n\r\n";
+                        if let Some(end) = buf.windows(4).position(|window| window == marker) {
+                            let headers = String::from_utf8_lossy(&buf[..end]).to_string();
+                            let length = headers
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    if name.eq_ignore_ascii_case("content-length") {
+                                        value.trim().parse::<usize>().ok()
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or(0);
+                            if buf.len() >= end + 4 + length {
+                                let body = buf[end + 4..end + 4 + length].to_vec();
+                                recorded.lock().expect("hits").push((headers, body));
+                                let _ = sock.write_all(
+                                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    RoutineCapture {
+        url: format!("http://{addr}/routine"),
+        hits,
+        done,
+        thread: Some(thread),
+    }
+}
+
+fn wait_until_accepts(addr: &str) {
+    let start = Instant::now();
+    loop {
+        if TcpStream::connect(addr).is_ok() {
+            return;
+        }
+        if start.elapsed() > Duration::from_secs(15) {
+            panic!("server did not accept {addr}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn open_shell(
+    dir: &std::path::Path,
+    session: &str,
+    device_id: &str,
+    user_id: &str,
+    base_url: &str,
+    token: &str,
+) -> OpenedStore {
+    let device = DeviceId::parse(device_id).expect("device id");
+    OpenedStore::open(dir, session, device, user_id, "localhost", base_url, token)
+        .expect("open shell")
+}
+
+fn settle(shell: &mut OpenedStore, now: &mut i64) {
+    for _ in 0..8 {
+        *now += 2_000;
+        shell.drive(*now, false).expect("drive");
+    }
+}
+
+fn catch_up(shell: &mut OpenedStore, now: &mut i64) {
+    *now += 2_000;
+    shell.drive(*now, true).expect("catch up");
+}
+
+fn describe(shell: &OpenedStore) -> String {
+    let rooms: Vec<String> = shell
+        .rooms()
+        .iter()
+        .map(|room| {
+            format!(
+                "{} membership={} encrypted={}",
+                room.room_id, room.membership, room.encrypted
+            )
+        })
+        .collect();
+    let texts: Vec<String> = shell
+        .texts()
+        .iter()
+        .map(|text| {
+            format!(
+                "{} outcome={} body_len={}",
+                text.room_id,
+                text.outcome,
+                text.body.len()
+            )
+        })
+        .collect();
+    format!(
+        "inflight={} rooms=[{}] texts=[{}] http=[{}]",
+        shell.sync_inflight(),
+        rooms.join(", "),
+        texts.join(", "),
+        shell.http_trace().join(" | ")
+    )
+}
+
+#[test]
+fn two_shells_exchange_one_text_over_loopback() {
+    let temp = TempDb {
+        dir: PathBuf::from(format!(
+            "/tmp/mail4agent-shell-two-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_millis()
+        )),
+    };
+    std::fs::create_dir_all(&temp.dir).expect("tmpdir");
+    let db = temp.dir.join("messenger.db");
+    let key_hex = random_key_hex();
+    let (alice_device, bob_device) = seed(&db, &key_hex);
+
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+    let port = probe.local_addr().expect("addr").port();
+    drop(probe);
+    let addr = format!("127.0.0.1:{port}");
+    let base = format!("http://{addr}");
+
+    let exe = server_bin();
+    let child = Command::new(exe)
+        .args([
+            "--bind",
+            &addr,
+            "--db",
+            db.to_str().expect("utf-8"),
+            "--server-name",
+            "localhost",
+        ])
+        .env("M4A_DB_KEY_HEX", &key_hex)
+        .env_remove("M4A_BOOTSTRAP_PUBLIC_ID")
+        .env_remove("M4A_BOOTSTRAP_NICK")
+        .env_remove("M4A_BOOTSTRAP_TOKEN")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn server");
+    let mut server = StopServer(Some(child));
+    wait_until_accepts(&addr);
+
+    let alice_dir = temp.dir.join("alice");
+    let bob_dir = temp.dir.join("bob");
+    let mut alice = open_shell(
+        &alice_dir,
+        "session-alice",
+        &alice_device,
+        "@alicepub:localhost",
+        &base,
+        ALICE_TOKEN,
+    );
+    let mut bob = open_shell(
+        &bob_dir,
+        "session-bob",
+        &bob_device,
+        "@bobpub:localhost",
+        &base,
+        BOB_TOKEN,
+    );
+    let routine = start_routine();
+    bob.set_wake(SessionWake {
+        routine_url: Some(routine.url.clone()),
+        ..SessionWake::default()
+    });
+    let mut alice_now = 1_000_000_i64;
+    let mut bob_now = 1_000_000_i64;
+    settle(&mut alice, &mut alice_now);
+    settle(&mut bob, &mut bob_now);
+
+    alice
+        .dispatch(
+            MessengerCommand::CreateRoom {
+                kind: CreateRoomKind::Dm {
+                    peer: mail4agent_messenger_shell::UserId::parse("@bobpub:localhost")
+                        .expect("bob"),
+                },
+            },
+            alice_now,
+        )
+        .expect("create dm");
+    settle(&mut alice, &mut alice_now);
+    catch_up(&mut alice, &mut alice_now);
+    catch_up(&mut bob, &mut bob_now);
+
+    let invite = bob
+        .rooms()
+        .into_iter()
+        .find(|room| room.membership == "invite")
+        .unwrap_or_else(|| {
+            panic!(
+                "bob saw no invite; bob {} alice {}",
+                describe(&bob),
+                describe(&alice)
+            )
+        });
+    bob.dispatch(
+        MessengerCommand::JoinRoom {
+            room_id: RoomId::parse(&invite.room_id).expect("room id"),
+        },
+        bob_now,
+    )
+    .expect("join");
+    settle(&mut bob, &mut bob_now);
+    catch_up(&mut bob, &mut bob_now);
+    catch_up(&mut alice, &mut alice_now);
+
+    let room = alice
+        .rooms()
+        .into_iter()
+        .find(|room| room.membership == "join")
+        .unwrap_or_else(|| panic!("alice has no joined room; {}", describe(&alice)));
+    assert!(
+        room.encrypted,
+        "private room was not encrypted; refusing a plaintext send; {}",
+        describe(&alice)
+    );
+    alice
+        .dispatch(
+            MessengerCommand::SendMessage {
+                room_id: RoomId::parse(&room.room_id).expect("room"),
+                message: OutgoingMessage {
+                    kind: MessageKind::Text,
+                    body: TEXT.to_string(),
+                    reply_to: None,
+                    edit_of: None,
+                },
+                txn_id: None,
+            },
+            alice_now,
+        )
+        .expect("send");
+
+    let mut sent = false;
+    for _ in 0..12 {
+        settle(&mut alice, &mut alice_now);
+        if alice
+            .texts()
+            .iter()
+            .any(|text| text.body == TEXT && text.outcome == "sent")
+        {
+            sent = true;
+            break;
+        }
+        let texts = alice.texts();
+        if let Some(failed) = texts
+            .iter()
+            .find(|text| text.body == TEXT && text.outcome.starts_with("failed"))
+        {
+            panic!(
+                "alice send failed ({}); {}",
+                failed.outcome,
+                describe(&alice)
+            );
+        }
+    }
+    assert!(
+        sent,
+        "alice ciphertext was not accepted; {}",
+        describe(&alice)
+    );
+
+    let mut saw = false;
+    for _ in 0..4 {
+        catch_up(&mut bob, &mut bob_now);
+        settle(&mut bob, &mut bob_now);
+        if bob.texts().iter().any(|text| text.body == TEXT) {
+            saw = true;
+            break;
+        }
+        if bob
+            .texts()
+            .iter()
+            .any(|text| text.outcome.starts_with("undecryptable"))
+        {
+            panic!("bob could not decrypt; {}", describe(&bob));
+        }
+    }
+    assert!(
+        saw,
+        "second device did not see the text; {}",
+        describe(&bob)
+    );
+    let hits = routine.hits.lock().expect("hits");
+    assert_eq!(
+        hits.len(),
+        1,
+        "decrypted room text did not hit the routine once; {}",
+        describe(&bob)
+    );
+    assert!(
+        !hits[0].0.to_ascii_lowercase().contains("authorization"),
+        "routine post added a bearer"
+    );
+    assert!(!hits[0].0.contains("/mail/send"));
+    drop(hits);
+    let ids = wake_event_ids(&routine, TEXT, "@alicepub:localhost");
+    assert_eq!(ids.len(), 1, "dm wake should be one json object");
+
+    drop(alice);
+    drop(bob);
+    if let Some(child) = server.0.as_mut() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    server.0 = None;
+}
+
+struct ThreeShells {
+    temp: TempDb,
+    key_hex: String,
+    alice_device: String,
+    bob_device: String,
+    carol_device: String,
+    base: String,
+    server: StopServer,
+    store_root: PathBuf,
+}
+
+fn seed_three(db: &std::path::Path, key_hex: &str) -> (String, String, String) {
+    ensure_server_name();
+    let conn = init_messenger_db(db.to_str().expect("utf-8"), key_hex).expect("open db");
+    store::ensure_matrix_user(&conn, 1, "alicepub", NOW).expect("alice");
+    store::ensure_matrix_user(&conn, 2, "bobpub", NOW).expect("bob");
+    store::ensure_matrix_user(&conn, 3, "carolpub", NOW).expect("carol");
+    nick::set_nick(&conn, 1, "alice_nick").expect("alice nick");
+    nick::set_nick(&conn, 2, "bob_nick").expect("bob nick");
+    nick::set_nick(&conn, 3, "carol_nick").expect("carol nick");
+    let alice_device = keys::create_device(
+        &conn,
+        1,
+        CredentialKind::Bearer,
+        &hash_token(ALICE_TOKEN),
+        NOW,
+    )
+    .expect("alice device");
+    let bob_device = keys::create_device(
+        &conn,
+        2,
+        CredentialKind::Bearer,
+        &hash_token(BOB_TOKEN),
+        NOW,
+    )
+    .expect("bob device");
+    let carol_device = keys::create_device(
+        &conn,
+        3,
+        CredentialKind::Bearer,
+        &hash_token(CAROL_TOKEN),
+        NOW,
+    )
+    .expect("carol device");
+    conn.execute_batch("PRAGMA wal_checkpoint(FULL);")
+        .expect("checkpoint");
+    (alice_device, bob_device, carol_device)
+}
+
+fn start_three_shells() -> ThreeShells {
+    let temp = TempDb {
+        dir: PathBuf::from(format!(
+            "/tmp/mail4agent-shell-group-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_millis()
+        )),
+    };
+    std::fs::create_dir_all(&temp.dir).expect("tmpdir");
+    let db = temp.dir.join("messenger.db");
+    let key_hex = random_key_hex();
+    let (alice_device, bob_device, carol_device) = seed_three(&db, &key_hex);
+
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+    let port = probe.local_addr().expect("addr").port();
+    drop(probe);
+    let addr = format!("127.0.0.1:{port}");
+    let base = format!("http://{addr}");
+
+    let exe = server_bin();
+    let child = Command::new(exe)
+        .args([
+            "--bind",
+            &addr,
+            "--db",
+            db.to_str().expect("utf-8"),
+            "--server-name",
+            "localhost",
+        ])
+        .env("M4A_DB_KEY_HEX", &key_hex)
+        .env_remove("M4A_BOOTSTRAP_PUBLIC_ID")
+        .env_remove("M4A_BOOTSTRAP_NICK")
+        .env_remove("M4A_BOOTSTRAP_TOKEN")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn server");
+    let server = StopServer(Some(child));
+    wait_until_accepts(&addr);
+
+    // One root, the directory M4A_STORE_ROOT names. session_store_dir
+    // gives each session id its own child. The shells are not pointed
+    // at one path.
+    let store_root = temp.dir.join("m4a-store-root");
+    std::fs::create_dir_all(&store_root).expect("store root");
+    ThreeShells {
+        temp,
+        key_hex,
+        alice_device,
+        bob_device,
+        carol_device,
+        base,
+        server,
+        store_root,
+    }
+}
+
+fn open_session(
+    boot: &ThreeShells,
+    session: &str,
+    device: &str,
+    user: &str,
+    token: &str,
+) -> OpenedStore {
+    let dir = session_store_dir(&boot.store_root, session);
+    open_shell(&dir, session, device, user, &boot.base, token)
+}
+
+fn distinct_session_dirs(boot: &ThreeShells) {
+    let alice = session_store_dir(&boot.store_root, "session-alice");
+    let bob = session_store_dir(&boot.store_root, "session-bob");
+    let carol = session_store_dir(&boot.store_root, "session-carol");
+    assert_ne!(alice, bob);
+    assert_ne!(alice, carol);
+    assert_ne!(bob, carol);
+    assert!(alice.starts_with(&boot.store_root));
+    assert!(bob.starts_with(&boot.store_root));
+    assert!(carol.starts_with(&boot.store_root));
+}
+
+fn wait_membership(
+    shell: &mut OpenedStore,
+    now: &mut i64,
+    membership: &str,
+    encrypted: Option<bool>,
+) -> String {
+    for _ in 0..5 {
+        if let Some(room) = shell.rooms().into_iter().find(|room| {
+            room.membership == membership && encrypted.is_none_or(|flag| room.encrypted == flag)
+        }) {
+            return room.room_id;
+        }
+        catch_up(shell, now);
+    }
+    panic!(
+        "no room membership={membership} encrypted={encrypted:?}; {}",
+        describe(shell)
+    );
+}
+
+fn join_room(shell: &mut OpenedStore, now: &mut i64, room_id: &str) {
+    shell
+        .dispatch(
+            MessengerCommand::JoinRoom {
+                room_id: RoomId::parse(room_id).expect("room id"),
+            },
+            *now,
+        )
+        .unwrap_or_else(|err| panic!("join {room_id}: {err}; {}", describe(shell)));
+    settle(shell, now);
+}
+
+fn send_text(shell: &mut OpenedStore, now: &mut i64, room_id: &str, text: &str) {
+    shell
+        .dispatch(
+            MessengerCommand::SendMessage {
+                room_id: RoomId::parse(room_id).expect("room"),
+                message: OutgoingMessage {
+                    kind: MessageKind::Text,
+                    body: text.to_string(),
+                    reply_to: None,
+                    edit_of: None,
+                },
+                txn_id: None,
+            },
+            *now,
+        )
+        .unwrap_or_else(|err| panic!("send: {err}; {}", describe(shell)));
+    let mut sent = false;
+    for _ in 0..12 {
+        settle(shell, now);
+        if shell
+            .texts()
+            .iter()
+            .any(|row| row.body == text && row.outcome == "sent")
+        {
+            sent = true;
+            break;
+        }
+        if let Some(failed) = shell
+            .texts()
+            .iter()
+            .find(|row| row.body == text && row.outcome.starts_with("failed"))
+        {
+            panic!("send failed ({}); {}", failed.outcome, describe(shell));
+        }
+    }
+    assert!(
+        sent,
+        "ciphertext or plaintext was not accepted; {}",
+        describe(shell)
+    );
+}
+
+fn wait_text(shell: &mut OpenedStore, now: &mut i64, text: &str) {
+    for _ in 0..4 {
+        catch_up(shell, now);
+        settle(shell, now);
+        if shell.texts().iter().any(|row| row.body == text) {
+            return;
+        }
+        if shell
+            .texts()
+            .iter()
+            .any(|row| row.outcome.starts_with("undecryptable"))
+        {
+            panic!("could not decrypt; {}", describe(shell));
+        }
+    }
+    panic!("did not see the text; {}", describe(shell));
+}
+
+fn wake_event_ids(routine: &RoutineCapture, body: &str, from: &str) -> Vec<String> {
+    let hits = routine.hits.lock().expect("hits");
+    assert!(
+        !hits.is_empty(),
+        "decrypted room text did not hit the routine"
+    );
+    let mut ids = Vec::new();
+    for (headers, bytes) in hits.iter() {
+        assert!(
+            !headers.to_ascii_lowercase().contains("authorization"),
+            "routine post added a bearer"
+        );
+        assert!(!headers.contains("/mail/send"));
+        let parsed: serde_json::Value = serde_json::from_slice(bytes).expect("wake json");
+        assert_eq!(parsed["body"], body, "wake body: {parsed}");
+        assert_eq!(parsed["from"], from, "wake from: {parsed}");
+        let event_id = parsed["event_id"].as_str().unwrap_or("").to_string();
+        assert!(event_id.starts_with('$'), "wake event_id missing: {parsed}");
+        ids.push(event_id);
+    }
+    ids
+}
+
+fn stop_server(server: &mut StopServer) {
+    if let Some(mut child) = server.0.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+fn timeline_messages(
+    db: &std::path::Path,
+    key_hex: &str,
+    room_id: &str,
+) -> Vec<(String, String, String)> {
+    let conn = init_messenger_db(db.to_str().expect("utf-8"), key_hex).expect("reopen db");
+    let mut stmt = conn
+        .prepare(
+            "SELECT event_id, event_type, content FROM events \
+             WHERE room_id = ?1 AND state_key IS NULL \
+             AND event_type IN ('m.room.message', 'm.room.encrypted') \
+             ORDER BY stream_id",
+        )
+        .expect("prepare");
+    stmt.query_map([room_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })
+    .expect("query")
+    .collect::<Result<Vec<_>, _>>()
+    .expect("rows")
+}
+
+fn open_trio(boot: &ThreeShells) -> (OpenedStore, OpenedStore, OpenedStore) {
+    distinct_session_dirs(boot);
+    let alice = open_session(
+        boot,
+        "session-alice",
+        &boot.alice_device,
+        "@alicepub:localhost",
+        ALICE_TOKEN,
+    );
+    let bob = open_session(
+        boot,
+        "session-bob",
+        &boot.bob_device,
+        "@bobpub:localhost",
+        BOB_TOKEN,
+    );
+    let carol = open_session(
+        boot,
+        "session-carol",
+        &boot.carol_device,
+        "@carolpub:localhost",
+        CAROL_TOKEN,
+    );
+    (alice, bob, carol)
+}
+
+#[test]
+fn three_local_shells_exchange_one_text_in_an_encrypted_group() {
+    let mut boot = start_three_shells();
+    let routine = start_routine();
+    let (mut alice, mut bob, mut carol) = open_trio(&boot);
+    bob.set_wake(SessionWake {
+        routine_url: Some(routine.url.clone()),
+        ..SessionWake::default()
+    });
+    carol.set_wake(SessionWake {
+        routine_url: Some(routine.url.clone()),
+        ..SessionWake::default()
+    });
+    let mut alice_now = 1_000_000_i64;
+    let mut bob_now = 1_000_000_i64;
+    let mut carol_now = 1_000_000_i64;
+    settle(&mut alice, &mut alice_now);
+    settle(&mut bob, &mut bob_now);
+    settle(&mut carol, &mut carol_now);
+
+    alice
+        .dispatch(
+            MessengerCommand::CreateRoom {
+                kind: CreateRoomKind::Group {
+                    name: "shell-group".to_string(),
+                    invite: vec![
+                        mail4agent_messenger_shell::UserId::parse("@bobpub:localhost")
+                            .expect("bob"),
+                        mail4agent_messenger_shell::UserId::parse("@carolpub:localhost")
+                            .expect("carol"),
+                    ],
+                    members_can_invite: false,
+                },
+            },
+            alice_now,
+        )
+        .expect("create group");
+    settle(&mut alice, &mut alice_now);
+    let room_id = wait_membership(&mut alice, &mut alice_now, "join", Some(true));
+    let bob_invite = wait_membership(&mut bob, &mut bob_now, "invite", None);
+    let carol_invite = wait_membership(&mut carol, &mut carol_now, "invite", None);
+    assert_eq!(bob_invite, room_id);
+    assert_eq!(carol_invite, room_id);
+    join_room(&mut bob, &mut bob_now, &room_id);
+    join_room(&mut carol, &mut carol_now, &room_id);
+    let _ = wait_membership(&mut bob, &mut bob_now, "join", Some(true));
+    let _ = wait_membership(&mut carol, &mut carol_now, "join", Some(true));
+    catch_up(&mut alice, &mut alice_now);
+
+    let room = alice
+        .rooms()
+        .into_iter()
+        .find(|room| room.room_id == room_id)
+        .expect("alice room");
+    assert!(
+        room.encrypted,
+        "group room was not encrypted; {}",
+        describe(&alice)
+    );
+    send_text(&mut alice, &mut alice_now, &room_id, GROUP_TEXT);
+    wait_text(&mut bob, &mut bob_now, GROUP_TEXT);
+    wait_text(&mut carol, &mut carol_now, GROUP_TEXT);
+
+    let ids = wake_event_ids(&routine, GROUP_TEXT, "@alicepub:localhost");
+    assert_eq!(
+        ids.len(),
+        2,
+        "each other member should wake once; {}",
+        describe(&bob)
+    );
+    assert_eq!(ids[0], ids[1]);
+
+    drop(alice);
+    drop(bob);
+    drop(carol);
+    stop_server(&mut boot.server);
+    let events = timeline_messages(&boot.temp.dir.join("messenger.db"), &boot.key_hex, &room_id);
+    assert!(
+        events.iter().any(|(event_id, event_type, content)| {
+            event_id == &ids[0] && event_type == "m.room.encrypted" && !content.contains(GROUP_TEXT)
+        }),
+        "group timeline was not m.room.encrypted: {:?}",
+        events
+            .iter()
+            .map(|(id, kind, _)| format!("{id} {kind}"))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        events
+            .iter()
+            .all(|(_, event_type, _)| event_type != "m.room.message"),
+        "encrypted group stored a plaintext m.room.message"
+    );
+}
+
+#[test]
+fn three_local_shells_exchange_one_text_in_an_unencrypted_channel() {
+    let mut boot = start_three_shells();
+    let routine = start_routine();
+    let (mut alice, mut bob, mut carol) = open_trio(&boot);
+    bob.set_wake(SessionWake {
+        routine_url: Some(routine.url.clone()),
+        ..SessionWake::default()
+    });
+    carol.set_wake(SessionWake {
+        routine_url: Some(routine.url.clone()),
+        ..SessionWake::default()
+    });
+    let mut alice_now = 2_000_000_i64;
+    let mut bob_now = 2_000_000_i64;
+    let mut carol_now = 2_000_000_i64;
+    settle(&mut alice, &mut alice_now);
+    settle(&mut bob, &mut bob_now);
+    settle(&mut carol, &mut carol_now);
+
+    alice
+        .dispatch(
+            MessengerCommand::CreateRoom {
+                kind: CreateRoomKind::Channel {
+                    name: "shell-channel".to_string(),
+                    topic: None,
+                },
+            },
+            alice_now,
+        )
+        .expect("create channel");
+    settle(&mut alice, &mut alice_now);
+    let room_id = wait_membership(&mut alice, &mut alice_now, "join", Some(false));
+    join_room(&mut bob, &mut bob_now, &room_id);
+    join_room(&mut carol, &mut carol_now, &room_id);
+    let _ = wait_membership(&mut bob, &mut bob_now, "join", Some(false));
+    let _ = wait_membership(&mut carol, &mut carol_now, "join", Some(false));
+
+    let room = alice
+        .rooms()
+        .into_iter()
+        .find(|room| room.room_id == room_id)
+        .expect("alice room");
+    assert!(
+        !room.encrypted,
+        "channel was encrypted; {}",
+        describe(&alice)
+    );
+    send_text(&mut alice, &mut alice_now, &room_id, CHANNEL_TEXT);
+    wait_text(&mut bob, &mut bob_now, CHANNEL_TEXT);
+    wait_text(&mut carol, &mut carol_now, CHANNEL_TEXT);
+
+    let ids = wake_event_ids(&routine, CHANNEL_TEXT, "@alicepub:localhost");
+    assert_eq!(
+        ids.len(),
+        2,
+        "each other member should wake once; {}",
+        describe(&bob)
+    );
+    assert_eq!(ids[0], ids[1]);
+
+    drop(alice);
+    drop(bob);
+    drop(carol);
+    stop_server(&mut boot.server);
+    let events = timeline_messages(&boot.temp.dir.join("messenger.db"), &boot.key_hex, &room_id);
+    assert!(
+        events.iter().any(|(event_id, event_type, content)| {
+            event_id == &ids[0] && event_type == "m.room.message" && content.contains(CHANNEL_TEXT)
+        }),
+        "channel timeline was not a plaintext m.room.message: {:?}",
+        events
+            .iter()
+            .map(|(id, kind, _)| format!("{id} {kind}"))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        events
+            .iter()
+            .all(|(_, event_type, _)| event_type != "m.room.encrypted"),
+        "unencrypted channel stored m.room.encrypted"
+    );
+}

@@ -11,6 +11,12 @@
 //! has a local key, the POST carries `Authorization: Bearer`. No key sends
 //! the same POST with no Authorization header. It does not start `grok`.
 //! Room and direct mail are dropped before either path runs.
+//!
+//! Room mail on the messenger path does not come through this doorbell. A
+//! messenger shell that already decrypted a room text calls
+//! [`wake_decrypted_room`] when a leader socket is configured. That is the
+//! same `session/prompt` push. It does not register a listener and it does
+//! not read the mailbox.
 
 mod acp;
 mod frame;
@@ -28,7 +34,7 @@ pub use gate::{
 pub use index::{
     config_mtime_unix_ms, locate, parse_active_sessions, ActiveSession, LocateError, Target,
 };
-pub use leader::push_into_session;
+pub use leader::{push_into_session, wake_decrypted_room, wake_decrypted_room_blocking};
 pub use pipe::{grok_home, leader_is_listening, leader_pipe_name, leader_socket, PushError};
 pub use web::{
     choose_route, effective_bearer, parse_webhooks, post_letter, validate_webhook_url, webhook_for,

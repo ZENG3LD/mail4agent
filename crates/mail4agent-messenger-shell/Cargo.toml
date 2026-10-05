@@ -1,0 +1,40 @@
+[package]
+name = "mail4agent-messenger-shell"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Client shell that opens the sealed messenger store for one session."
+
+[dependencies]
+mail4agent-messenger = { path = "../mail4agent-messenger", version = "0.1.0" }
+mail4agent-server = { path = "../mail4agent-server", version = "0.1.0" }
+mail4agent-grok = { path = "../mail4agent-grok", version = "0.1.3" }
+sha2 = "0.10"
+zeroize = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+# Blocking client: the shell is synchronous, same as the engine it drives.
+# rustls so https routine posts do not depend on the process CA store.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+tower = { version = "0.5", features = ["util"] }
+axum = { version = "0.8" }
+# Blocking socket the machine client opens. http homeservers use ws.
+# https homeservers use wss, with the webpki roots already used for routines.
+tungstenite = { version = "0.29", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
+rusqlite = "0.32"
+
+[[bin]]
+name = "m4a-ensure-agent-webhooks"
+path = "src/bin/ensure_agent_webhooks.rs"
+
+[[bin]]
+name = "m4a-web-client"
+path = "src/bin/web_client.rs"
+
+[[bin]]
+name = "m4a-send"
+path = "src/bin/send.rs"

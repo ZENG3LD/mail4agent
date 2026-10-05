@@ -12,8 +12,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::{timeout, Instant};
 
 use crate::acp::{
-    acp_envelope, acp_request, classify_inbound, disconnect_message, initialize_params, register_message,
-    registered_is_ready, server_type, session_load_params, session_prompt_params, Inbound,
+    acp_envelope, acp_request, classify_inbound, disconnect_message, initialize_params,
+    register_message, registered_is_ready, server_type, session_load_params, session_prompt_params,
+    Inbound,
 };
 use crate::frame::{encode_frame, MAX_FRAME_BYTES};
 use crate::pipe::PushError;
@@ -29,13 +30,20 @@ const INIT_ID: i64 = 0;
 const LOAD_ID: i64 = 1;
 const PROMPT_ID: i64 = 2;
 
-pub async fn push_into_session(sock: &Path, session_id: &str, cwd: &str, text: &str) -> Result<(), PushError> {
+pub async fn push_into_session(
+    sock: &Path,
+    session_id: &str,
+    cwd: &str,
+    text: &str,
+) -> Result<(), PushError> {
     #[cfg(windows)]
     let stream = {
         let pipe = crate::pipe::leader_pipe_os_path(sock);
         timeout(
             CONNECT_TIMEOUT,
-            tokio::task::spawn_blocking(move || tokio::net::windows::named_pipe::ClientOptions::new().open(pipe)),
+            tokio::task::spawn_blocking(move || {
+                tokio::net::windows::named_pipe::ClientOptions::new().open(pipe)
+            }),
         )
         .await
         .map_err(|_| PushError::LeaderAbsent)?
@@ -52,6 +60,45 @@ pub async fn push_into_session(sock: &Path, session_id: &str, cwd: &str, text: &
     finish(stream, session_id, cwd, text).await
 }
 
+/// Wakes one already-running local session with an already-decrypted room
+/// plaintext. This is [`push_into_session`]: `session/load`, then
+/// `session/prompt`, on `sock`. It does not open a mailbox, it does not
+/// call `POST /mail/send` or `POST /admin/listener`, and it is `Ok` only
+/// when the leader answers the prompt.
+pub async fn wake_decrypted_room(
+    sock: &Path,
+    session_id: &str,
+    cwd: &str,
+    plaintext: &str,
+) -> Result<(), PushError> {
+    push_into_session(sock, session_id, cwd, plaintext).await
+}
+
+/// Synchronous [`wake_decrypted_room`] for a caller that is not already
+/// on a tokio runtime. A dedicated thread owns the runtime so this does
+/// not pretend the push worked.
+pub fn wake_decrypted_room_blocking(
+    sock: &Path,
+    session_id: &str,
+    cwd: &str,
+    plaintext: &str,
+) -> Result<(), PushError> {
+    let sock = sock.to_path_buf();
+    let session_id = session_id.to_string();
+    let cwd = cwd.to_string();
+    let plaintext = plaintext.to_string();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .map_err(|err| PushError::Protocol(err.to_string()))?;
+        runtime.block_on(wake_decrypted_room(&sock, &session_id, &cwd, &plaintext))
+    })
+    .join()
+    .map_err(|_| PushError::Protocol("leader thread dropped".to_string()))?
+}
+
 async fn finish<S>(stream: S, session_id: &str, cwd: &str, text: &str) -> Result<(), PushError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -62,17 +109,28 @@ where
     result
 }
 
-async fn drive<R, W>(reader: &mut R, writer: &mut W, session_id: &str, cwd: &str, text: &str) -> Result<(), PushError>
+async fn drive<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    session_id: &str,
+    cwd: &str,
+    text: &str,
+) -> Result<(), PushError>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     write_value(writer, &register_message()).await?;
-    let registered = read_until(reader, REGISTER_TIMEOUT, |value| registered_is_ready(value).is_some()).await?;
+    let registered = read_until(reader, REGISTER_TIMEOUT, |value| {
+        registered_is_ready(value).is_some()
+    })
+    .await?;
     if !registered_is_ready(&registered).unwrap_or(true) {
-        read_until(reader, READY_TIMEOUT, |value| server_type(value) == Some("leader_ready"))
-            .await
-            .map_err(|_| PushError::LeaderNotReady)?;
+        read_until(reader, READY_TIMEOUT, |value| {
+            server_type(value) == Some("leader_ready")
+        })
+        .await
+        .map_err(|_| PushError::LeaderNotReady)?;
     }
 
     acp_call(
@@ -156,10 +214,15 @@ where
 fn terminal(value: &Value) -> Option<PushError> {
     match server_type(value) {
         Some("error") => {
-            let message = value.get("message").and_then(Value::as_str).unwrap_or("error");
+            let message = value
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("error");
             Some(PushError::Protocol(truncate(message)))
         }
-        Some("shutting_down") | Some("shutdown") => Some(PushError::Protocol("leader-shutdown".to_string())),
+        Some("shutting_down") | Some("shutdown") => {
+            Some(PushError::Protocol("leader-shutdown".to_string()))
+        }
         _ => None,
     }
 }
@@ -181,7 +244,10 @@ where
     }
 }
 
-async fn read_one<R: AsyncRead + Unpin>(reader: &mut R, deadline: Instant) -> Result<Value, PushError> {
+async fn read_one<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    deadline: Instant,
+) -> Result<Value, PushError> {
     let left = deadline.saturating_duration_since(Instant::now());
     if left.is_zero() {
         return Err(PushError::Protocol("timeout".to_string()));
@@ -209,7 +275,10 @@ async fn read_value<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Value, PushE
     serde_json::from_slice(&buf).map_err(|err| PushError::Protocol(err.to_string()))
 }
 
-async fn write_value<W: AsyncWrite + Unpin>(writer: &mut W, value: &Value) -> Result<(), PushError> {
+async fn write_value<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    value: &Value,
+) -> Result<(), PushError> {
     let bytes = serde_json::to_vec(value).map_err(|err| PushError::Protocol(err.to_string()))?;
     let frame = encode_frame(&bytes).map_err(|_| PushError::FrameTooLarge)?;
     writer
@@ -229,4 +298,130 @@ fn truncate(message: &str) -> String {
         out.push(ch);
     }
     out
+}
+
+#[cfg(all(test, unix))]
+mod socket_tests {
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use serde_json::{json, Value};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixListener;
+
+    use super::wake_decrypted_room;
+    use crate::frame::encode_frame;
+
+    async fn read_frame(stream: &mut tokio::net::UnixStream) -> Value {
+        let mut len_buf = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(3), stream.read_exact(&mut len_buf))
+            .await
+            .expect("frame header wait")
+            .expect("frame header");
+        let len = u32::from_be_bytes(len_buf) as usize;
+        assert!(len < 1_000_000, "frame too large");
+        let mut buf = vec![0u8; len];
+        tokio::time::timeout(Duration::from_secs(3), stream.read_exact(&mut buf))
+            .await
+            .expect("frame body wait")
+            .expect("frame body");
+        serde_json::from_slice(&buf).expect("frame json")
+    }
+
+    async fn write_frame(stream: &mut tokio::net::UnixStream, value: &Value) {
+        let bytes = serde_json::to_vec(value).expect("json");
+        let frame = encode_frame(&bytes).expect("frame");
+        stream.write_all(&frame).await.expect("write");
+        stream.flush().await.expect("flush");
+    }
+
+    fn sock_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mail4agent-grok-leader-{}-{}",
+            std::process::id(),
+            name
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        dir
+    }
+
+    async fn serve(listener: UnixListener, refuse_prompt: bool, prompts: Arc<Mutex<Vec<String>>>) {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let register = read_frame(&mut stream).await;
+        assert_eq!(register["type"], "register");
+        write_frame(&mut stream, &json!({"type": "registered", "ready": true})).await;
+        loop {
+            let value = read_frame(&mut stream).await;
+            if value.get("type").and_then(Value::as_str) == Some("disconnect") {
+                break;
+            }
+            if value.get("type").and_then(Value::as_str) != Some("acp") {
+                continue;
+            }
+            let payload = value
+                .get("payload")
+                .and_then(Value::as_str)
+                .expect("payload");
+            let inner: Value = serde_json::from_str(payload).expect("inner");
+            if inner.get("method").and_then(Value::as_str) == Some("session/prompt") {
+                let text = inner["params"]["prompt"][0]["text"]
+                    .as_str()
+                    .expect("prompt text")
+                    .to_string();
+                prompts.lock().expect("prompts").push(text);
+                if refuse_prompt {
+                    let id = inner["id"].clone();
+                    let body = json!({"jsonrpc":"2.0","id": id, "error": {"message": "refused"}})
+                        .to_string();
+                    write_frame(&mut stream, &json!({"type":"acp","payload": body})).await;
+                    continue;
+                }
+            }
+            let id = inner["id"].clone();
+            let body = json!({"jsonrpc":"2.0","id": id, "result": {}}).to_string();
+            write_frame(&mut stream, &json!({"type":"acp","payload": body})).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn wake_decrypted_room_prompts_the_leader_socket_once() {
+        let dir = sock_dir("once");
+        let path = dir.join("leader.sock");
+        let listener = UnixListener::bind(&path).expect("bind");
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let server = tokio::spawn(serve(listener, false, Arc::clone(&prompts)));
+        wake_decrypted_room(&path, "sess-local", "/tmp", "already-decrypted")
+            .await
+            .expect("prompt answered");
+        server.await.expect("server");
+        let got = prompts.lock().expect("prompts");
+        assert_eq!(got.len(), 1, "session/prompt fired more than once");
+        assert_eq!(got[0], "already-decrypted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn wake_decrypted_room_does_not_succeed_when_the_prompt_is_refused() {
+        let dir = sock_dir("refused");
+        let path = dir.join("leader.sock");
+        let listener = UnixListener::bind(&path).expect("bind");
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let server = tokio::spawn(serve(listener, true, Arc::clone(&prompts)));
+        let err = wake_decrypted_room(&path, "sess-local", "/tmp", "already-decrypted")
+            .await
+            .expect_err("a refused prompt is not success");
+        let _ = tokio::time::timeout(Duration::from_secs(3), server).await;
+        assert!(
+            !matches!(err, crate::pipe::PushError::LeaderAbsent),
+            "the socket was up; refusal must not look like a missing leader: {err}"
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains("prompt-failed") || text.contains("refused"),
+            "refusal was swallowed: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
