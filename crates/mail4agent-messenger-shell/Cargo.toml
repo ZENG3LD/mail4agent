@@ -26,3 +26,8 @@ axum = { version = "0.8" }
 # https homeservers use wss, with the webpki roots already used for routines.
 tungstenite = { version = "0.29", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
 rusqlite = "0.32"
+
+[[bin]]
+name = "m4a-ensure-agent-webhooks"
+path = "src/bin/ensure_agent_webhooks.rs"
+

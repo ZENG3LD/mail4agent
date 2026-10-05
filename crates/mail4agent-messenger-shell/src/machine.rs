@@ -1,16 +1,25 @@
 //! Web machine client: one process for every bot session on this machine.
 //!
 //! This is not the homeserver, and it is not the node CLI
-//! ([`crate::OpenedStore::connect_node_from_env`]). The host passes the
-//! list, or this process reads [`SESSIONS_DIR_ENV`]. A record is the bot
-//! display name, the mail session id, and the Grok Bot agent id when this
-//! session has one. A routine URL or a bearer in the file is refused.
-//! [`MachineClient::from_env`] creates one webhook routine per session that
-//! has an agent id, through the local gateway, and keeps the URL and key
-//! in memory. A record with no agent id does not create a routine.
-//! It does not write them back and it does not log them. One URL is not
-//! shared across sessions. [`crate::LEADER_SOCK_ENV`] is not this path.
-//! The node CLI does not create a routine.
+//! ([`crate::OpenedStore::connect_node_from_env`]). Discovery prefers the
+//! live agents directory ([`AGENTS_DIR_ENV`], or
+//! [`DEFAULT_AGENTS_DIR`] when that folder exists): each child folder is a
+//! Grok Bot agent id and `profile.json` carries the display name. The mail
+//! session id is that agent id. The host may still pass a list, or this
+//! process may read [`SESSIONS_DIR_ENV`] when no agents directory is
+//! present. A session record is the bot display name, the mail session id,
+//! and the Grok Bot agent id when this session has one. A routine URL or a
+//! bearer in the file is refused.
+//! [`MachineClient::from_env`] creates one webhook routine per agent,
+//! through the local gateway, and keeps the URL and key in memory. It
+//! skips a name that already exists (so Hostbot is not minted twice). A
+//! record with no agent id does not create a routine. It does not write
+//! them back and it does not log them. One URL is not shared across
+//! sessions. [`ensure_agent_webhook_routines`] is the same create path
+//! without opening sealed stores. [`MachineClient::poll_agent_directory`]
+//! rescans the agents directory for bots that appeared after open.
+//! [`crate::LEADER_SOCK_ENV`] is not this path. The node CLI does not
+//! create a routine.
 //!
 //! Each session still seals under [`crate::session_store_dir`]. Olm pickles
 //! are not shared. While [`MachineClient::set_local_delivery`] is set, the
@@ -42,9 +51,23 @@ use crate::{
 };
 
 /// Directory of session records. Each `*.json` file is `bot_name`,
-/// `session_id`, and an optional `agent_id`. Unset means the host passed
-/// the list to [`MachineClient::open`] instead.
+/// `session_id`, and an optional `agent_id`. Used when no agents directory
+/// is available. Unset means the host passed the list to
+/// [`MachineClient::open`] instead.
 pub const SESSIONS_DIR_ENV: &str = "M4A_SESSIONS_DIR";
+
+/// Live Grok Bot agents on this machine. Each child folder name is an
+/// agent id; `profile.json` has the display `name`. [`MachineClient::from_env`]
+/// prefers this over [`SESSIONS_DIR_ENV`] when the directory exists.
+pub const AGENTS_DIR_ENV: &str = "M4A_AGENTS_DIR";
+
+/// Default agents directory on the box. Used when [`AGENTS_DIR_ENV`] is
+/// unset and this path is a directory.
+pub const DEFAULT_AGENTS_DIR: &str = "/srv/agent-data/agents";
+
+/// Optional rescan period in seconds for [`MachineClient::poll_agent_directory`].
+/// Unset or `0` means the caller decides when to poll; open still scans once.
+pub const AGENT_RESCAN_SECS_ENV: &str = "M4A_AGENT_RESCAN_SECS";
 
 /// One bot session the host says lives on this machine.
 ///
@@ -164,7 +187,87 @@ pub fn load_session_records(dir: &Path) -> Result<Vec<HostSession>, ShellError> 
     Ok(out)
 }
 
-/// [`load_session_records`] plus one webhook routine per session.
+#[derive(serde::Deserialize)]
+struct AgentProfileFile {
+    name: String,
+}
+
+/// Reads each agent folder under `dir`. Folder name is the agent id and the
+/// mail session id. `profile.json` supplies the display name. Folders
+/// without a usable profile are skipped. This does not hardcode agent ids.
+pub fn load_agents_dir(dir: &Path) -> Result<Vec<HostSession>, ShellError> {
+    if !dir.is_dir() {
+        return Err(ShellError::SessionList(
+            "agents directory is missing".to_string(),
+        ));
+    }
+    let mut ids = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(id) = name.to_str() else {
+            continue;
+        };
+        if id.is_empty() || id.starts_with('.') {
+            continue;
+        }
+        ids.push(id.to_string());
+    }
+    ids.sort();
+    if ids.is_empty() {
+        return Err(ShellError::SessionList(
+            "agents directory has no agents".to_string(),
+        ));
+    }
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        let profile_path = dir.join(&id).join("profile.json");
+        if !profile_path.is_file() {
+            continue;
+        }
+        let text = std::fs::read_to_string(&profile_path)
+            .map_err(|err| ShellError::SessionList(clip_public(err.to_string())))?;
+        let profile: AgentProfileFile = serde_json::from_str(&text)
+            .map_err(|err| ShellError::SessionList(clip_public(err.to_string())))?;
+        let bot_name = profile.name.trim().to_string();
+        if bot_name.is_empty() {
+            continue;
+        }
+        let mut session = HostSession::new(bot_name, id.clone());
+        session.agent_id = Some(id);
+        out.push(session);
+    }
+    if out.is_empty() {
+        return Err(ShellError::SessionList(
+            "agents directory has no profiles".to_string(),
+        ));
+    }
+    Ok(out)
+}
+
+/// Resolves the agents directory from the environment lookup. Prefers
+/// [`AGENTS_DIR_ENV`], then [`DEFAULT_AGENTS_DIR`] when that path is a
+/// directory.
+fn resolve_agents_dir(mut get: impl FnMut(&str) -> Option<String>) -> Option<PathBuf> {
+    if let Some(path) = get(AGENTS_DIR_ENV).filter(|value| !value.is_empty()) {
+        let path = PathBuf::from(path);
+        if path.is_dir() {
+            return Some(path);
+        }
+        return None;
+    }
+    let default = PathBuf::from(DEFAULT_AGENTS_DIR);
+    if default.is_dir() {
+        Some(default)
+    } else {
+        None
+    }
+}
+
+/// Session records plus one webhook routine per session that has an agent id.
 ///
 /// `get` is the process environment on [`MachineClient::from_env`]. A
 /// shared [`crate::ROUTINE_URL_ENV`] is not copied onto every session.
@@ -176,12 +279,71 @@ fn load_web_sessions(
     mut get: impl FnMut(&str) -> Option<String>,
 ) -> Result<Vec<HostSession>, ShellError> {
     let mut sessions = load_session_records(dir)?;
+    attach_routines_from_env(&mut sessions, &mut get)?;
+    Ok(sessions)
+}
+
+/// [`load_agents_dir`] plus one webhook routine per agent.
+fn load_web_agents(
+    dir: &Path,
+    mut get: impl FnMut(&str) -> Option<String>,
+) -> Result<Vec<HostSession>, ShellError> {
+    let mut sessions = load_agents_dir(dir)?;
+    attach_routines_from_env(&mut sessions, &mut get)?;
+    Ok(sessions)
+}
+
+fn attach_routines_from_env(
+    sessions: &mut [HostSession],
+    get: &mut impl FnMut(&str) -> Option<String>,
+) -> Result<(), ShellError> {
     let Some(path) = get(GATEWAY_FILE_ENV).filter(|value| !value.is_empty()) else {
-        return Ok(sessions);
+        return Ok(());
     };
     let token = get(GATEWAY_TOKEN_ENV).filter(|value| !value.is_empty());
-    attach_webhook_routines(&mut sessions, Path::new(&path), token.as_deref())?;
-    Ok(sessions)
+    attach_webhook_routines(sessions, Path::new(&path), token.as_deref())?;
+    Ok(())
+}
+
+/// Creates webhook routines for every agent under `agents_dir` that does not
+/// already have a routine of the intended name. Returns the routine names
+/// that exist afterwards (including ones that were already present). Does
+/// not open sealed stores, does not register on the homeserver, and does
+/// not log URLs or keys.
+pub fn ensure_agent_webhook_routines(
+    agents_dir: &Path,
+    gateway_file: &Path,
+    token_override: Option<&str>,
+) -> Result<Vec<String>, ShellError> {
+    let mut sessions = load_agents_dir(agents_dir)?;
+    attach_webhook_routines(&mut sessions, gateway_file, token_override)?;
+    // Re-list so a card whose credential mint returned no key still appears.
+    let mut names = list_webhook_routine_names(&sessions, gateway_file, token_override)?;
+    if names.is_empty() {
+        names = sessions
+            .iter()
+            .filter(|session| session.agent_id.is_some())
+            .map(routine_name_for)
+            .collect();
+    }
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
+/// [`ensure_agent_webhook_routines`] using the host gateway file and the
+/// agents directory from the environment (or [`DEFAULT_AGENTS_DIR`]).
+pub fn ensure_agent_webhook_routines_from_env() -> Result<Vec<String>, ShellError> {
+    let agents_dir = resolve_agents_dir(|key| std::env::var(key).ok().filter(|v| !v.is_empty()))
+        .ok_or_else(|| ShellError::SessionList("agents directory is missing".to_string()))?;
+    let gateway = std::env::var(GATEWAY_FILE_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_GATEWAY_FILE.to_string());
+    let token = std::env::var(GATEWAY_TOKEN_ENV)
+        .ok()
+        .filter(|value| !value.is_empty());
+    ensure_agent_webhook_routines(Path::new(&agents_dir), Path::new(&gateway), token.as_deref())
 }
 
 /// Gateway file the host already runs. [`GATEWAY_FILE_ENV`] overrides it.
@@ -252,16 +414,18 @@ fn routine_name_for(session: &HostSession) -> String {
     }
 }
 
-/// Creates each session's webhook routine, or reads the credential when
-/// that name already exists. A missing gateway file leaves the sessions
-/// unchanged. The URL and key stay on `sessions` and are not logged.
-fn attach_webhook_routines(
-    sessions: &mut [HostSession],
+struct GatewayConn {
+    client: reqwest::blocking::Client,
+    base: String,
+    token: String,
+}
+
+fn open_gateway(
     gateway_file: &Path,
     token_override: Option<&str>,
-) -> Result<(), ShellError> {
+) -> Result<Option<GatewayConn>, ShellError> {
     if !gateway_file.is_file() {
-        return Ok(());
+        return Ok(None);
     }
     let text = std::fs::read_to_string(gateway_file)
         .map_err(|_| ShellError::Gateway("gateway file is unreadable".to_string()))?;
@@ -286,7 +450,24 @@ fn attach_webhook_routines(
     };
     // The gateway listens on loopback only. Do not use the file's host.
     let base = format!("{scheme}://127.0.0.1:{}", file.port);
-    let client = gateway_client()?;
+    Ok(Some(GatewayConn {
+        client: gateway_client()?,
+        base,
+        token,
+    }))
+}
+
+/// Creates each session's webhook routine, or reads the credential when
+/// that name already exists. A missing gateway file leaves the sessions
+/// unchanged. The URL and key stay on `sessions` and are not logged.
+fn attach_webhook_routines(
+    sessions: &mut [HostSession],
+    gateway_file: &Path,
+    token_override: Option<&str>,
+) -> Result<(), ShellError> {
+    let Some(gate) = open_gateway(gateway_file, token_override)? else {
+        return Ok(());
+    };
     for session in sessions.iter_mut() {
         if session.routine_url.is_some() && session.routine_bearer.is_some() {
             continue;
@@ -304,7 +485,13 @@ fn attach_webhook_routines(
                 "session has no routine name".to_string(),
             ));
         }
-        match read_webhook_credential(&client, &base, &token, &agent_id, &slug)? {
+        let existing = list_agent_automations(&gate.client, &gate.base, &gate.token, &agent_id)?;
+        if let Some(card) = existing.iter().find(|card| card.name == name) {
+            // Name already exists: never mint a second card (Hostbot).
+            apply_credential(session, &gate, &agent_id, &card.id)?;
+            continue;
+        }
+        match read_webhook_credential(&gate.client, &gate.base, &gate.token, &agent_id, &slug)? {
             CredentialRead::Ready { url, key } => {
                 session.routine_url = Some(url);
                 session.routine_bearer = Some(key);
@@ -313,21 +500,83 @@ fn attach_webhook_routines(
             CredentialRead::MintFailed => continue,
             CredentialRead::Missing => {}
         }
-        let cards = create_webhook_routine(&client, &base, &token, &agent_id, &name)?;
+        let cards = create_webhook_routine(&gate.client, &gate.base, &gate.token, &agent_id, &name)?;
         let Some(card) = pick_created_card(&cards, &name, &slug) else {
             return Err(ShellError::Gateway(
                 "gateway create did not return the routine".to_string(),
             ));
         };
-        match read_webhook_credential(&client, &base, &token, &agent_id, &card.id)? {
-            CredentialRead::Ready { url, key } => {
-                session.routine_url = Some(url);
-                session.routine_bearer = Some(key);
-            }
-            CredentialRead::MintFailed | CredentialRead::Missing => {}
-        }
+        apply_credential(session, &gate, &agent_id, &card.id)?;
     }
     Ok(())
+}
+
+fn apply_credential(
+    session: &mut HostSession,
+    gate: &GatewayConn,
+    agent_id: &str,
+    automation_id: &str,
+) -> Result<(), ShellError> {
+    match read_webhook_credential(
+        &gate.client,
+        &gate.base,
+        &gate.token,
+        agent_id,
+        automation_id,
+    )? {
+        CredentialRead::Ready { url, key } => {
+            session.routine_url = Some(url);
+            session.routine_bearer = Some(key);
+        }
+        CredentialRead::MintFailed | CredentialRead::Missing => {}
+    }
+    Ok(())
+}
+
+fn list_agent_automations(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    token: &str,
+    agent_id: &str,
+) -> Result<Vec<AutomationCard>, ShellError> {
+    let (status, body) = gateway_post(
+        client,
+        base,
+        token,
+        "getAgentAutomations",
+        &serde_json::json!({ "id": agent_id }),
+    )?;
+    if status != 200 {
+        return Err(ShellError::Gateway(format!(
+            "gateway list status {status}"
+        )));
+    }
+    serde_json::from_slice(&body)
+        .map_err(|_| ShellError::Gateway("gateway list was not understood".to_string()))
+}
+
+fn list_webhook_routine_names(
+    sessions: &[HostSession],
+    gateway_file: &Path,
+    token_override: Option<&str>,
+) -> Result<Vec<String>, ShellError> {
+    let Some(gate) = open_gateway(gateway_file, token_override)? else {
+        return Ok(Vec::new());
+    };
+    let mut names = Vec::new();
+    for session in sessions {
+        let Some(agent_id) = session.agent_id.as_deref().filter(|id| !id.is_empty()) else {
+            continue;
+        };
+        let want = routine_name_for(session);
+        let cards = list_agent_automations(&gate.client, &gate.base, &gate.token, agent_id)?;
+        for card in cards {
+            if card.name == want {
+                names.push(card.name);
+            }
+        }
+    }
+    Ok(names)
 }
 
 enum CredentialRead {
@@ -508,6 +757,14 @@ pub struct MachineClient {
     sessions: Vec<OpenedStore>,
     bus: Arc<LocalBus>,
     push: crate::push::PushLink,
+    /// When set, [`Self::poll_agent_directory`] rescans this folder for new
+    /// bots and creates their webhook routines. Session stores already open
+    /// are left alone; a new process picks up new sealed stores.
+    agents_dir: Option<PathBuf>,
+    gateway_file: Option<PathBuf>,
+    gateway_token: Option<String>,
+    last_agent_poll: std::time::Instant,
+    agent_rescan_secs: u64,
 }
 
 impl MachineClient {
@@ -611,6 +868,11 @@ impl MachineClient {
             sessions: opened,
             bus,
             push,
+            agents_dir: None,
+            gateway_file: None,
+            gateway_token: None,
+            last_agent_poll: std::time::Instant::now(),
+            agent_rescan_secs: 0,
         })
     }
 
@@ -627,13 +889,15 @@ impl MachineClient {
 
     /// Web machine client open path.
     ///
-    /// [`HOMESERVER_URL_ENV`], [`STORE_ROOT_ENV`], and [`SESSIONS_DIR_ENV`].
-    /// One webhook routine per session, from the gateway file
-    /// ([`GATEWAY_FILE_ENV`], or the host gateway file when that is unset).
-    /// The token is the file's token, or [`GATEWAY_TOKEN_ENV`] when the
-    /// host injected one. A missing file leaves routines unset and does
-    /// not fail this open. URLs and keys are not read from the json files
-    /// and are not written back. [`crate::LEADER_SOCK_ENV`] is not read.
+    /// [`HOMESERVER_URL_ENV`], [`STORE_ROOT_ENV`]. Discovery prefers the
+    /// agents directory ([`AGENTS_DIR_ENV`] or [`DEFAULT_AGENTS_DIR`]) when
+    /// that folder exists; otherwise [`SESSIONS_DIR_ENV`]. One webhook
+    /// routine per agent, from the gateway file ([`GATEWAY_FILE_ENV`], or
+    /// the host gateway file when that is unset). The token is the file's
+    /// token, or [`GATEWAY_TOKEN_ENV`] when the host injected one. A missing
+    /// file leaves routines unset and does not fail this open. URLs and
+    /// keys are not read from disk and are not written back.
+    /// [`crate::LEADER_SOCK_ENV`] is not read.
     pub fn from_env() -> Result<Self, ShellError> {
         let homeserver_url = std::env::var(HOMESERVER_URL_ENV)
             .ok()
@@ -643,11 +907,7 @@ impl MachineClient {
             .ok()
             .filter(|value| !value.is_empty())
             .ok_or(ShellError::StoreRoot)?;
-        let sessions_dir = std::env::var(SESSIONS_DIR_ENV)
-            .ok()
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| ShellError::SessionList("session directory is unset".to_string()))?;
-        let sessions = load_web_sessions(Path::new(&sessions_dir), |key| {
+        let mut get = |key: &str| -> Option<String> {
             if key == GATEWAY_FILE_ENV {
                 return std::env::var(GATEWAY_FILE_ENV)
                     .ok()
@@ -655,8 +915,57 @@ impl MachineClient {
                     .or_else(|| Some(DEFAULT_GATEWAY_FILE.to_string()));
             }
             std::env::var(key).ok().filter(|value| !value.is_empty())
-        })?;
-        Self::open(&homeserver_url, Path::new(&store_root), sessions)
+        };
+        let agents_dir = resolve_agents_dir(&mut get);
+        let (sessions, agents_dir) = if let Some(dir) = agents_dir {
+            (load_web_agents(&dir, &mut get)?, Some(dir))
+        } else {
+            let sessions_dir = get(SESSIONS_DIR_ENV).ok_or_else(|| {
+                ShellError::SessionList("session directory is unset".to_string())
+            })?;
+            (load_web_sessions(Path::new(&sessions_dir), &mut get)?, None)
+        };
+        let gateway_file = get(GATEWAY_FILE_ENV).map(PathBuf::from);
+        let gateway_token = get(GATEWAY_TOKEN_ENV);
+        let agent_rescan_secs = get(AGENT_RESCAN_SECS_ENV)
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        let mut client = Self::open(&homeserver_url, Path::new(&store_root), sessions)?;
+        client.agents_dir = agents_dir;
+        client.gateway_file = gateway_file;
+        client.gateway_token = gateway_token;
+        client.agent_rescan_secs = agent_rescan_secs;
+        client.last_agent_poll = std::time::Instant::now();
+        Ok(client)
+    }
+
+    /// Rescans the agents directory when this client was opened from one.
+    /// Creates a webhook routine for each new agent that has no card of the
+    /// intended name. Does not open a new sealed store for that agent in
+    /// this process; the next open picks it up. When
+    /// [`AGENT_RESCAN_SECS_ENV`] is set and greater than zero, returns
+    /// without scanning until that many seconds have passed since the last
+    /// poll. Returns the routine names that exist for agents found on disk.
+    pub fn poll_agent_directory(&mut self) -> Result<Vec<String>, ShellError> {
+        let Some(agents_dir) = self.agents_dir.as_ref() else {
+            return Ok(Vec::new());
+        };
+        if self.agent_rescan_secs > 0 {
+            let elapsed = self.last_agent_poll.elapsed().as_secs();
+            if elapsed < self.agent_rescan_secs {
+                return Ok(Vec::new());
+            }
+        }
+        self.last_agent_poll = std::time::Instant::now();
+        let gateway = self
+            .gateway_file
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_GATEWAY_FILE));
+        ensure_agent_webhook_routines(
+            agents_dir,
+            &gateway,
+            self.gateway_token.as_deref(),
+        )
     }
 
     /// While `enabled`, drive does not call the homeserver. Requests are
@@ -1238,6 +1547,26 @@ mod tests {
                         });
                         let response = if !authorized {
                             b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+                        } else if lower.starts_with("post /api/getagentautomations ") {
+                            let request: serde_json::Value =
+                                serde_json::from_slice(&body).expect("list json");
+                            let agent = request["id"].as_str().unwrap_or("");
+                            let gate = recorded.lock().expect("gate");
+                            let list: Vec<serde_json::Value> = gate
+                                .cards
+                                .iter()
+                                .filter(|card| card.agent == agent)
+                                .map(|card| serde_json::json!({"id": card.id, "name": card.name}))
+                                .collect();
+                            drop(gate);
+                            let payload = serde_json::to_vec(&list).expect("list");
+                            let mut out = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        payload.len()
+                    )
+                    .into_bytes();
+                            out.extend(payload);
+                            out
                         } else if lower.starts_with("post /api/createagentautomation ") {
                             let request: serde_json::Value =
                                 serde_json::from_slice(&body).expect("create json");
@@ -1445,6 +1774,43 @@ mod tests {
         assert!(bare[0].routine_bearer.is_none());
         done.store(true, Ordering::Relaxed);
         let _ = server.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn agents_directory_becomes_sessions_without_hardcoded_ids() {
+        let dir = std::env::temp_dir().join(format!(
+            "m4a-agents-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_millis()
+        ));
+        let hostbot = dir.join("agent-hostbot");
+        let chief = dir.join("agent-chief");
+        std::fs::create_dir_all(&hostbot).expect("dir");
+        std::fs::create_dir_all(&chief).expect("dir");
+        std::fs::write(
+            hostbot.join("profile.json"),
+            r#"{"name":"Hostbot","description":"x"}"#,
+        )
+        .expect("profile");
+        std::fs::write(
+            chief.join("profile.json"),
+            concat!("{\"name\":\"", "Привет мир", "\",\"description\":\"x\"}"),
+        )
+        .expect("profile");
+        std::fs::write(dir.join("active-agent.json"), "{}").expect("skip file");
+        let loaded = load_agents_dir(&dir).expect("agents");
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].session_id, "agent-chief");
+        assert_eq!(loaded[0].agent_id.as_deref(), Some("agent-chief"));
+        assert_eq!(loaded[0].bot_name, "Привет мир");
+        assert_eq!(routine_name_for(&loaded[0]), "agent-chief");
+        assert_eq!(loaded[1].bot_name, "Hostbot");
+        assert_eq!(routine_name_for(&loaded[1]), "Hostbot");
+        assert!(loaded.iter().all(|session| session.routine_url.is_none()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

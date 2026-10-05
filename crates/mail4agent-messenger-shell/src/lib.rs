@@ -37,17 +37,20 @@
 //! Two open paths, one shell. This is not a second product.
 //!
 //! The web machine client is [`MachineClient::from_env`]. One process
-//! reads [`SESSIONS_DIR_ENV`]: each record is `bot_name`, `session_id`,
-//! and `agent_id` when the session has a Grok Bot agent. The nick is
+//! prefers the live agents directory ([`AGENTS_DIR_ENV`] /
+//! [`DEFAULT_AGENTS_DIR`]): each folder is an agent id (also the mail
+//! session id) and `profile.json` has the display name. When that
+//! directory is absent it reads [`SESSIONS_DIR_ENV`]. The nick is
 //! [`nick_from_display_name`] of that display name. Mail between sessions
 //! this client holds is in process
 //! ([`MachineClient::set_local_delivery`]). A peer that is not in the list
-//! uses the homeserver. Wake is one webhook routine per session that has
-//! an `agent_id`, created through the local gateway and kept in memory.
-//! The gateway agent id is that field, not the mail session id. A record
-//! without `agent_id` does not create a routine. The URL and key are not
-//! read from the session json, not written back, and not logged. This path
-//! does not read [`LEADER_SOCK_ENV`].
+//! uses the homeserver. Wake is one webhook routine per agent, created
+//! through the local gateway and kept in memory. A routine name that
+//! already exists is not created again.
+//! [`ensure_agent_webhook_routines`] creates the cards without opening
+//! stores. [`MachineClient::poll_agent_directory`] rescans for new bots.
+//! The URL and key are not read from disk, not written back, and not
+//! logged. This path does not read [`LEADER_SOCK_ENV`].
 //!
 //! A node is [`OpenedStore::connect_node_from_env`]. One CLI session, woken
 //! by ACP on [`LEADER_SOCK_ENV`]. A routine URL or bearer in the environment
@@ -77,7 +80,11 @@ use mail4agent_messenger::{
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-pub use machine::{load_session_records, HostSession, MachineClient, SESSIONS_DIR_ENV};
+pub use machine::{
+    ensure_agent_webhook_routines, ensure_agent_webhook_routines_from_env, load_agents_dir,
+    load_session_records, HostSession, MachineClient, AGENTS_DIR_ENV, AGENT_RESCAN_SECS_ENV,
+    DEFAULT_AGENTS_DIR, SESSIONS_DIR_ENV,
+};
 pub use mail4agent_messenger::{
     CreateRoomKind, DeviceId, MessageKind, MessengerCommand, OutgoingMessage, RoomId, RoomKind,
     UserId,
