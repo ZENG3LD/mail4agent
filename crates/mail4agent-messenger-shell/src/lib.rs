@@ -15,14 +15,14 @@
 //!
 //! Inbound wake is not a second mailbox. After the engine has a readable
 //! room text from someone else, this shell posts a small JSON object to
-//! the one routine URL ([`ROUTINE_URL_ENV`], or [`OpenedStore::set_wake`])
-//! through [`post_decrypted`]. The plaintext stays in `body`. `from` is
-//! the sender mxid, `event_id` is the Matrix event id, and `nick` is the
-//! sender's display name only when this shell already has one. A local
-//! session is the existing leader push ([`LEADER_SOCK_ENV`] ->
-//! `wake_decrypted_room`). Missing either target skips that trigger. It
-//! does not drop the message and it is not an error. Texts already in
-//! the store when it opens are not woken.
+//! one routine URL through [`post_decrypted`], or pushes the same text on
+//! the leader socket. The plaintext stays in `body`. `from` is the sender
+//! mxid, `event_id` is the Matrix event id, and `nick` is the sender's
+//! display name only when this shell already has one. Which of those two
+//! triggers is armed depends on the open path, not on a file. Missing the
+//! one this path uses skips that trigger. It does not drop the message
+//! and it is not an error. Texts already in the store when it opens are
+//! not woken.
 //!
 //! The device bearer stays in memory on [`OpenedStore`]. It is sent as
 //! `Authorization: Bearer` and is not written next to the sealed records.
@@ -34,18 +34,24 @@
 //! Paths the engine builds under `/_matrix` are sent without that prefix:
 //! `mail4agent-server-bin` mounts the Client-Server router at `/client/v3`.
 //!
-//! A Grok Bot web session registers itself with [`OpenedStore::connect`].
-//! The nick is derived from the bot display name ([`BOT_NAME_ENV`]), not
-//! from a slug. This path is not the local grok CLI.
+//! Two open paths, one shell. This is not a second product.
 //!
-//! One process on a machine is a [`MachineClient`]. The host passes the
-//! sessions that live there ([`MachineClient::open`], or a directory of
-//! session records at [`SESSIONS_DIR_ENV`]). There is no host API that
-//! enumerates live bot processes. Each session keeps the sealed store
-//! [`session_store_dir`] already uses. Mail between two of those sessions
-//! is performed in process. The homeserver is used only when the peer is
-//! not one of them. The existing drive loop does that work; nothing here
-//! starts a second sync daemon.
+//! The web machine client is [`MachineClient::from_env`]. One process
+//! reads [`SESSIONS_DIR_ENV`]: each record is `bot_name` and `session_id`.
+//! The nick is [`nick_from_display_name`] of that display name. Mail
+//! between sessions this client holds is in process
+//! ([`MachineClient::set_local_delivery`]). A peer that is not in the list
+//! uses the homeserver. Wake is the webhook the host injected as
+//! [`ROUTINE_URL_ENV`] and [`ROUTINE_BEARER_ENV`]. Those are not read from
+//! the session json, not written back, and not logged. This path does not
+//! read [`LEADER_SOCK_ENV`].
+//!
+//! A node is [`OpenedStore::connect_node_from_env`]. One CLI session, woken
+//! by ACP on [`LEADER_SOCK_ENV`]. A routine URL or bearer in the environment
+//! is refused before register. This path does not gain a webhook config.
+//! [`OpenedStore::connect`] still registers one session a caller already
+//! built; it is not either of those open paths and it does not read a wake
+//! from the environment.
 
 mod machine;
 mod nick;
@@ -202,16 +208,54 @@ impl Default for SessionWake {
 }
 
 impl SessionWake {
-    /// Reads the documented environment variables. Unset stays `None`.
-    pub fn from_env() -> Self {
+    /// Web machine client. The host injected [`ROUTINE_URL_ENV`] and, when
+    /// that URL is set, [`ROUTINE_BEARER_ENV`]. [`LEADER_SOCK_ENV`] is not
+    /// read. Nothing is taken from a file.
+    pub fn web_host() -> Self {
+        Self::web_from_lookup(|key| nonempty_var(key))
+    }
+
+    /// Same as [`Self::web_host`] with an explicit lookup. A leader socket
+    /// returned by `get` is ignored.
+    pub fn web_from_lookup(mut get: impl FnMut(&str) -> Option<String>) -> Self {
+        let routine_url = get(ROUTINE_URL_ENV).filter(|value| !value.is_empty());
+        let routine_bearer = if routine_url.is_some() {
+            get(ROUTINE_BEARER_ENV).filter(|value| !value.is_empty())
+        } else {
+            None
+        };
         Self {
-            routine_url: nonempty_var(ROUTINE_URL_ENV),
-            routine_bearer: nonempty_var(ROUTINE_BEARER_ENV),
-            leader_sock: std::env::var_os(LEADER_SOCK_ENV)
+            routine_url,
+            routine_bearer,
+            leader_sock: None,
+            leader_cwd: None,
+        }
+    }
+
+    /// Node CLI. [`LEADER_SOCK_ENV`] and [`LEADER_CWD_ENV`] only. A routine
+    /// URL or bearer is refused. The refused value is not copied into the
+    /// error.
+    pub fn node_cli() -> Result<Self, ShellError> {
+        Self::node_from_lookup(|key| nonempty_var(key))
+    }
+
+    /// Same as [`Self::node_cli`] with an explicit lookup.
+    pub fn node_from_lookup(
+        mut get: impl FnMut(&str) -> Option<String>,
+    ) -> Result<Self, ShellError> {
+        let routine_url = get(ROUTINE_URL_ENV).filter(|value| !value.is_empty());
+        let routine_bearer = get(ROUTINE_BEARER_ENV).filter(|value| !value.is_empty());
+        if routine_url.is_some() || routine_bearer.is_some() {
+            return Err(ShellError::NodeRoutine);
+        }
+        Ok(Self {
+            routine_url: None,
+            routine_bearer: None,
+            leader_sock: get(LEADER_SOCK_ENV)
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from),
-            leader_cwd: nonempty_var(LEADER_CWD_ENV),
-        }
+            leader_cwd: get(LEADER_CWD_ENV).filter(|value| !value.is_empty()),
+        })
     }
 }
 
@@ -264,8 +308,8 @@ impl SessionConfig {
     ///
     /// Required: [`HOMESERVER_URL_ENV`] or `homeserver_url` in toml,
     /// [`BOT_NAME_ENV`] (display name), [`SESSION_ID_ENV`], [`STORE_ROOT_ENV`].
-    /// Optional: [`DEVICE_TOKEN_ENV`], [`ROUTINE_URL_ENV`], [`ROUTINE_BEARER_ENV`],
-    /// [`LEADER_SOCK_ENV`]. `M4A_NICK` is not read.
+    /// Optional: [`DEVICE_TOKEN_ENV`]. `M4A_NICK`, [`ROUTINE_URL_ENV`], and
+    /// [`LEADER_SOCK_ENV`] are not read. Wake is chosen by the open path.
     pub fn from_env() -> Result<Self, ShellError> {
         let toml_text = load_homeserver_toml()?;
         Self::from_lookup(
@@ -606,9 +650,10 @@ impl OpenedStore {
     /// core. A different session id cannot open records this session sealed.
     ///
     /// The host keychain injects `device_token`. [`STORE_ROOT_ENV`] plus
-    /// `session_id` ([`session_store_dir`]) picks `dir`. Inbound text wakes
-    /// [`ROUTINE_URL_ENV`] rather than a side channel. The bearer stays in
-    /// memory and is not written under `dir`.
+    /// `session_id` ([`session_store_dir`]) picks `dir`. This does not read
+    /// a routine URL or a leader socket. The web machine client and the
+    /// node CLI set wake on their own open paths. The device bearer stays
+    /// in memory and is not written under `dir`.
     pub fn open(
         dir: &Path,
         session_id: &str,
@@ -673,7 +718,6 @@ impl OpenedStore {
             bus: None,
             local_peers: Vec::new(),
         };
-        opened.set_wake(SessionWake::from_env());
         // History already on disk is not a new inbound text.
         opened.note_already_present();
         Ok(opened)
@@ -688,6 +732,10 @@ impl OpenedStore {
     /// One [`Self::drive`] publishes this device's public keys. The private
     /// Olm account stays in the store.
     pub fn connect(config: &SessionConfig) -> Result<Self, ShellError> {
+        Self::connect_with_wake(config, SessionWake::default())
+    }
+
+    fn connect_with_wake(config: &SessionConfig, wake: SessionWake) -> Result<Self, ShellError> {
         let registered = register_session(config)?;
         let server_name = registered
             .user_id
@@ -705,14 +753,36 @@ impl OpenedStore {
             &registered.bearer,
         )?;
         opened.nick = Some(config.nick.clone());
+        opened.set_wake(wake);
         // The first sync is what publishes the public keys.
         opened.drive(1_000, false)?;
         Ok(opened)
     }
 
-    /// [`SessionConfig::from_env`] then [`Self::connect`].
+    /// [`SessionConfig::from_env`] then [`Self::connect`]. No routine URL
+    /// and no leader socket. The web machine client is
+    /// [`MachineClient::from_env`]. The node CLI is
+    /// [`Self::connect_node_from_env`].
     pub fn connect_from_env() -> Result<Self, ShellError> {
         Self::connect(&SessionConfig::from_env()?)
+    }
+
+    /// Node CLI open path. One session from the host environment, woken by
+    /// ACP on [`LEADER_SOCK_ENV`]. [`ROUTINE_URL_ENV`] or
+    /// [`ROUTINE_BEARER_ENV`] is refused before register, is not stored, and
+    /// is not logged. This does not read a session json.
+    pub fn connect_node_from_env() -> Result<Self, ShellError> {
+        let wake = SessionWake::node_cli()?;
+        Self::connect_with_wake(&SessionConfig::from_env()?, wake)
+    }
+
+    pub(crate) fn connect_node_from_lookup(
+        mut get: impl FnMut(&str) -> Option<String>,
+        toml_text: Option<&str>,
+    ) -> Result<Self, ShellError> {
+        let wake = SessionWake::node_from_lookup(&mut get)?;
+        let config = SessionConfig::from_lookup(&mut get, toml_text)?;
+        Self::connect_with_wake(&config, wake)
     }
 
     /// Bearer for the host keychain. Not written to disk and not logged.
@@ -1003,9 +1073,10 @@ impl OpenedStore {
         None
     }
 
-    /// Replaces the wake targets, including ones read from the environment
-    /// at [`Self::open`]. `None` or empty turns that trigger off. The
-    /// bearer is stored in [`Zeroizing`] memory and is not written to disk.
+    /// Replaces the wake targets. `None` or empty turns that trigger off.
+    /// The bearer is stored in [`Zeroizing`] memory and is not written to
+    /// disk. [`Self::open`] does not read a wake; the web machine client
+    /// and the node CLI set one on their open paths.
     pub fn set_wake(&mut self, wake: SessionWake) {
         self.routine_url = wake.routine_url.filter(|url| !url.is_empty());
         self.routine_bearer = wake
@@ -1761,6 +1832,9 @@ pub enum ShellError {
     /// The routine URL is not an `http` or `https` URL this shell can post to.
     #[error("routine url is not an http or https url")]
     RoutineUrl,
+    /// Node CLI open path saw a routine URL or bearer. The value is not included.
+    #[error("node cli does not take a routine url")]
+    NodeRoutine,
     /// The routine bearer is not a single header value. The value is not included.
     #[error("routine bearer is empty or not a single header value")]
     RoutineBearer,

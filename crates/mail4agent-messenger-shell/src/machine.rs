@@ -1,12 +1,13 @@
-//! One client process for every bot session that lives on this machine.
+//! Web machine client: one process for every bot session on this machine.
 //!
-//! The host passes the list. Nothing in this process can see another
-//! agent's session table, so discovery is that list: either
-//! [`MachineClient::open`] or a directory of session records
-//! ([`SESSIONS_DIR_ENV`]). A record is the bot display name and the session
-//! id. A routine URL or a bearer in the file is refused. Those stay on
-//! [`HostSession`], in memory, and the bearer is never written next to the
-//! sealed store.
+//! This is not the homeserver, and it is not the node CLI
+//! ([`crate::OpenedStore::connect_node_from_env`]). The host passes the
+//! list, or this process reads [`SESSIONS_DIR_ENV`]. A record is the bot
+//! display name and the session id. A routine URL or a bearer in the file
+//! is refused. [`MachineClient::from_env`] copies [`crate::ROUTINE_URL_ENV`]
+//! and [`crate::ROUTINE_BEARER_ENV`] from the process environment onto
+//! those sessions, in memory only. It does not write them back and it does
+//! not log them. [`crate::LEADER_SOCK_ENV`] is not this path.
 //!
 //! Each session still seals under [`crate::session_store_dir`]. Olm pickles
 //! are not shared. While [`MachineClient::set_local_delivery`] is set, the
@@ -141,6 +142,22 @@ pub fn load_session_records(dir: &Path) -> Result<Vec<HostSession>, ShellError> 
     Ok(out)
 }
 
+/// [`load_session_records`] plus the host-injected routine. `get` is the
+/// process environment on [`MachineClient::from_env`]. A leader socket from
+/// `get` is not copied. The json files are not rewritten.
+fn load_web_sessions(
+    dir: &Path,
+    get: impl FnMut(&str) -> Option<String>,
+) -> Result<Vec<HostSession>, ShellError> {
+    let mut sessions = load_session_records(dir)?;
+    let wake = crate::SessionWake::web_from_lookup(get);
+    for session in &mut sessions {
+        session.routine_url = wake.routine_url.clone();
+        session.routine_bearer = wake.routine_bearer.clone();
+    }
+    Ok(sessions)
+}
+
 struct Prepared {
     config: SessionConfig,
     user_id: String,
@@ -266,10 +283,13 @@ impl MachineClient {
         Self::open(homeserver_url, store_root, sessions)
     }
 
+    /// Web machine client open path.
+    ///
     /// [`HOMESERVER_URL_ENV`], [`STORE_ROOT_ENV`], and [`SESSIONS_DIR_ENV`].
-    /// Per-session routine values are not read from the environment: one
-    /// process-wide variable cannot name which session it belongs to, and
-    /// a bearer is not taken from a file.
+    /// The routine URL and bearer are the host injection
+    /// ([`crate::ROUTINE_URL_ENV`], [`crate::ROUTINE_BEARER_ENV`]), applied
+    /// to every session in this process. They are not read from the json
+    /// files. [`crate::LEADER_SOCK_ENV`] is not read.
     pub fn from_env() -> Result<Self, ShellError> {
         let homeserver_url = std::env::var(HOMESERVER_URL_ENV)
             .ok()
@@ -283,11 +303,10 @@ impl MachineClient {
             .ok()
             .filter(|value| !value.is_empty())
             .ok_or_else(|| ShellError::SessionList("session directory is unset".to_string()))?;
-        Self::open_session_dir(
-            &homeserver_url,
-            Path::new(&store_root),
-            Path::new(&sessions_dir),
-        )
+        let sessions = load_web_sessions(Path::new(&sessions_dir), |key| {
+            std::env::var(key).ok().filter(|value| !value.is_empty())
+        })?;
+        Self::open(&homeserver_url, Path::new(&store_root), sessions)
     }
 
     /// While `enabled`, drive does not call the homeserver. Requests are
@@ -684,6 +703,86 @@ mod tests {
         let text = refused.to_string();
         assert!(!text.contains("not-a-file"));
         assert!(!text.contains("127.0.0.1/hook"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn web_client_takes_the_routine_from_the_host_and_node_cli_refuses_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "m4a-split-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_millis()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let record = dir.join("hostbot.json");
+        let body = r#"{"bot_name":"Hostbot","session_id":"web-hostbot"}"#;
+        std::fs::write(&record, body).expect("write");
+        let routine = "http://127.0.0.1:9/routine";
+        let bearer = "host-injected-bearer";
+        let sessions = load_web_sessions(&dir, |key| match key {
+            crate::ROUTINE_URL_ENV => Some(routine.to_string()),
+            crate::ROUTINE_BEARER_ENV => Some(bearer.to_string()),
+            crate::LEADER_SOCK_ENV => Some("/tmp/leader.sock".to_string()),
+            _ => None,
+        })
+        .expect("web sessions");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].routine_url.as_deref(), Some(routine));
+        assert_eq!(sessions[0].routine_bearer.as_deref(), Some(bearer));
+        assert_eq!(std::fs::read_to_string(&record).expect("reread"), body);
+        let wake = crate::SessionWake::web_from_lookup(|key| match key {
+            crate::ROUTINE_URL_ENV => Some(routine.to_string()),
+            crate::LEADER_SOCK_ENV => Some("/tmp/leader.sock".to_string()),
+            _ => None,
+        });
+        assert!(wake.leader_sock.is_none());
+        assert!(wake.leader_cwd.is_none());
+
+        std::fs::write(
+            dir.join("leaked.json"),
+            r#"{"bot_name":"Courier","session_id":"web-courier","routine_url":"http://127.0.0.1:9/from-file","routine_bearer":"file-bearer"}"#,
+        )
+        .expect("leak");
+        let refused = load_web_sessions(&dir, |_| None).expect_err("json routine");
+        let text = refused.to_string();
+        assert!(!text.contains("from-file"));
+        assert!(!text.contains("file-bearer"));
+
+        let node = crate::OpenedStore::connect_node_from_lookup(
+            |key| match key {
+                crate::ROUTINE_URL_ENV => Some(routine.to_string()),
+                crate::ROUTINE_BEARER_ENV => Some(bearer.to_string()),
+                crate::LEADER_SOCK_ENV => Some("/tmp/leader.sock".to_string()),
+                _ => None,
+            },
+            None,
+        );
+        let err = match node {
+            Ok(_) => panic!("node cli accepted a routine url"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, crate::ShellError::NodeRoutine));
+        let text = err.to_string();
+        assert!(!text.contains(routine));
+        assert!(!text.contains(bearer));
+        assert!(!text.contains("leader.sock"));
+
+        let node = crate::SessionWake::node_from_lookup(|key| match key {
+            crate::LEADER_SOCK_ENV => Some("/tmp/node-leader.sock".to_string()),
+            crate::LEADER_CWD_ENV => Some("/tmp/node".to_string()),
+            _ => None,
+        })
+        .expect("node leader");
+        assert!(node.routine_url.is_none());
+        assert!(node.routine_bearer.is_none());
+        assert_eq!(
+            node.leader_sock.as_deref(),
+            Some(std::path::Path::new("/tmp/node-leader.sock"))
+        );
+        assert_eq!(node.leader_cwd.as_deref(), Some("/tmp/node"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
