@@ -74,9 +74,13 @@ pub async fn wake_decrypted_room(
     push_into_session(sock, session_id, cwd, plaintext).await
 }
 
-/// Synchronous [`wake_decrypted_room`] for a caller that is not already
-/// on a tokio runtime. A dedicated thread owns the runtime so this does
-/// not pretend the push worked.
+/// Synchronous wake for a caller that is not already on a tokio runtime.
+///
+/// `Ok` means `session/load` succeeded and the `session/prompt` frame was
+/// written. The leader's prompt result is the end of the agent turn, so
+/// this does not wait for it: the worker thread keeps the pipe open until
+/// that result or [`PROMPT_TIMEOUT`]. Waiting here stalled the listen loop
+/// for the whole turn and the busy session never saw the next letter.
 pub fn wake_decrypted_room_blocking(
     sock: &Path,
     session_id: &str,
@@ -87,16 +91,168 @@ pub fn wake_decrypted_room_blocking(
     let session_id = session_id.to_string();
     let cwd = cwd.to_string();
     let plaintext = plaintext.to_string();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
+        let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_io()
             .enable_time()
             .build()
-            .map_err(|err| PushError::Protocol(err.to_string()))?;
-        runtime.block_on(wake_decrypted_room(&sock, &session_id, &cwd, &plaintext))
+        {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                let _ = tx.send(Err(PushError::Protocol(err.to_string())));
+                return;
+            }
+        };
+        runtime.block_on(async move {
+            let stream = match connect_leader(&sock).await {
+                Ok(stream) => stream,
+                Err(err) => {
+                    let _ = tx.send(Err(err));
+                    return;
+                }
+            };
+            let (mut reader, mut writer) = tokio::io::split(stream);
+            if let Err(err) =
+                prepare_session(&mut reader, &mut writer, &session_id, &cwd).await
+            {
+                let _ = tx.send(Err(err));
+                return;
+            }
+            let payload = acp_request(PROMPT_ID, "session/prompt", session_prompt_params(&session_id, &plaintext));
+            if let Err(err) = write_value(&mut writer, &acp_envelope(&payload)).await {
+                let _ = tx.send(Err(err));
+                return;
+            }
+            let _ = tx.send(Ok(()));
+            let _ = acp_call_already_written(
+                &mut reader,
+                PROMPT_ID,
+                PROMPT_TIMEOUT,
+                PushError::PromptFailed,
+            )
+            .await;
+            let _ = write_value(&mut writer, &disconnect_message()).await;
+        });
+    });
+    match rx.recv_timeout(Duration::from_secs(20)) {
+        Ok(result) => result,
+        Err(_) => Err(PushError::LeaderAbsent),
+    }
+}
+
+async fn connect_leader(sock: &Path) -> Result<LeaderStream, PushError> {
+    #[cfg(windows)]
+    {
+        let pipe = crate::pipe::leader_pipe_os_path(sock);
+        timeout(
+            CONNECT_TIMEOUT,
+            tokio::task::spawn_blocking(move || {
+                tokio::net::windows::named_pipe::ClientOptions::new().open(pipe)
+            }),
+        )
+        .await
+        .map_err(|_| PushError::LeaderAbsent)?
+        .map_err(|_| PushError::LeaderAbsent)?
+        .map_err(|_| PushError::LeaderAbsent)
+    }
+    #[cfg(not(windows))]
+    {
+        timeout(CONNECT_TIMEOUT, tokio::net::UnixStream::connect(sock))
+            .await
+            .map_err(|_| PushError::LeaderAbsent)?
+            .map_err(|_| PushError::LeaderAbsent)
+    }
+}
+
+#[cfg(windows)]
+type LeaderStream = tokio::net::windows::named_pipe::NamedPipeClient;
+#[cfg(not(windows))]
+type LeaderStream = tokio::net::UnixStream;
+
+async fn prepare_session<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    session_id: &str,
+    cwd: &str,
+) -> Result<(), PushError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    write_value(writer, &register_message()).await?;
+    let registered = read_until(reader, REGISTER_TIMEOUT, |value| {
+        registered_is_ready(value).is_some()
     })
-    .join()
-    .map_err(|_| PushError::Protocol("leader thread dropped".to_string()))?
+    .await?;
+    if !registered_is_ready(&registered).unwrap_or(true) {
+        read_until(reader, READY_TIMEOUT, |value| {
+            server_type(value) == Some("leader_ready")
+        })
+        .await
+        .map_err(|_| PushError::LeaderNotReady)?;
+    }
+    acp_call(
+        reader,
+        writer,
+        INIT_ID,
+        "initialize",
+        initialize_params(),
+        INIT_TIMEOUT,
+        PushError::Protocol,
+    )
+    .await?;
+    acp_call(
+        reader,
+        writer,
+        LOAD_ID,
+        "session/load",
+        session_load_params(session_id, cwd),
+        LOAD_TIMEOUT,
+        PushError::SessionLoadFailed,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn acp_call_already_written<R, F>(
+    reader: &mut R,
+    id: i64,
+    limit: Duration,
+    fail: F,
+) -> Result<(), PushError>
+where
+    R: AsyncRead + Unpin,
+    F: Fn(String) -> PushError,
+{
+    let deadline = Instant::now() + limit;
+    loop {
+        let value = read_one(reader, deadline).await?;
+        if let Some(err) = terminal(&value) {
+            return Err(err);
+        }
+        if server_type(&value) != Some("acp") {
+            continue;
+        }
+        let Some(inner_text) = value.get("payload").and_then(Value::as_str) else {
+            continue;
+        };
+        let inner: Value = match serde_json::from_str(inner_text) {
+            Ok(parsed) => parsed,
+            Err(_) => continue,
+        };
+        match classify_inbound(&inner, id) {
+            Inbound::Ignore => continue,
+            Inbound::Matched { ok: true, .. } => return Ok(()),
+            Inbound::Matched { ok: false, error } => {
+                let message = truncate(&error.unwrap_or_else(|| "error".to_string()));
+                if message.contains("leader_starting") {
+                    return Err(PushError::LeaderNotReady);
+                }
+                return Err(fail(message));
+            }
+        }
+    }
 }
 
 async fn finish<S>(stream: S, session_id: &str, cwd: &str, text: &str) -> Result<(), PushError>

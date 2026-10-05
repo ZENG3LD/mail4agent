@@ -2344,6 +2344,64 @@ impl<C: RecordCodec> MessengerCore<C> {
         true
     }
 
+    /// Decrypts Megolm rows already on the timeline. `pending_decrypt` is
+    /// memory-only, so a restarted client still holds the ciphertext and
+    /// would otherwise never turn it into text the leader trigger can see.
+    pub fn decrypt_loaded_timeline(&mut self) {
+        let rooms: Vec<RoomId> = self.timelines.keys().cloned().collect();
+        for room_id in rooms {
+            let sealed: Vec<(EventId, i64, UserId, MegolmEncryptedContent)> = {
+                let Some(timeline) = self.timelines.get(&room_id) else {
+                    continue;
+                };
+                timeline
+                    .items()
+                    .iter()
+                    .filter_map(|item| {
+                        let event_id = item.event_id.clone()?;
+                        let (session_id, ciphertext) = match &item.content {
+                            ItemContent::Encrypted { session_id, ciphertext_b64 } => {
+                                (session_id.clone(), ciphertext_b64.clone())
+                            }
+                            _ => return None,
+                        };
+                        Some((
+                            event_id,
+                            item.origin_server_ts,
+                            item.sender.clone(),
+                            MegolmEncryptedContent {
+                                ciphertext,
+                                session_id,
+                                sender_key: None,
+                                device_id: None,
+                                relates_to: None,
+                            },
+                        ))
+                    })
+                    .collect()
+            };
+            for (event_id, origin_server_ts, sender, content) in sealed {
+                let Ok(plaintext) = GroupSessionManager::decrypt_event(
+                    &mut self.store,
+                    &room_id,
+                    &event_id,
+                    origin_server_ts,
+                    &sender,
+                    &content,
+                ) else {
+                    continue;
+                };
+                self.apply_decrypted_plaintext(
+                    &room_id,
+                    &event_id,
+                    &sender,
+                    origin_server_ts,
+                    &plaintext,
+                );
+            }
+        }
+    }
+
     /// Applies one successfully-decrypted Megolm plaintext to `room_id`'s
     /// timeline entry for `event_id` — as an ordinary message
     /// ([`Timeline::set_decrypted`]), or, when the plaintext itself carries

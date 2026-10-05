@@ -21,8 +21,11 @@
 //! display name only when this shell already has one. Which of those two
 //! triggers is armed depends on the open path, not on a file. Missing the
 //! one this path uses skips that trigger. It does not drop the message
-//! and it is not an error. Texts already in the store when it opens are
-//! not woken.
+//! and it is not an error. Routine replay skips texts already loaded.
+//! A leader prompt skips keys already listed in `leader-prompted`. When
+//! that file records nothing, joined rooms with an empty timeline are
+//! paged once from the stored sync token, and only the newest inbound
+//! text in each room is prompted.
 //!
 //! The device bearer stays in memory on [`OpenedStore`]. It is sent as
 //! `Authorization: Bearer` and is not written next to the sealed records.
@@ -61,6 +64,7 @@
 //! built; it is not either of those open paths and it does not read a wake
 //! from the environment.
 
+mod grok_listen;
 mod ipc;
 mod machine;
 mod nick;
@@ -96,6 +100,7 @@ pub use mail4agent_messenger::{
     CreateRoomKind, DeviceId, MessageKind, MessengerCommand, OutgoingMessage, RoomId, RoomKind,
     UserId,
 };
+pub use grok_listen::{hear, GrokListener, Heard, ListenReport};
 pub use nick::{nick_from_display_name, routine_folder_id};
 pub use node::{NodeClient, NodeTickReport, NODE_DEFAULT_SOCK_NAME};
 pub use push::PushedRoomEvent;
@@ -722,6 +727,9 @@ pub struct OpenedStore {
     local_peers: Vec<(String, String)>,
     /// Room texts pushed on the machine socket for this session. Not `/sync`.
     pushed_room_events: Vec<PushedRoomEvent>,
+    /// Joined rooms already paged once. Timelines are not stored, so a
+    /// resumed process asks `/messages` from the sync token a single time.
+    history_pulled: HashSet<String>,
 }
 
 struct SyncFlight {
@@ -838,8 +846,10 @@ impl OpenedStore {
             bus: None,
             local_peers: Vec::new(),
             pushed_room_events: Vec::new(),
+            history_pulled: HashSet::new(),
         };
-        // History already on disk is not a new inbound text.
+        // Routine replay is suppressed for whatever is already on disk.
+        // A leader prompt is not. Only a recorded successful prompt is.
         opened.note_already_present();
         Ok(opened)
     }
@@ -1316,6 +1326,9 @@ impl OpenedStore {
     /// A homeserver that wakes that poll (this server does) delivers the
     /// event without the shell polling twice.
     pub fn drive(&mut self, now_ms: i64, wait_for_sync: bool) -> Result<(), ShellError> {
+        self.core.decrypt_loaded_timeline();
+        let trace_at = self.http_trace.len();
+        let history = self.request_missing_history(now_ms)?;
         let mut waited_long_poll = false;
         if wait_for_sync && self.sync_flight.is_some() {
             // A poll that already finished is a stale catch-up. Do not
@@ -1357,7 +1370,66 @@ impl OpenedStore {
             }
             self.wake_inbound();
         }
+        self.note_history_pages(&history, trace_at);
         Ok(())
+    }
+
+    /// Joined rooms whose timeline is still empty. The engine does not
+    /// store timeline rows, and `/sync?since=` does not replay them. One
+    /// backward `/messages` from the stored sync token loads that gap.
+    fn request_missing_history(&mut self, now_ms: i64) -> Result<Vec<String>, ShellError> {
+        let me = self.core.user_id().clone();
+        let ids: Vec<RoomId> = self.core.room_ids().cloned().collect();
+        let mut requested = Vec::new();
+        for room_id in ids {
+            if !self.room_needs_history(&room_id, &me) {
+                continue;
+            }
+            let label = room_id.as_str().to_string();
+            self.core
+                .dispatch(MessengerCommand::LoadOlder { room_id }, now_ms)?;
+            requested.push(label);
+        }
+        Ok(requested)
+    }
+
+    fn room_needs_history(&self, room_id: &RoomId, me: &UserId) -> bool {
+        if self.history_pulled.contains(room_id.as_str()) {
+            return false;
+        }
+        let joined = match self
+            .core
+            .room_state(room_id)
+            .and_then(|state| state.members.get(me))
+        {
+            Some(member) => matches!(member.membership, Membership::Join),
+            None => false,
+        };
+        if !joined {
+            return false;
+        }
+        match self.core.timeline(room_id) {
+            Some(timeline) => timeline.items().is_empty(),
+            None => true,
+        }
+    }
+
+    fn note_history_pages(&mut self, requested: &[String], trace_at: usize) {
+        if requested.is_empty() {
+            return;
+        }
+        let ok = self.http_trace[trace_at..]
+            .iter()
+            .filter(|(kind, status)| {
+                *kind == OutgoingRequestKind::RoomMessages && (200..300).contains(status)
+            })
+            .count();
+        if ok < requested.len() {
+            return;
+        }
+        for room_id in requested {
+            self.history_pulled.insert(room_id.clone());
+        }
     }
 
     /// Rooms this account has state for.
@@ -1649,18 +1721,98 @@ impl OpenedStore {
     fn note_already_present(&mut self) {
         for item in self.inbound_plaintexts() {
             self.routine_sent.insert(item.key.clone());
-            self.leader_sent.insert(item.key);
         }
+        self.load_leader_prompted();
+    }
+
+    /// Keys already given to `session/prompt`. A missing file is the first
+    /// run of this trigger: older rows stay quiet, and the newest inbound
+    /// text in each room is left unmarked so the trigger fires for it.
+    fn load_leader_prompted(&mut self) {
+        let path = self.dir.join(LEADER_PROMPTED_FILE);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                for line in text.lines() {
+                    let Some((room, event)) = line.split_once('\t') else {
+                        continue;
+                    };
+                    if room.is_empty() || event.is_empty() {
+                        continue;
+                    }
+                    self.leader_sent.insert(format!("{room}\n{event}"));
+                }
+            }
+            Err(_) => self.seed_leader_prompted_except_newest(&path),
+        }
+    }
+
+    fn seed_leader_prompted_except_newest(&mut self, path: &Path) {
+        let items = self.inbound_plaintexts();
+        let mut newest: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for item in &items {
+            newest.insert(item.room_id.clone(), item.key.clone());
+        }
+        let mut lines = String::new();
+        for item in &items {
+            if newest.get(&item.room_id) == Some(&item.key) {
+                continue;
+            }
+            self.leader_sent.insert(item.key.clone());
+            if let Some((room, event)) = item.key.split_once('\n') {
+                lines.push_str(room);
+                lines.push('\t');
+                lines.push_str(event);
+                lines.push('\n');
+            }
+        }
+        let _ = std::fs::write(path, lines);
+    }
+
+    fn remember_leader_prompt(&mut self, key: &str) {
+        self.leader_sent.insert(key.to_string());
+        let Some((room, event)) = key.split_once('\n') else {
+            return;
+        };
+        if room.is_empty() || event.is_empty() {
+            return;
+        }
+        let path = self.dir.join(LEADER_PROMPTED_FILE);
+        let mut file = match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(_) => return,
+        };
+        use std::io::Write;
+        let _ = write!(file, "{room}\t{event}\n");
     }
 
     /// Posts and/or prompts each new inbound plaintext. A missing URL or
     /// socket skips that trigger. A failed trigger is remembered on
     /// [`Self::wake_note`] and retried on a later [`Self::drive`]. The
     /// timeline row stays either way.
+    /// An empty `leader-prompted` was often written before any timeline
+    /// row existed. Once history is in memory, keep every inbound except
+    /// the newest in each room off the leader.
+    fn arm_unprompted_newest(&mut self) {
+        if self.leader_sock.is_none() || !self.leader_sent.is_empty() {
+            return;
+        }
+        if self.inbound_plaintexts().is_empty() {
+            return;
+        }
+        let path = self.dir.join(LEADER_PROMPTED_FILE);
+        self.seed_leader_prompted_except_newest(&path);
+    }
+
     fn wake_inbound(&mut self) {
         if self.routine_url.is_none() && self.leader_sock.is_none() {
             return;
         }
+        self.arm_unprompted_newest();
         let url = self.routine_url.clone();
         let bearer = self.routine_bearer.clone();
         let sock = self.leader_sock.clone();
@@ -1727,7 +1879,7 @@ impl OpenedStore {
                         &item.body,
                     ) {
                         Ok(()) => {
-                            self.leader_sent.insert(item.key.clone());
+                            self.remember_leader_prompt(&item.key);
                         }
                         Err(err) => {
                             self.wake_note = Some(clip_public(err.to_string()));
@@ -2076,7 +2228,15 @@ fn persist(dir: &Path, core: &mut MessengerCore<SealedRecordCodec>) -> Result<()
 }
 
 /// Files in a session directory that are not sealed records.
-const NOT_RECORDS: &[&str] = &[machine::WAKE_KEYCHAIN_FILE, machine::STORE_LOCK_FILE];
+const NOT_RECORDS: &[&str] = &[
+    machine::WAKE_KEYCHAIN_FILE,
+    machine::STORE_LOCK_FILE,
+    LEADER_PROMPTED_FILE,
+];
+
+/// Event ids this process has already handed to the leader. Presence in the
+/// timeline is not a prompt. One line is `room \t event_id`.
+const LEADER_PROMPTED_FILE: &str = "leader-prompted";
 
 fn read_records(dir: &Path) -> Result<Vec<SealedRecord>, ShellError> {
     let mut records = Vec::new();

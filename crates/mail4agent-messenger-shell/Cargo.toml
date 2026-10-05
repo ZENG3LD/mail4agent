@@ -40,5 +40,9 @@ name = "m4a-node-client"
 path = "src/bin/node_client.rs"
 
 [[bin]]
+name = "m4a-grok-listen"
+path = "src/bin/grok_listen.rs"
+
+[[bin]]
 name = "m4a-send"
 path = "src/bin/send.rs"
