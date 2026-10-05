@@ -72,25 +72,43 @@ impl SendReply {
 
 /// Socket path: [`SEND_SOCK_ENV`] when set, else [`DEFAULT_SOCK_NAME`]
 /// under `store_root`.
-pub fn send_sock_path(mut get: impl FnMut(&str) -> Option<String>, store_root: &Path) -> PathBuf {
+pub fn send_sock_path(get: impl FnMut(&str) -> Option<String>, store_root: &Path) -> PathBuf {
+    send_sock_path_named(get, store_root, DEFAULT_SOCK_NAME)
+}
+
+/// Like [`send_sock_path`], but uses `default_name` under `store_root` when
+/// [`SEND_SOCK_ENV`] is unset (node client uses `node-client.sock`).
+pub fn send_sock_path_named(
+    mut get: impl FnMut(&str) -> Option<String>,
+    store_root: &Path,
+    default_name: &str,
+) -> PathBuf {
     get(SEND_SOCK_ENV)
         .map(PathBuf::from)
-        .unwrap_or_else(|| store_root.join(DEFAULT_SOCK_NAME))
+        .unwrap_or_else(|| store_root.join(default_name))
 }
 
 /// Sets each `KEY=VALUE` from the env file ([`ENV_FILE_ENV`] or the
-/// default path) that the environment does not already have. Blank lines
-/// and `#` comments are skipped; surrounding quotes are dropped. Call at
-/// the start of `main`, before any thread starts. Returns the file read.
+/// default web-client path) that the environment does not already have.
+/// Blank lines and `#` comments are skipped; surrounding quotes are
+/// dropped. Call at the start of `main`, before any thread starts.
+/// Returns the file read.
 pub fn load_env_file() -> Option<PathBuf> {
+    load_env_file_named("web-client.env")
+}
+
+/// Like [`load_env_file`], but the default under
+/// `$HOME/.config/mail4agent/` is `default_name` (node uses
+/// `node-client.env`). [`ENV_FILE_ENV`] still wins when set.
+pub fn load_env_file_named(default_name: &str) -> Option<PathBuf> {
     let path = std::env::var(ENV_FILE_ENV)
         .ok()
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|home| PathBuf::from(home).join(".config/mail4agent/web-client.env"))
+            std::env::var("HOME").ok().map(|home| {
+                PathBuf::from(home).join(".config/mail4agent").join(default_name)
+            })
         })?;
     let text = std::fs::read_to_string(&path).ok()?;
     for (key, value) in parse_env_lines(&text) {

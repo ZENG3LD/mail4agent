@@ -923,7 +923,7 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn lock_store(dir: &Path) -> Result<File, ShellError> {
+pub(crate) fn lock_store(dir: &Path) -> Result<File, ShellError> {
     std::fs::create_dir_all(dir)?;
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -977,13 +977,13 @@ fn device_bearer_path(keychain_dir: &Path, session_id: &str) -> PathBuf {
     crate::session_store_dir(keychain_dir, session_id).join(DEVICE_KEYCHAIN_FILE)
 }
 
-fn load_device_bearer(keychain_dir: &Path, session_id: &str) -> Option<String> {
+pub(crate) fn load_device_bearer(keychain_dir: &Path, session_id: &str) -> Option<String> {
     let text = std::fs::read_to_string(device_bearer_path(keychain_dir, session_id)).ok()?;
     let token = text.trim().to_string();
     (!token.is_empty()).then_some(token)
 }
 
-fn save_device_bearer(keychain_dir: &Path, session_id: &str, token: &str) {
+pub(crate) fn save_device_bearer(keychain_dir: &Path, session_id: &str, token: &str) {
     if write_secret_file(
         &device_bearer_path(keychain_dir, session_id),
         token.as_bytes(),

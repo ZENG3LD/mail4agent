@@ -63,6 +63,7 @@
 
 mod machine;
 mod nick;
+mod node;
 mod push;
 mod send;
 
@@ -95,10 +96,11 @@ pub use mail4agent_messenger::{
     UserId,
 };
 pub use nick::{nick_from_display_name, routine_folder_id};
+pub use node::{NodeClient, NodeTickReport, NODE_DEFAULT_SOCK_NAME};
 pub use push::PushedRoomEvent;
 pub use send::{
-    load_env_file, send_sock_path, send_via_socket, SendReply, SendRequest, DEFAULT_SOCK_NAME,
-    ENV_FILE_ENV, MAX_SEND_BYTES, SEND_SOCK_ENV,
+    load_env_file, load_env_file_named, send_sock_path, send_sock_path_named, send_via_socket,
+    SendReply, SendRequest, DEFAULT_SOCK_NAME, ENV_FILE_ENV, MAX_SEND_BYTES, SEND_SOCK_ENV,
 };
 
 /// SHA-256 of `session_id`'s UTF-8 bytes. That digest is the check that this
@@ -290,7 +292,7 @@ impl SessionWake {
     }
 }
 
-fn nonempty_var(name: &str) -> Option<String> {
+pub(crate) fn nonempty_var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
@@ -378,6 +380,11 @@ impl SessionConfig {
     /// Derived nick. Not the display name.
     pub fn nick(&self) -> &str {
         &self.nick
+    }
+
+    /// Homeserver origin this session will register against.
+    pub fn homeserver_url(&self) -> &str {
+        &self.homeserver_url
     }
 
     /// [`session_store_dir`] for this session under the configured root.
@@ -845,7 +852,7 @@ impl OpenedStore {
         Self::connect_with_wake(config, SessionWake::default())
     }
 
-    fn connect_with_wake(config: &SessionConfig, wake: SessionWake) -> Result<Self, ShellError> {
+    pub(crate) fn connect_with_wake(config: &SessionConfig, wake: SessionWake) -> Result<Self, ShellError> {
         let registered = register_session(config)?;
         let server_name = registered
             .user_id
@@ -904,6 +911,21 @@ impl OpenedStore {
     /// [`Self::open`] leaves this empty.
     pub fn nick(&self) -> Option<&str> {
         self.nick.as_deref()
+    }
+
+    /// Session / device id used for the seal and for ACP `sessionId`.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// Homeserver origin this store performs Client-Server calls against.
+    pub fn homeserver_url(&self) -> &str {
+        self.base_url.as_str().trim_end_matches('/')
+    }
+
+    /// Whether an ACP leader socket is configured for wake.
+    pub fn has_leader(&self) -> bool {
+        self.leader_sock.is_some()
     }
 
     /// Directory this store seals into. Not shared with another session.
