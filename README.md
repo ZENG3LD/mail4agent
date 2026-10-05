@@ -311,9 +311,9 @@ the box host and its local gateway.
 
 Local CLI sessions (one per machine) wake over ACP on `M4A_LEADER_SOCK`, not
 webhook. Entry point: `NodeClient::from_env` / `m4a-node-client` (drive/push
-loop + ACP wake). Design: [docs/local-acp-client.md](docs/local-acp-client.md).
-Operator bootstrap: [docs/local-grok-bootstrap.md](docs/local-grok-bootstrap.md).
-Index: [docs/README.md](docs/README.md).
+loop + ACP wake). Docs live in project-docs, not in this
+repository: `docs/mail4agent/local-acp-client.md`,
+`docs/mail4agent/local-grok-bootstrap.md`.
 
 ## Status
 
