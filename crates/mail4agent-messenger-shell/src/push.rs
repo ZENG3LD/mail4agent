@@ -1,7 +1,9 @@
 //! The machine client's one socket. The client opens it against the
-//! homeserver it already has. Room text for a session registered on this
-//! connection is pushed here. The ack goes out before the text is handed
-//! to that session. This path does not POST and it does not call `/sync`.
+//! homeserver it already has. Room text, and an encrypted event with no
+//! plaintext body, for a session registered on this connection is pushed
+//! here. The ack goes out before the event is handed to that session.
+//! This path does not POST and it does not call `/sync`. The client that
+//! holds the Megolm keys decrypts after an encrypted push.
 
 use std::io::ErrorKind;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,17 +15,20 @@ use tungstenite::{stream::MaybeTlsStream, Message};
 
 use crate::{clip_public, ShellError};
 
-/// One room text the homeserver pushed for a single session.
+/// One room event the homeserver pushed for a single session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PushedRoomEvent {
     /// Room id.
     pub room: String,
     /// Sender mxid.
     pub sender: String,
-    /// Plaintext body. Ciphertext is not pushed on this socket.
+    /// Plaintext body. Empty when `wire_type` is `m.room.encrypted`.
+    /// The server does not invent one.
     pub body: String,
     /// Matrix event id.
     pub event_id: String,
+    /// `m.room.message` or `m.room.encrypted`.
+    pub wire_type: String,
 }
 
 struct Incoming {
@@ -100,11 +105,7 @@ fn push_ws_url(base: &str) -> Result<String, ShellError> {
     let url = reqwest::Url::parse(base).map_err(|_| ShellError::BaseUrl)?;
     let scheme = match url.scheme() {
         "http" => "ws",
-        "https" => {
-            return Err(ShellError::Http(
-                "push socket is opened from an http homeserver, not https".into(),
-            ));
-        }
+        "https" => "wss",
         _ => return Err(ShellError::BaseUrl),
     };
     let host = url
@@ -151,6 +152,9 @@ fn run_socket(
     match socket.get_mut() {
         MaybeTlsStream::Plain(tcp) => {
             let _ = tcp.set_read_timeout(Some(Duration::from_millis(200)));
+        }
+        MaybeTlsStream::Rustls(tls) => {
+            let _ = tls.sock.set_read_timeout(Some(Duration::from_millis(200)));
         }
         _ => {}
     }
@@ -214,10 +218,29 @@ fn parse_event(value: &serde_json::Value) -> Option<Incoming> {
     }
     let room = event.get("room")?.as_str()?.to_string();
     let sender = event.get("sender")?.as_str()?.to_string();
-    let body = event.get("body")?.as_str()?.to_string();
     let event_id = event.get("event_id")?.as_str()?.to_string();
     let recipient = event.get("recipient")?.as_str()?.to_string();
-    if room.is_empty() || sender.is_empty() || event_id.is_empty() || recipient.is_empty() {
+    let wire_type = event
+        .get("wire_type")
+        .and_then(|item| item.as_str())
+        .unwrap_or("");
+    let body = if wire_type == "m.room.encrypted" {
+        // Ignore a body if one is present. It is not plaintext.
+        String::new()
+    } else {
+        event.get("body")?.as_str()?.to_string()
+    };
+    let wire_type = if wire_type.is_empty() {
+        "m.room.message".to_string()
+    } else {
+        wire_type.to_string()
+    };
+    if room.is_empty()
+        || sender.is_empty()
+        || event_id.is_empty()
+        || recipient.is_empty()
+        || (wire_type != "m.room.encrypted" && body.is_empty())
+    {
         return None;
     }
     Some(Incoming {
@@ -227,6 +250,43 @@ fn parse_event(value: &serde_json::Value) -> Option<Incoming> {
             sender,
             body,
             event_id,
+            wire_type,
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn https_homeserver_opens_the_push_socket_as_wss() {
+        let url = push_ws_url("https://example.test/ignored").expect("url");
+        assert_eq!(url, "wss://example.test/client/v3/push");
+        let local = push_ws_url("http://127.0.0.1:9").expect("local");
+        assert_eq!(local, "ws://127.0.0.1:9/client/v3/push");
+    }
+
+    #[test]
+    fn encrypted_push_keeps_the_event_id_and_drops_any_body() {
+        let value = serde_json::json!({
+            "type": "event",
+            "envelope_id": "p1",
+            "event": {
+                "room": "!room:example",
+                "sender": "@a:example",
+                "event_id": "$evt",
+                "recipient": "@b:example",
+                "wire_type": "m.room.encrypted",
+                "body": "not-plaintext",
+            }
+        });
+        let incoming = parse_event(&value).expect("parsed");
+        assert_eq!(incoming.recipient, "@b:example");
+        assert_eq!(incoming.event.event_id, "$evt");
+        assert_eq!(incoming.event.wire_type, "m.room.encrypted");
+        assert!(incoming.event.body.is_empty());
+        assert_eq!(incoming.event.room, "!room:example");
+        assert_eq!(incoming.event.sender, "@a:example");
+    }
 }

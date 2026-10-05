@@ -1,7 +1,8 @@
 //! `GET /client/v3/push`. The machine client opens this socket. The
 //! server does not call out. The first text frame registers every device
-//! bearer this connection speaks for. Later frames are acks. Room text
-//! is pushed after that, one envelope per recipient.
+//! bearer this connection speaks for. Later frames are acks. A new room
+//! text, or a new encrypted event with no plaintext body, is pushed after
+//! that, one envelope per recipient.
 
 use std::sync::Arc;
 
