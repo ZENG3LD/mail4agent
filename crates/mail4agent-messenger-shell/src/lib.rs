@@ -723,6 +723,10 @@ pub struct OpenedStore {
     leader_cwd: Option<String>,
     /// Inbound event keys whose routine POST already succeeded.
     routine_sent: HashSet<String>,
+    /// When true, the next [`Self::wake_inbound`] with timeline rows seeds
+    /// older keys into [`ROUTINE_WOKEN_FILE`] (newest still POSTs once) —
+    /// first open after a missing/empty ledger, once tip/history has landed.
+    routine_woken_seed_pending: bool,
     /// Inbound event keys whose leader prompt already succeeded.
     leader_sent: HashSet<String>,
     /// Last wake failure, clipped. No bearer and no message body.
@@ -858,6 +862,7 @@ impl OpenedStore {
             leader_sock: None,
             leader_cwd: None,
             routine_sent: HashSet::new(),
+            routine_woken_seed_pending: false,
             leader_sent: HashSet::new(),
             wake_chain: None,
             wake_route: None,
@@ -1815,10 +1820,82 @@ impl OpenedStore {
     }
 
     fn note_already_present(&mut self) {
-        for item in self.inbound_plaintexts() {
-            self.routine_sent.insert(item.key.clone());
-        }
+        self.load_routine_woken();
         self.load_leader_prompted();
+    }
+
+    /// Load [`ROUTINE_WOKEN_FILE`]. A missing file means seed once tip/history
+    /// has filled the timeline (see [`Self::wake_inbound`]).
+    fn load_routine_woken(&mut self) {
+        let path = self.dir.join(ROUTINE_WOKEN_FILE);
+        match std::fs::read_to_string(&path) {
+            Ok(text) if !text.trim().is_empty() => {
+                for line in text.lines() {
+                    let Some((room, event)) = line.split_once('\t') else {
+                        continue;
+                    };
+                    if room.is_empty() || event.is_empty() {
+                        continue;
+                    }
+                    self.routine_sent.insert(format!("{room}\n{event}"));
+                }
+                self.routine_woken_seed_pending = false;
+            }
+            Ok(_) | Err(_) => {
+                // Missing or empty ledger: seed once tip/history fills the timeline.
+                self.routine_woken_seed_pending = true;
+            }
+        }
+    }
+
+    /// Mark every inbound plaintext except the newest in each room as already
+    /// woken, and persist. The newest still fires once (then
+    /// [`Self::remember_routine_wake`] lasting across restarts). Mirrors
+    /// [`Self::seed_leader_prompted_except_newest`].
+    fn seed_routine_woken_from_timeline(&mut self) {
+        let path = self.dir.join(ROUTINE_WOKEN_FILE);
+        let items = self.inbound_plaintexts();
+        let mut newest: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for item in &items {
+            newest.insert(item.room_id.clone(), item.key.clone());
+        }
+        let mut lines = String::new();
+        for item in &items {
+            if newest.get(&item.room_id) == Some(&item.key) {
+                continue;
+            }
+            self.routine_sent.insert(item.key.clone());
+            if let Some((room, event)) = item.key.split_once('\n') {
+                lines.push_str(room);
+                lines.push('\t');
+                lines.push_str(event);
+                lines.push('\n');
+            }
+        }
+        let _ = std::fs::write(path, lines);
+        self.routine_woken_seed_pending = false;
+    }
+
+    fn remember_routine_wake(&mut self, key: &str) {
+        self.routine_sent.insert(key.to_string());
+        let Some((room, event)) = key.split_once('\n') else {
+            return;
+        };
+        if room.is_empty() || event.is_empty() {
+            return;
+        }
+        let path = self.dir.join(ROUTINE_WOKEN_FILE);
+        let mut file = match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(_) => return,
+        };
+        use std::io::Write;
+        let _ = write!(file, "{room}\t{event}\n");
     }
 
     /// Keys already given to `session/prompt`. A missing file is the first
@@ -1908,6 +1985,14 @@ impl OpenedStore {
         if self.routine_url.is_none() && self.leader_sock.is_none() && self.wake_chain.is_none() {
             return;
         }
+        if self.routine_woken_seed_pending && self.routine_url.is_some() {
+            // Tip/history may have just filled an empty timeline. Mark older
+            // rows woken without POSTing; newest still fires once, then the
+            // ledger persists across restarts.
+            if !self.inbound_plaintexts().is_empty() {
+                self.seed_routine_woken_from_timeline();
+            }
+        }
         self.arm_unprompted_newest();
         let url = self.routine_url.clone();
         let bearer = self.routine_bearer.clone();
@@ -1937,7 +2022,7 @@ impl OpenedStore {
                         bearer.as_ref().map(|token| token.as_str()),
                     ) {
                         Ok(()) => {
-                            self.routine_sent.insert(item.key.clone());
+                            self.remember_routine_wake(&item.key);
                             self.wake_log.push(WakeAttempt {
                                 event_id: item.event_id.clone(),
                                 status: Some(200),
@@ -2354,11 +2439,15 @@ const NOT_RECORDS: &[&str] = &[
     machine::WAKE_KEYCHAIN_FILE,
     machine::STORE_LOCK_FILE,
     LEADER_PROMPTED_FILE,
+    ROUTINE_WOKEN_FILE,
 ];
 
 /// Event ids this process has already handed to the leader. Presence in the
 /// timeline is not a prompt. One line is `room \t event_id`.
 const LEADER_PROMPTED_FILE: &str = "leader-prompted";
+/// Persisted `room\tevent_id` lines: routine webhook already woke this key.
+/// Without it, restart + tip-page re-POSTs historical plaintext to the routine.
+const ROUTINE_WOKEN_FILE: &str = "routine-woken";
 
 fn read_records(dir: &Path) -> Result<Vec<SealedRecord>, ShellError> {
     let mut records = Vec::new();
@@ -3243,6 +3332,43 @@ mod tests {
             "@bob:localhost",
             "$m1:localhost",
             None,
+        );
+    }
+
+    #[test]
+    fn routine_wake_stays_once_across_store_reopen() {
+        let (base, home_done, home) = spawn_homeserver("wake-persist");
+        let (routine, hits, routine_done, routine_thread) = spawn_routine();
+        let dir = temp_dir("wake-persist");
+        let mut store = open_against(&base, &dir.0, "session-a");
+        store.set_wake(SessionWake {
+            routine_url: Some(routine.clone()),
+            ..SessionWake::default()
+        });
+        store.drive(1_000, false).expect("drive");
+        let ledger = dir.0.join("routine-woken");
+        assert!(
+            ledger.is_file(),
+            "successful wake must persist routine-woken"
+        );
+        drop(store);
+        let mut store = open_against(&base, &dir.0, "session-a");
+        store.set_wake(SessionWake {
+            routine_url: Some(routine),
+            ..SessionWake::default()
+        });
+        store.drive(1_000, false).expect("drive again");
+        store.drive(3_000, false).expect("drive third");
+        let note = store.wake_note().unwrap_or("").to_string();
+        drop(store);
+        stop(&routine_done, routine_thread);
+        stop(&home_done, home);
+        let hits = hits.lock().expect("hits");
+        assert_eq!(
+            hits.len(),
+            1,
+            "reopen must not re-POST the same event; note={note} hits={}",
+            hits.len()
         );
     }
 
