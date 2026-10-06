@@ -394,7 +394,7 @@ fn e2e_edit_reply_and_reaction_round_trip() {
 }
 
 #[test]
-fn e2e_channel_sends_plaintext_and_members_read_it() {
+fn e2e_channel_is_encrypted_and_members_decrypt() {
     let mut server = FakeServer::new();
     let mut alice = Device::new("alice", "ALICE1");
     let mut bob = Device::new("bob", "BOB1");
@@ -405,15 +405,18 @@ fn e2e_channel_sends_plaintext_and_members_read_it() {
     alice.core.dispatch(MessengerCommand::CreateRoom { kind }, 0).expect("dispatch create_room");
     alice.drive_until(&mut server, 0, "alice's own channel appears", |core| core.room_ids().next().is_some());
     let room_id = alice.core.room_ids().next().cloned().expect("room present");
-    assert!(alice.core.room_state(&room_id).expect("room present").encryption.is_none(), "a channel is never encrypted");
+    assert!(
+        alice.core.room_state(&room_id).expect("room present").encryption.is_some(),
+        "public channels are E2E; join_rule alone marks them public"
+    );
 
-    // A public channel is discovered out of band (a directory search, a
-    // shared link, ...), not via an invite -- this test's own harness plays
-    // that role by handing bob the room id directly, same as a real client
-    // would after a directory lookup.
+    // Public channel: join without invite (directory / shared link).
     bob.core.dispatch(MessengerCommand::JoinRoom { room_id: room_id.clone() }, 0).expect("dispatch join_room");
     let bob_user_id = bob.user_id.clone();
     bob.drive_until(&mut server, 0, "bob's own join lands", |core| is_joined(core, &room_id, &bob_user_id));
+    // Alice must sync bob's join (and query his devices) before sending so
+    // the Megolm room key is shared to him.
+    alice.drive_until(&mut server, 0, "alice sees bob joined", |core| is_joined(core, &room_id, &bob_user_id));
 
     alice
         .core
@@ -422,10 +425,9 @@ fn e2e_channel_sends_plaintext_and_members_read_it() {
     alice.drive_until(&mut server, 0, "alice's send reaches Sent", |core| {
         find_by_body(core, &room_id, "welcome").send_state == SendState::Sent
     });
-    bob.drive_until(&mut server, 0, "bob receives the channel message", |core| has_body(core, &room_id, "welcome"));
+    bob.drive_until(&mut server, 0, "bob decrypts the channel message", |core| has_body(core, &room_id, "welcome"));
 
     let item = find_by_body(&bob.core, &room_id, "welcome");
-    assert_eq!(item.event_type, "m.room.message", "channel content arrives as plaintext m.room.message, not encrypted");
     assert_eq!(item_body(item), Some("welcome"));
 }
 

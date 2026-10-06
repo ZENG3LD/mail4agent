@@ -1,9 +1,9 @@
 //! The machine client's one socket. The client opens it against the
-//! homeserver it already has. Room text, and an encrypted event with no
-//! plaintext body, for a session registered on this connection is pushed
-//! here. The ack goes out before the event is handed to that session.
-//! This path does not POST and it does not call `/sync`. The client that
-//! holds the Megolm keys decrypts after an encrypted push.
+//! homeserver it already has. Push contract **v1**: metadata only
+//! (`room`, `sender`, `event_id`, `recipient`, `wire_type`) — never a
+//! plaintext `body`. The ack goes out before the event is handed to that
+//! session. This path does not POST. The client drives `/sync` and
+//! decrypts after the push.
 
 use std::io::ErrorKind;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,8 +22,9 @@ pub struct PushedRoomEvent {
     pub room: String,
     /// Sender mxid.
     pub sender: String,
-    /// Plaintext body. Empty when `wire_type` is `m.room.encrypted`.
-    /// The server does not invent one.
+    /// Always empty on push v1 (server never sends plaintext). Kept so
+    /// call sites compiling against this struct stay stable; wake uses
+    /// `/sync` + decrypt, not this field.
     pub body: String,
     /// Matrix event id.
     pub event_id: String,
@@ -223,23 +224,11 @@ fn parse_event(value: &serde_json::Value) -> Option<Incoming> {
     let wire_type = event
         .get("wire_type")
         .and_then(|item| item.as_str())
-        .unwrap_or("");
-    let body = if wire_type == "m.room.encrypted" {
-        // Ignore a body if one is present. It is not plaintext.
-        String::new()
-    } else {
-        event.get("body")?.as_str()?.to_string()
-    };
-    let wire_type = if wire_type.is_empty() {
-        "m.room.message".to_string()
-    } else {
-        wire_type.to_string()
-    };
-    if room.is_empty()
-        || sender.is_empty()
-        || event_id.is_empty()
-        || recipient.is_empty()
-        || (wire_type != "m.room.encrypted" && body.is_empty())
+        .unwrap_or("m.room.message")
+        .to_string();
+    // Push v1: never trust/require body. Always empty locally.
+    let body = String::new();
+    if room.is_empty() || sender.is_empty() || event_id.is_empty() || recipient.is_empty() || wire_type.is_empty()
     {
         return None;
     }
@@ -271,6 +260,7 @@ mod tests {
     fn encrypted_push_keeps_the_event_id_and_drops_any_body() {
         let value = serde_json::json!({
             "type": "event",
+            "v": 1,
             "envelope_id": "p1",
             "event": {
                 "room": "!room:example",
@@ -288,5 +278,25 @@ mod tests {
         assert!(incoming.event.body.is_empty());
         assert_eq!(incoming.event.room, "!room:example");
         assert_eq!(incoming.event.sender, "@a:example");
+    }
+
+    #[test]
+    fn v1_plaintext_wire_type_parses_without_body() {
+        let value = serde_json::json!({
+            "type": "event",
+            "v": 1,
+            "envelope_id": "p2",
+            "event": {
+                "room": "!room:example",
+                "sender": "@a:example",
+                "event_id": "$evt2",
+                "recipient": "@b:example",
+                "wire_type": "m.room.message",
+            }
+        });
+        let incoming = parse_event(&value).expect("v1 without body must parse");
+        assert!(incoming.event.body.is_empty());
+        assert_eq!(incoming.event.wire_type, "m.room.message");
+        assert_eq!(incoming.event.event_id, "$evt2");
     }
 }

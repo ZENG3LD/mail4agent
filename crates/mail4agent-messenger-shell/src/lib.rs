@@ -745,6 +745,9 @@ pub struct OpenedStore {
     /// Joined rooms already paged once. Timelines are not stored, so a
     /// resumed process asks `/messages` from the sync token a single time.
     history_pulled: HashSet<String>,
+    /// Joined rooms whose tip page has already landed in this process.
+    /// A `/sync` token that has moved past an event will not replay it.
+    tip_pulled: HashSet<String>,
 }
 
 struct SyncFlight {
@@ -864,6 +867,7 @@ impl OpenedStore {
             local_peers: Vec::new(),
             pushed_room_events: Vec::new(),
             history_pulled: HashSet::new(),
+            tip_pulled: HashSet::new(),
         };
         // Routine replay is suppressed for whatever is already on disk.
         // A leader prompt is not. Only a recorded successful prompt is.
@@ -1375,6 +1379,7 @@ impl OpenedStore {
         self.core.decrypt_loaded_timeline();
         let trace_at = self.http_trace.len();
         let history = self.request_missing_history(now_ms)?;
+        self.pull_room_tips()?;
         let mut waited_long_poll = false;
         if wait_for_sync && self.sync_flight.is_some() {
             // A poll that already finished is a stale catch-up. Do not
@@ -1417,7 +1422,52 @@ impl OpenedStore {
             self.wake_inbound();
         }
         self.note_history_pages(&history, trace_at);
+        self.note_room_tips();
         Ok(())
+    }
+
+    /// Newest page of each joined room, once the timeline is still empty.
+    /// [`MessengerCore::pull_latest_page`] does not use the sync token.
+    fn pull_room_tips(&mut self) -> Result<(), ShellError> {
+        let me = self.core.user_id().clone();
+        let ids: Vec<RoomId> = self.core.room_ids().cloned().collect();
+        for room_id in ids {
+            if self.tip_pulled.contains(room_id.as_str()) {
+                continue;
+            }
+            if self
+                .core
+                .timeline(&room_id)
+                .is_some_and(|timeline| !timeline.items().is_empty())
+            {
+                self.tip_pulled.insert(room_id.as_str().to_string());
+                continue;
+            }
+            let joined = self.core.room_state(&room_id).is_some_and(|state| {
+                state
+                    .members
+                    .get(&me)
+                    .is_some_and(|member| matches!(member.membership, Membership::Join))
+            });
+            if !joined {
+                continue;
+            }
+            self.core.pull_latest_page(room_id)?;
+        }
+        Ok(())
+    }
+
+    fn note_room_tips(&mut self) {
+        let ids: Vec<RoomId> = self.core.room_ids().cloned().collect();
+        for room_id in ids {
+            if self
+                .core
+                .timeline(&room_id)
+                .is_some_and(|timeline| !timeline.items().is_empty())
+            {
+                self.tip_pulled.insert(room_id.as_str().to_string());
+            }
+        }
     }
 
     /// Joined rooms whose timeline is still empty. The engine does not

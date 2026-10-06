@@ -387,6 +387,7 @@ fn encrypted_event_is_pushed_to_session_b_and_not_session_a() {
     assert!(!frame.contains("access_token") && !frame.contains("bearer"));
     let value: serde_json::Value = serde_json::from_str(&frame).expect("push json");
     assert_eq!(value["type"], "event");
+    assert_eq!(value["v"], 1, "push v1 required");
     assert_eq!(value["event"]["room"], room_id);
     assert_eq!(value["event"]["sender"], "@alicepub:localhost");
     assert_eq!(value["event"]["recipient"], "@bobpub:localhost");

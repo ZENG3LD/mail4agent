@@ -510,9 +510,8 @@ fn stable_hits(client: &MachineClient) -> u64 {
     }
 }
 
-/// Server has a plaintext room event for session B. The one socket this
-/// machine client opened receives it. Session A does not. The client does
-/// not POST.
+/// Server accepts a channel send; push v1 metadata reaches session B's
+/// socket (no plaintext body). Session A does not. The client does not POST.
 #[test]
 fn one_socket_pushes_session_b_and_not_session_a() {
     let temp = TempDb {
@@ -593,13 +592,13 @@ fn one_socket_pushes_session_b_and_not_session_a() {
         room_id = courier
             .rooms()
             .into_iter()
-            .find(|room| room.membership == "join" && !room.encrypted)
+            .find(|room| room.membership == "join")
             .map(|room| room.room_id);
         if room_id.is_some() {
             break;
         }
     }
-    let room_id = room_id.unwrap_or_else(|| panic!("unencrypted channel; {}", describe(&courier)));
+    let room_id = room_id.unwrap_or_else(|| panic!("channel missing; {}", describe(&courier)));
     let mut chief_now = 20_000_i64;
     client
         .session_mut("privet-mir")
@@ -689,7 +688,7 @@ fn one_socket_pushes_session_b_and_not_session_a() {
             .expect("b")
             .pushed_room_events()
             .iter()
-            .any(|event| event.body == body);
+            .any(|event| event.event_id.starts_with('$') && event.body.is_empty());
         if got || start.elapsed() > Duration::from_secs(5) {
             break;
         }
@@ -713,12 +712,22 @@ fn one_socket_pushes_session_b_and_not_session_a() {
     let event = &pushed_b[0];
     assert_eq!(event.room, room_id);
     assert_eq!(event.sender, sender);
-    assert_eq!(event.body, body);
+    assert!(
+        event.body.is_empty(),
+        "push v1 must not carry plaintext body, got {:?}",
+        event.body
+    );
+    assert!(
+        event.wire_type == "m.room.encrypted" || event.wire_type == "m.room.message",
+        "wire_type {}",
+        event.wire_type
+    );
     assert!(
         event.event_id.starts_with('$'),
         "event id {}",
         event.event_id
     );
+    let _ = body; // sent plaintext; push carries metadata only
     assert_eq!(
         client.homeserver_hits(),
         hits,

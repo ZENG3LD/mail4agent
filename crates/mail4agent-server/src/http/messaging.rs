@@ -316,6 +316,8 @@ mod tests {
     const RAW: &str = "send-token";
 
     #[tokio::test]
+    /// Legacy path: a pre-model unencrypted public room still accepts
+    /// plaintext `m.room.message`. New channels are created encrypted.
     async fn joined_member_sends_message_in_unencrypted_public_room() {
         let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory sqlite");
         store::create_matrix_schema(&conn).expect("matrix schema");

@@ -159,14 +159,17 @@ pub fn bootstrap_member_events(kind: RoomKind, creator: (i64, &str, &str), invit
 }
 
 
-/// `join_rule`, `history_visibility`, `is_encrypted` per plan §5's table.
-/// `pub(crate)` — also the P12 legacy-DM migration's bootstrap builder (see
-/// `routes::matrix::mod`'s own doc comment on `pub mod rooms`).
+/// `join_rule`, `history_visibility`, `is_encrypted` for a fresh room.
+/// Public vs private differs only in join rights: every kind is E2E
+/// encrypted with `history_visibility: shared`. (Older plan §5 left
+/// channels plaintext/`world_readable`; that contradicted the product
+/// model — server must never see content.)
+/// `pub(crate)` — also the P12 legacy-DM migration's bootstrap builder.
 pub fn room_kind_settings(kind: RoomKind) -> (JoinRule, HistoryVisibility, bool) {
     match kind {
         RoomKind::Dm => (JoinRule::Invite, HistoryVisibility::Shared, true),
         RoomKind::Group => (JoinRule::Invite, HistoryVisibility::Shared, true),
-        RoomKind::Channel => (JoinRule::Public, HistoryVisibility::WorldReadable, false),
+        RoomKind::Channel => (JoinRule::Public, HistoryVisibility::Shared, true),
     }
 }
 
@@ -227,19 +230,17 @@ pub fn power_levels_content(creator_mxid: &str, kind: RoomKind, invite_level: i6
 }
 
 
-/// `PUT state/{eventType}/{stateKey}`'s `m.room.encryption` rule (P5
-/// correction): refuse changing/removing an EXISTING encryption event
-/// outright, and refuse setting it for the first time on a public room.
-/// Every other event type is unconditionally fine as far as this rule goes.
+/// `PUT state/{eventType}/{stateKey}`'s `m.room.encryption` rule: refuse
+/// changing/removing an EXISTING encryption event. Enabling encryption on
+/// a still-unencrypted room (including a public channel) is allowed — all
+/// room kinds are E2E. `join_rule` is retained for call-site compatibility.
 pub fn check_encryption_state_change(event_type: &str, join_rule: JoinRule, already_encrypted: bool) -> Result<(), MatrixError> {
+    let _ = join_rule;
     if event_type != "m.room.encryption" {
         return Ok(());
     }
     if already_encrypted {
         return Err(MatrixError::forbidden("encryption cannot be changed once set"));
-    }
-    if join_rule == JoinRule::Public {
-        return Err(MatrixError::forbidden("encryption cannot be enabled on a public room"));
     }
     Ok(())
 }
@@ -840,4 +841,209 @@ pub fn apply_forget(conn: &Connection, room_id: &str, user_id: i64) -> Result<()
         return Err(MatrixError::forbidden("must have left the room before forgetting it"));
     }
     Ok(())
+}
+
+
+/// Enable Megolm on every still-plaintext room: write `m.room.encryption`
+/// if missing, flip `rooms.is_encrypted`, and normalize
+/// `history_visibility` to `shared` (public vs private = join_rule only).
+/// Past timeline plaintext rows stay as historical `m.room.message`; new
+/// sends must be encrypted. Idempotent. Returns how many rooms were changed.
+pub fn migrate_plaintext_rooms_to_encrypted(
+    conn: &mut Connection,
+    now: &str,
+    origin_ts: i64,
+) -> Result<usize, MatrixError> {
+    let plaintext: Vec<(String, i64, String)> = {
+        let mut stmt = conn
+            .prepare("SELECT id, creator_user_id, history_visibility FROM rooms WHERE is_encrypted = 0")
+            .map_err(|e| MatrixError::unknown(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .map_err(|e| MatrixError::unknown(e.to_string()))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| MatrixError::unknown(e.to_string()))?
+    };
+    let mut changed = 0usize;
+    for (room_id, creator_user_id, hv) in plaintext {
+        let already = crate::store::current_state_event(conn, &room_id, "m.room.encryption", "")?.is_some();
+        if !already {
+            let event_id = crate::store::new_event_id();
+            crate::store::apply_state_event(
+                conn,
+                &crate::store::StateEventWrite {
+                    event_id: &event_id,
+                    room_id: &room_id,
+                    sender_user_id: creator_user_id,
+                    event_type: "m.room.encryption",
+                    state_key: "",
+                    content: r#"{"algorithm":"m.megolm.v1.aes-sha2"}"#,
+                    origin_server_ts: origin_ts,
+                    now,
+                },
+            )?;
+        }
+        if hv == HistoryVisibility::WorldReadable.as_str() {
+            let event_id = crate::store::new_event_id();
+            crate::store::apply_state_event(
+                conn,
+                &crate::store::StateEventWrite {
+                    event_id: &event_id,
+                    room_id: &room_id,
+                    sender_user_id: creator_user_id,
+                    event_type: "m.room.history_visibility",
+                    state_key: "",
+                    content: r#"{"history_visibility":"shared"}"#,
+                    origin_server_ts: origin_ts,
+                    now,
+                },
+            )?;
+            conn.execute(
+                "UPDATE rooms SET history_visibility = ?1 WHERE id = ?2",
+                rusqlite::params![HistoryVisibility::Shared.as_str(), room_id],
+            )
+            .map_err(|e| MatrixError::unknown(e.to_string()))?;
+        }
+        conn.execute(
+            "UPDATE rooms SET is_encrypted = 1 WHERE id = ?1",
+            rusqlite::params![room_id],
+        )
+        .map_err(|e| MatrixError::unknown(e.to_string()))?;
+        changed += 1;
+    }
+    Ok(changed)
+}
+
+/// Drop empty `legacy_dm_message_map` (P12 scaffold). Refuses if any rows remain.
+pub fn drop_legacy_dm_scaffold_if_empty(conn: &Connection) -> Result<bool, MatrixError> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='legacy_dm_message_map'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| MatrixError::unknown(e.to_string()))?;
+    if count == 0 {
+        return Ok(false);
+    }
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM legacy_dm_message_map", [], |row| row.get(0))
+        .map_err(|e| MatrixError::unknown(e.to_string()))?;
+    if rows > 0 {
+        return Err(MatrixError::forbidden("legacy_dm_message_map still has rows; refuse drop"));
+    }
+    conn.execute_batch("DROP TABLE IF EXISTS legacy_dm_message_map;")
+        .map_err(|e| MatrixError::unknown(e.to_string()))?;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod messenger_model_tests {
+    use super::*;
+    use crate::store::{self, HistoryVisibility, JoinRule, RoomKind};
+    use rusqlite::Connection;
+
+    const T0: &str = "2026-10-06T00:00:00+00:00";
+
+    fn test_conn() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory sqlite");
+        store::create_matrix_schema(&conn).expect("schema");
+        conn
+    }
+
+    #[test]
+    fn every_room_kind_is_encrypted_public_differs_only_in_join_rule() {
+        let (jr, hv, enc) = room_kind_settings(RoomKind::Dm);
+        assert_eq!(jr, JoinRule::Invite);
+        assert_eq!(hv, HistoryVisibility::Shared);
+        assert!(enc);
+
+        let (jr, hv, enc) = room_kind_settings(RoomKind::Group);
+        assert_eq!(jr, JoinRule::Invite);
+        assert_eq!(hv, HistoryVisibility::Shared);
+        assert!(enc);
+
+        let (jr, hv, enc) = room_kind_settings(RoomKind::Channel);
+        assert_eq!(jr, JoinRule::Public);
+        assert_eq!(hv, HistoryVisibility::Shared);
+        assert!(enc, "public channels are E2E; join_rule alone marks them public");
+    }
+
+    #[test]
+    fn encryption_may_be_enabled_on_a_public_room_but_never_changed() {
+        check_encryption_state_change("m.room.encryption", JoinRule::Public, false).expect("enable ok");
+        let err = check_encryption_state_change("m.room.encryption", JoinRule::Public, true).unwrap_err();
+        assert!(format!("{err:?}").contains("changed") || format!("{err:?}").to_lowercase().contains("forbidden"));
+    }
+
+    #[test]
+    fn public_channel_join_without_invite_private_group_requires_invite() {
+        let mut conn = test_conn();
+        store::ensure_matrix_user(&conn, 1, "alice000000000000000000000000001", T0).expect("alice");
+        let bob_mxid = store::ensure_matrix_user(&conn, 2, "bob00000000000000000000000000002", T0).expect("bob");
+
+        let channel = "!chan:example.org";
+        let (jr, hv, enc) = room_kind_settings(RoomKind::Channel);
+        store::create_room(&conn, channel, RoomKind::Channel, 1, T0, enc, jr, hv, None, None).expect("channel");
+        match decide_and_apply_join(&mut conn, channel, 2, &bob_mxid, "bob", T0, 1_000).expect("join") {
+            JoinDecision::Joined(_) => {}
+            JoinDecision::AlreadyJoined => panic!("expected fresh join"),
+        }
+
+        let group = "!grp:example.org";
+        let (jr, hv, enc) = room_kind_settings(RoomKind::Group);
+        store::create_room(&conn, group, RoomKind::Group, 1, T0, enc, jr, hv, None, None).expect("group");
+        match decide_and_apply_join(&mut conn, group, 2, &bob_mxid, "bob", T0, 2_000) {
+            Err(err) => {
+                let msg = format!("{err:?}").to_lowercase();
+                assert!(msg.contains("invitation") || msg.contains("forbidden"), "{msg}");
+            }
+            Ok(_) => panic!("stranger must not join a private group without invite"),
+        }
+    }
+
+    #[test]
+    fn migrate_plaintext_public_channel_sets_encryption_and_shared_hv() {
+        let mut conn = test_conn();
+        store::ensure_matrix_user(&conn, 1, "alice000000000000000000000000001", T0).expect("alice");
+        let channel = "!oldchan:example.org";
+        store::create_room(
+            &conn,
+            channel,
+            RoomKind::Channel,
+            1,
+            T0,
+            false,
+            JoinRule::Public,
+            HistoryVisibility::WorldReadable,
+            None,
+            None,
+        )
+        .expect("legacy channel");
+        let n = migrate_plaintext_rooms_to_encrypted(&mut conn, T0, 1_000).expect("migrate");
+        assert_eq!(n, 1);
+        let room = store::get_room(&conn, channel).expect("get").expect("exists");
+        assert!(room.is_encrypted);
+        assert_eq!(room.history_visibility, HistoryVisibility::Shared);
+        assert!(store::current_state_event(&conn, channel, "m.room.encryption", "")
+            .expect("state")
+            .is_some());
+        let n2 = migrate_plaintext_rooms_to_encrypted(&mut conn, T0, 2_000).expect("idempotent");
+        assert_eq!(n2, 0);
+    }
+
+    #[test]
+    fn drop_legacy_dm_scaffold_when_empty() {
+        let conn = test_conn();
+        // Schema no longer creates the table; simulate an old DB.
+        conn.execute_batch(
+            "CREATE TABLE legacy_dm_message_map (
+                legacy_message_id INTEGER PRIMARY KEY,
+                event_id TEXT NOT NULL
+            );",
+        )
+        .expect("old table");
+        assert!(drop_legacy_dm_scaffold_if_empty(&conn).expect("drop"));
+        assert!(!drop_legacy_dm_scaffold_if_empty(&conn).expect("already gone"));
+    }
 }

@@ -661,11 +661,12 @@ impl FakeServer {
             .unwrap_or_default();
 
         let is_channel = !is_direct && visibility == "public";
-        let encrypted = !is_channel;
+        // All room kinds are E2E; public vs private is join_rule only.
+        let encrypted = true;
         let (events_default, invite_level, join_rule, history_visibility) = if is_direct {
             (0i64, 50i64, "invite", "shared")
         } else if is_channel {
-            (50i64, 50i64, "public", "world_readable")
+            (50i64, 50i64, "public", "shared")
         } else {
             (0i64, if members_can_invite { 0i64 } else { 50i64 }, "invite", "shared")
         };
@@ -725,9 +726,9 @@ impl FakeServer {
         json_response(200, &serde_json::json!({ "room_id": room_id.as_str() }))
     }
 
-    /// `POST /rooms/{roomId}/join` -- this fake never checks a join rule
-    /// (module doc: spec-shaped, not spec-complete); joining a room that
-    /// does not exist in `self.rooms` is a `404`.
+    /// `POST /rooms/{roomId}/join` -- enforces join_rule: public rooms
+    /// allow anyone; invite rooms require an invite (or already joined).
+    /// Unknown room -> 404.
     fn handle_join_room(&mut self, as_user: &UserId, request: &OutgoingRequest) -> HttpResponseDescriptor {
         let Some(room_id) = parse_room_action_path(&request.path) else {
             return json_response(400, &serde_json::json!({ "errcode": "M_UNKNOWN", "error": "fake server: malformed join path" }));
@@ -735,6 +736,24 @@ impl FakeServer {
         let Some(room) = self.rooms.get_mut(&room_id) else {
             return json_response(404, &serde_json::json!({ "errcode": "M_NOT_FOUND", "error": "fake server: unknown room" }));
         };
+        let current = room.members.get(as_user).cloned();
+        if current.as_ref() == Some(&Membership::Join) {
+            return json_response(200, &serde_json::json!({ "room_id": room_id.as_str() }));
+        }
+        let join_rule = room
+            .current_state
+            .get(&("m.room.join_rules".to_string(), String::new()))
+            .and_then(|event| event.get("content"))
+            .and_then(|content| content.get("join_rule"))
+            .and_then(Value::as_str)
+            .unwrap_or("invite");
+        let invited = current.as_ref() == Some(&Membership::Invite);
+        if join_rule != "public" && !invited {
+            return json_response(
+                403,
+                &serde_json::json!({ "errcode": "M_FORBIDDEN", "error": "no invitation to this room" }),
+            );
+        }
         room.apply_state("m.room.member", as_user.as_str(), as_user, serde_json::json!({ "membership": "join" }));
         room.members.insert(as_user.clone(), Membership::Join);
         self.broadcast_membership_awareness(&room_id, as_user);

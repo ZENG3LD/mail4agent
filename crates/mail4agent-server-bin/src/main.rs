@@ -82,7 +82,8 @@ fn run() -> Result<(), String> {
     validate_key_hex(&key_hex)?;
     let bootstrap = read_bootstrap()?;
 
-    let conn = open_messenger(&server_name, &db_path, &key_hex)?;
+    let mut conn = open_messenger(&server_name, &db_path, &key_hex)?;
+    run_boot_migrations(&mut conn)?;
     if let Some(boot) = &bootstrap {
         seed_user(&conn, boot)?;
         eprintln!("bootstrapped one local user");
@@ -91,6 +92,23 @@ fn run() -> Result<(), String> {
 
     let runtime = tokio::runtime::Runtime::new().map_err(|err| format!("runtime: {err}"))?;
     runtime.block_on(serve(bind, app))
+}
+
+
+fn run_boot_migrations(conn: &mut Connection) -> Result<(), String> {
+    use mail4agent_server::rooms::{drop_legacy_dm_scaffold_if_empty, migrate_plaintext_rooms_to_encrypted};
+    let now = Utc::now().to_rfc3339();
+    let origin_ts = Utc::now().timestamp_millis();
+    let n = migrate_plaintext_rooms_to_encrypted(conn, &now, origin_ts).map_err(|e| format!("{e:?}"))?;
+    if n > 0 {
+        eprintln!("migrated {n} plaintext room(s) to encrypted");
+    }
+    match drop_legacy_dm_scaffold_if_empty(conn) {
+        Ok(true) => eprintln!("dropped empty legacy_dm_message_map"),
+        Ok(false) => {}
+        Err(err) => eprintln!("legacy_dm drop skipped: {err:?}"),
+    }
+    Ok(())
 }
 
 fn open_messenger(server_name: &str, db_path: &Path, key_hex: &str) -> Result<Connection, String> {
