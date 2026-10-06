@@ -69,6 +69,7 @@ mod ipc;
 mod machine;
 mod nick;
 mod node;
+mod provider;
 mod push;
 mod send;
 
@@ -103,6 +104,11 @@ pub use mail4agent_messenger::{
 pub use grok_listen::{hear, GrokListener, Heard, ListenReport};
 pub use nick::{nick_from_display_name, routine_folder_id};
 pub use node::{NodeClient, NodeTickReport, NODE_DEFAULT_SOCK_NAME};
+pub use provider::{
+    adapter_for, wake_prompt, ClaudeCodeAdapter, CodexAdapter, CursorAgentAdapter,
+    GrokLeaderAdapter, KimiCodeAdapter, ProviderKind, ProviderSession, WakeAdapter, WakeError,
+    WakeLetter, WakeOutcome, INBOX_DIR_ENV, PROVIDER_ENV,
+};
 pub use push::PushedRoomEvent;
 pub use send::{
     load_env_file, load_env_file_named, send_sock_path, send_sock_path_named, send_via_socket,
