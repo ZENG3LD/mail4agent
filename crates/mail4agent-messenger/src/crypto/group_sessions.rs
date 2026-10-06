@@ -110,10 +110,12 @@ use crate::crypto::olm_sessions::{DecryptedToDevice, OlmSessionManager};
 use crate::error::MessengerError;
 use crate::ids::{DeviceId, EventId, RoomId, UserId};
 use crate::store::CryptoStore;
-use crate::wire::events::{MegolmEncryptedContent, RelatesTo, RoomEncryptedContent, RoomEncryptionContent, RoomKeyContent};
+use crate::wire::events::{
+    ForwardedRoomKeyContent, MegolmEncryptedContent, RelatesTo, RoomEncryptedContent, RoomEncryptionContent, RoomKeyContent,
+};
 use mail4agent_vodozemac::megolm::{
-    DecryptionError as MegolmDecryptionError, GroupSession, InboundGroupSession, MegolmMessage, SessionConfig,
-    SessionKey, SessionOrdering,
+    DecryptionError as MegolmDecryptionError, ExportedSessionKey, GroupSession, InboundGroupSession, MegolmMessage,
+    SessionConfig, SessionKey, SessionOrdering,
 };
 use mail4agent_vodozemac::{Curve25519PublicKey, DecodeError as VodozemacDecodeError, Ed25519PublicKey};
 use serde::{Deserialize, Serialize};
@@ -699,6 +701,30 @@ impl GroupSessionManager {
         room_key_content: &RoomKeyContent,
     ) -> Result<serde_json::Value, MessengerError> {
         let content_value = serde_json::to_value(room_key_content)?;
+        Self::build_encrypted_to_device_body(
+            store,
+            account,
+            our_user_id,
+            our_device_id,
+            chunk,
+            "m.room_key",
+            content_value,
+        )
+    }
+
+    /// Same fan-out as [`GroupSessionManager::build_room_key_send_to_device_body`],
+    /// for any inner to-device type (`m.room_key`, `m.room_key_request`,
+    /// `m.forwarded_room_key`). The outer `sendToDevice` type stays
+    /// `m.room.encrypted`.
+    pub fn build_encrypted_to_device_body<S: CryptoStore>(
+        store: &mut S,
+        account: &OlmAccountState,
+        our_user_id: &UserId,
+        our_device_id: &DeviceId,
+        chunk: &[StoredDevice],
+        event_type: &str,
+        content_value: serde_json::Value,
+    ) -> Result<serde_json::Value, MessengerError> {
         let mut by_user: BTreeMap<UserId, serde_json::Map<String, serde_json::Value>> = BTreeMap::new();
         for device in chunk {
             let encrypted = OlmSessionManager::encrypt_to_device(
@@ -707,7 +733,7 @@ impl GroupSessionManager {
                 our_user_id,
                 our_device_id,
                 device,
-                "m.room_key",
+                event_type,
                 content_value.clone(),
             )?;
             let wire_content = serde_json::to_value(RoomEncryptedContent::Olm(encrypted))?;
@@ -718,6 +744,58 @@ impl GroupSessionManager {
             top.insert(user_id.as_str().to_string(), serde_json::Value::Object(devices));
         }
         Ok(serde_json::json!({ "messages": serde_json::Value::Object(top) }))
+    }
+
+    /// The `m.forwarded_room_key` body for an inbound session this store
+    /// holds, exported at its first known index so earlier messages in the
+    /// session still decrypt. `None` when this device has no such session.
+    pub fn forwarded_room_key_content<S: CryptoStore>(
+        store: &S,
+        room_id: &RoomId,
+        session_id: &str,
+        our_curve25519_b64: &str,
+    ) -> Result<Option<ForwardedRoomKeyContent>, MessengerError> {
+        let Some(record) = load_inbound_record(store, room_id, session_id)? else { return Ok(None) };
+        let InboundGroupSessionRecord { session, bound_sender_curve25519, bound_sender_ed25519, .. } = record;
+        let inbound = InboundGroupSession::from_pickle(session);
+        if inbound.session_id() != session_id {
+            return Ok(None);
+        }
+        let exported = inbound.export_at_first_known_index();
+        Ok(Some(ForwardedRoomKeyContent {
+            algorithm: MEGOLM_ALGORITHM.to_string(),
+            room_id: room_id.clone(),
+            session_id: session_id.to_string(),
+            session_key: exported.to_base64(),
+            sender_key: bound_sender_curve25519,
+            sender_claimed_ed25519_key: Some(bound_sender_ed25519),
+            forwarding_curve25519_key_chain: vec![our_curve25519_b64.to_string()],
+        }))
+    }
+
+    /// The current outbound `m.room_key` when its session id matches.
+    /// This key starts at the ratchet's current index, so it does not
+    /// decrypt messages encrypted before that index. Callers prefer
+    /// [`GroupSessionManager::forwarded_room_key_content`].
+    pub fn outbound_room_key_content<S: CryptoStore>(
+        store: &S,
+        room_id: &RoomId,
+        session_id: &str,
+    ) -> Result<Option<RoomKeyContent>, MessengerError> {
+        let Some(bytes) = store.outbound_group_session(room_id)?.map(<[u8]>::to_vec) else { return Ok(None) };
+        let record: OutboundGroupSessionRecord = serde_json::from_slice(&bytes).map_err(|source| {
+            MessengerError::Crypto(format!("decode outbound Megolm session for room {room_id}: {source}"))
+        })?;
+        let session = GroupSession::from_pickle(record.session);
+        if session.session_id() != session_id {
+            return Ok(None);
+        }
+        Ok(Some(RoomKeyContent {
+            algorithm: MEGOLM_ALGORITHM.to_string(),
+            room_id: room_id.clone(),
+            session_id: session_id.to_string(),
+            session_key: session.session_key().to_base64(),
+        }))
     }
 
     /// Convenience wrapper over [`GroupSessionManager::receive_room_key`]
@@ -776,6 +854,37 @@ impl GroupSessionManager {
             // nothing changes (module doc; `merge_inbound_session`'s own
             // doc for the binding-never-changes rule).
             InboundMergeOutcome::Kept | InboundMergeOutcome::IgnoredSenderMismatch => Ok(()),
+        }
+    }
+
+    /// Accepts an `m.forwarded_room_key` already known to have arrived over
+    /// an Olm-decrypted to-device event. The exported key is imported, not
+    /// parsed as an outbound [`SessionKey`]. `bound_*` is the original
+    /// Megolm sender the caller resolved, not merely whoever forwarded.
+    /// Returns whether a new or improved session was stored.
+    pub fn receive_forwarded_room_key<S: CryptoStore>(
+        store: &mut S,
+        bound_user_id: &UserId,
+        bound_curve25519: Curve25519PublicKey,
+        bound_ed25519: Ed25519PublicKey,
+        content: &ForwardedRoomKeyContent,
+    ) -> Result<bool, MessengerError> {
+        if content.algorithm != MEGOLM_ALGORITHM {
+            return Ok(false);
+        }
+        let exported = ExportedSessionKey::from_base64(&content.session_key)
+            .map_err(|source| MessengerError::Crypto(format!("malformed forwarded Megolm session_key: {source}")))?;
+        let incoming = InboundGroupSession::import(&exported, SessionConfig::version_1());
+        if incoming.session_id() != content.session_id {
+            return Ok(false);
+        }
+        let existing = load_inbound_record(store, &content.room_id, &content.session_id)?;
+        match merge_inbound_session(existing, incoming, bound_user_id, bound_curve25519, bound_ed25519) {
+            InboundMergeOutcome::New { record } | InboundMergeOutcome::Merged { record } => {
+                save_inbound_record(store, &content.room_id, &content.session_id, &record)?;
+                Ok(true)
+            }
+            InboundMergeOutcome::Kept | InboundMergeOutcome::IgnoredSenderMismatch => Ok(false),
         }
     }
 
@@ -1449,5 +1558,70 @@ mod tests {
         GroupSessionManager::adopt_own_outbound_session(&mut store, &room_id, &alice, identity.curve25519, identity.ed25519, &again)
             .expect("no-op");
         GroupSessionManager::decrypt_event(&mut store, &room_id, &event_id, 1, &alice, &encrypted).expect("still decrypts");
+    }
+
+    #[test]
+    fn a_forwarded_inbound_session_decrypts_the_original_senders_later_event() {
+        let mut alice_store = new_store();
+        let mut bob_store = new_store();
+        let room_id = room("fwd");
+        let alice = user("alice");
+        let alice_dev = device("ALICEDEV");
+        let members: BTreeSet<UserId> = [alice.clone()].into_iter().collect();
+        let identity = Account::new().identity_keys();
+        let event_id = EventId::parse("$fwd:example.org").expect("valid event id");
+
+        let update = GroupSessionManager::ensure_outbound_session(
+            &mut alice_store,
+            &room_id,
+            &alice,
+            &alice_dev,
+            &default_encryption(),
+            &members,
+            &[],
+            0,
+        )
+        .expect("create");
+        GroupSessionManager::adopt_own_outbound_session(
+            &mut alice_store,
+            &room_id,
+            &alice,
+            identity.curve25519,
+            identity.ed25519,
+            &update,
+        )
+        .expect("adopt");
+        let encrypted = GroupSessionManager::encrypt_event(
+            &mut alice_store,
+            &room_id,
+            &identity.curve25519.to_base64(),
+            &alice_dev,
+            "m.room.message",
+            serde_json::json!({ "body": "later" }),
+            None,
+        )
+        .expect("encrypt");
+
+        let forwarded = GroupSessionManager::forwarded_room_key_content(
+            &alice_store,
+            &room_id,
+            &encrypted.session_id,
+            &identity.curve25519.to_base64(),
+        )
+        .expect("export")
+        .expect("inbound exists at the first index");
+        let stored = GroupSessionManager::receive_forwarded_room_key(
+            &mut bob_store,
+            &alice,
+            identity.curve25519,
+            identity.ed25519,
+            &forwarded,
+        )
+        .expect("import");
+        assert!(stored);
+
+        let plaintext =
+            GroupSessionManager::decrypt_event(&mut bob_store, &room_id, &event_id, 1, &alice, &encrypted).expect("bob decrypts");
+        assert_eq!(plaintext.content, serde_json::json!({ "body": "later" }));
     }
 }

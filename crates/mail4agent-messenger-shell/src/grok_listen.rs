@@ -146,6 +146,8 @@ pub struct ListenReport {
     /// `room=<id> event=<id>` for sends accepted on the local socket.
     pub sent: Vec<String>,
     pub wake_notes: Vec<String>,
+    /// Missing Megolm sessions this tick asked the peer for. No session id.
+    pub key_requests: usize,
 }
 
 impl GrokListener {
@@ -249,8 +251,13 @@ impl GrokListener {
             if !pushed && !full {
                 continue;
             }
+            let requests_before = slot.store.key_request_count();
             if let Err(err) = slot.store.drive(now_ms, pushed) {
                 report.errors.push(err.to_string());
+            }
+            let requests_after = slot.store.key_request_count();
+            if requests_after > requests_before {
+                report.key_requests += requests_after - requests_before;
             }
             if let Some(note) = slot.store.wake_note() {
                 report.wake_notes.push(note.to_string());

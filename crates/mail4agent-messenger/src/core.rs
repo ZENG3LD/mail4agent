@@ -77,8 +77,14 @@
 //! message from a peer whose device this account has not queried yet (the
 //! usual case: the to-device share arrives before any `/keys/query` for
 //! them) is not lost.
-//! `m.room_key.withheld`/`m.room_key_request`/`m.forwarded_room_key` are a
-//! no-op hook for `crypto::withheld` (M8); (2) `device_lists.changed`/
+//! A missing inbound Megolm session sends `m.room_key_request` to the
+//! event sender and to this account's other devices. A request from a
+//! joined or invited room member is answered with `m.forwarded_room_key`
+//! (the inbound session exported at its first known index) or, if this
+//! device only still has the outbound session, with `m.room_key`.
+//! `m.forwarded_room_key` is imported and bound to the original sender.
+//! `m.room_key.withheld` records the session so the request is not
+//! repeated. (2) `device_lists.changed`/
 //! `left` → [`crate::crypto::device_tracker::DeviceTracker`]; (3) OTK
 //! counts / unused fallback types →
 //! [`crate::crypto::account::OlmAccountState::on_sync_counts`], may enqueue
@@ -99,8 +105,8 @@
 
 use crate::crypto::account::OlmAccountState;
 use crate::crypto::device_tracker::{DeviceTracker, StoredDevice};
-use crate::crypto::group_sessions::{GroupSessionManager, RoomEventPlaintext};
-use crate::crypto::olm_sessions::{OlmDecryptError, OlmSessionManager};
+use crate::crypto::group_sessions::{GroupDecryptError, GroupSessionManager, RoomEventPlaintext};
+use crate::crypto::olm_sessions::{DecryptedToDevice, OlmDecryptError, OlmSessionManager};
 use crate::error::MessengerError;
 use crate::ids::{DeviceId, EventId, RequestId, RoomId, TxnId, UserId};
 use crate::outgoing_queue::{Jitter, Lane, OutgoingQueue, PendingRequest, ResponseOutcome};
@@ -113,9 +119,10 @@ use crate::room::RoomKind;
 use crate::store::sealed::SealedRecordCodec;
 use crate::store::{CryptoStore, RecordCodec, StateStore, Store};
 use crate::wire::events::{
-    DirectContent, InReplyTo, MegolmEncryptedContent, Membership, RawEvent, ReceiptContent, RelatesTo,
-    RoomEncryptedContent, RoomKeyContent, StrippedStateEvent, TagContent, TagInfo, TextLikeMessageContent,
-    ToDeviceEvent, TypingContent, Unsigned,
+    DirectContent, ForwardedRoomKeyContent, InReplyTo, MegolmEncryptedContent, Membership, RawEvent, ReceiptContent,
+    RelatesTo, RoomEncryptedContent, RoomKeyContent, RoomKeyRequestAction, RoomKeyRequestBody, RoomKeyRequestContent,
+    RoomKeyWithheldContent, StrippedStateEvent, TagContent, TagInfo, TextLikeMessageContent, ToDeviceEvent,
+    TypingContent, Unsigned,
 };
 use crate::wire::sync::{parse_sync_response, InvitedRoom, JoinedRoom, LeftRoom};
 use crate::wire::{percent_decode_segment, HttpResponseDescriptor, OutgoingRequest, OutgoingRequestKind};
@@ -901,6 +908,14 @@ pub struct MessengerCore<C: RecordCodec> {
     account_data_write_keys: BTreeMap<RequestId, AccountDataKey>,
 
     pending_decrypt: BTreeMap<RoomId, BTreeMap<EventId, PendingDecryptItem>>,
+    /// `(room, session)` pairs this process already asked for. Memory-only:
+    /// a restart asks again, which is what recovers a share the previous
+    /// process acked and then lost.
+    key_requests_sent: BTreeSet<(RoomId, String)>,
+    /// Sessions a peer refused with `m.room_key.withheld`. Stops the retry.
+    withheld_sessions: BTreeSet<(RoomId, String)>,
+    /// `(requester, device, request_id)` already answered with a share.
+    key_requests_answered: BTreeSet<(UserId, DeviceId, String)>,
     unknown_sender_retry: VecDeque<ToDeviceEvent>,
 
     /// The last `now_ms` a [`MessengerCommand::SetTyping { typing: true,
@@ -1046,6 +1061,9 @@ impl<C: RecordCodec> MessengerCore<C> {
             account_data_guard: BTreeMap::new(),
             account_data_write_keys: BTreeMap::new(),
             pending_decrypt: BTreeMap::new(),
+            key_requests_sent: BTreeSet::new(),
+            withheld_sessions: BTreeSet::new(),
+            key_requests_answered: BTreeSet::new(),
             unknown_sender_retry: VecDeque::new(),
             typing_debounce: BTreeMap::new(),
             pending_sends: BTreeMap::new(),
@@ -2004,6 +2022,11 @@ impl<C: RecordCodec> MessengerCore<C> {
         self.global_account_data.get(event_type)
     }
 
+    /// How many missing Megolm sessions this process has already requested.
+    pub fn key_request_count(&self) -> usize {
+        self.key_requests_sent.len()
+    }
+
     /// This account's own user id, exactly as configured at
     /// [`MessengerCore::open`] -- a UI-facing adapter needs this to tell
     /// its own account apart from every other room member (a DM's peer, a
@@ -2332,22 +2355,53 @@ impl<C: RecordCodec> MessengerCore<C> {
         let Some(item) = self.pending_decrypt.get(room_id).and_then(|by_event| by_event.get(event_id)).cloned() else {
             return false;
         };
-        let Ok(plaintext) =
-            GroupSessionManager::decrypt_event(&mut self.store, room_id, event_id, item.origin_server_ts, &item.sender, &item.content)
-        else {
-            return false;
-        };
-        self.apply_decrypted_plaintext(room_id, event_id, &item.sender, item.origin_server_ts, &plaintext);
+        match GroupSessionManager::decrypt_event(
+            &mut self.store,
+            room_id,
+            event_id,
+            item.origin_server_ts,
+            &item.sender,
+            &item.content,
+        ) {
+            Ok(plaintext) => {
+                self.apply_decrypted_plaintext(room_id, event_id, &item.sender, item.origin_server_ts, &plaintext);
+            }
+            Err(GroupDecryptError::MissingSession { .. }) => {
+                let _ = self.request_missing_room_key(room_id, &item.sender, &item.content);
+                return false;
+            }
+            Err(_) => return false,
+        }
         if let Some(by_event) = self.pending_decrypt.get_mut(room_id) {
             by_event.remove(event_id);
         }
         true
     }
 
+    /// One backward page from the tip, not from the stored sync token.
+    /// Used when a push names an event the timeline does not have as text.
+    pub fn pull_latest_page(&mut self, room_id: RoomId) -> Result<(), MessengerError> {
+        let request_id = self.next_request_id()?;
+        let request = OutgoingRequest::room_messages_latest(request_id.clone(), &room_id, 20);
+        self.enqueue_request(request, Lane::Room(room_id.clone()))?;
+        self.pending_room_messages.insert(request_id, room_id);
+        Ok(())
+    }
+
     /// Decrypts Megolm rows already on the timeline. `pending_decrypt` is
     /// memory-only, so a restarted client still holds the ciphertext and
     /// would otherwise never turn it into text the leader trigger can see.
     pub fn decrypt_loaded_timeline(&mut self) {
+        let pending: Vec<(RoomId, Vec<EventId>)> = self
+            .pending_decrypt
+            .iter()
+            .map(|(room_id, by_event)| (room_id.clone(), by_event.keys().cloned().collect()))
+            .collect();
+        for (room_id, event_ids) in pending {
+            for event_id in event_ids {
+                self.retry_decrypt_one(&room_id, &event_id);
+            }
+        }
         let rooms: Vec<RoomId> = self.timelines.keys().cloned().collect();
         for room_id in rooms {
             let sealed: Vec<(EventId, i64, UserId, MegolmEncryptedContent)> = {
@@ -2381,15 +2435,20 @@ impl<C: RecordCodec> MessengerCore<C> {
                     .collect()
             };
             for (event_id, origin_server_ts, sender, content) in sealed {
-                let Ok(plaintext) = GroupSessionManager::decrypt_event(
+                let plaintext = match GroupSessionManager::decrypt_event(
                     &mut self.store,
                     &room_id,
                     &event_id,
                     origin_server_ts,
                     &sender,
                     &content,
-                ) else {
-                    continue;
+                ) {
+                    Ok(plaintext) => plaintext,
+                    Err(GroupDecryptError::MissingSession { .. }) => {
+                        let _ = self.request_missing_room_key(&room_id, &sender, &content);
+                        continue;
+                    }
+                    Err(_) => continue,
                 };
                 self.apply_decrypted_plaintext(
                     &room_id,
@@ -2542,7 +2601,7 @@ impl<C: RecordCodec> MessengerCore<C> {
 
     fn route_decrypted_to_device(
         &mut self,
-        decrypted: crate::crypto::olm_sessions::DecryptedToDevice,
+        decrypted: DecryptedToDevice,
         newly_received_sessions: &mut Vec<(RoomId, String)>,
     ) -> Result<(), MessengerError> {
         match decrypted.event_type.as_str() {
@@ -2560,12 +2619,255 @@ impl<C: RecordCodec> MessengerCore<C> {
                     }
                 }
             }
-            // Hooks for `crypto::withheld`'s key-request/re-share flow
-            // (M8) -- this module's own doc: intentionally a no-op here.
-            "m.room_key.withheld" | "m.room_key_request" | "m.forwarded_room_key" => {}
+            "m.forwarded_room_key" => {
+                if let Ok(content) = serde_json::from_value::<ForwardedRoomKeyContent>(decrypted.content.clone()) {
+                    if let Some((user_id, curve, ed)) = self.forward_binding(&decrypted, &content)? {
+                        let stored = GroupSessionManager::receive_forwarded_room_key(
+                            &mut self.store,
+                            &user_id,
+                            curve,
+                            ed,
+                            &content,
+                        )?;
+                        if stored {
+                            newly_received_sessions.push((content.room_id, content.session_id));
+                        }
+                    }
+                }
+            }
+            "m.room_key_request" => {
+                if let Ok(content) = serde_json::from_value::<RoomKeyRequestContent>(decrypted.content.clone()) {
+                    self.answer_room_key_request(&decrypted, &content)?;
+                }
+            }
+            "m.room_key.withheld" => {
+                if let Ok(content) = serde_json::from_value::<RoomKeyWithheldContent>(decrypted.content.clone()) {
+                    if let (Some(room_id), Some(session_id)) = (content.room_id, content.session_id) {
+                        self.withheld_sessions.insert((room_id, session_id));
+                    }
+                }
+            }
             _ => {}
         }
         Ok(())
+    }
+
+    /// Who a forwarded Megolm session is bound to. The Olm sender is
+    /// authenticated. The session is bound to the device named by
+    /// `sender_key` when that device is the forwarder, or when the
+    /// forwarder is this account (another of our devices). A room peer
+    /// cannot install a session bound to somebody else.
+    fn forward_binding(
+        &self,
+        decrypted: &DecryptedToDevice,
+        content: &ForwardedRoomKeyContent,
+    ) -> Result<Option<(UserId, mail4agent_vodozemac::Curve25519PublicKey, mail4agent_vodozemac::Ed25519PublicKey)>, MessengerError>
+    {
+        let members = self.encrypted_room_member_ids(&content.room_id);
+        let forwarder_is_us = decrypted.sender == self.config.user_id;
+        if !forwarder_is_us && !members.contains(&decrypted.sender) {
+            return Ok(None);
+        }
+        for user_id in &members {
+            for device in DeviceTracker::devices_for_user(&self.store, user_id)? {
+                if device.blocked || device.curve25519.to_base64() != content.sender_key {
+                    continue;
+                }
+                let same_user = decrypted.sender == device.user_id;
+                if same_user || forwarder_is_us {
+                    return Ok(Some((device.user_id, device.curve25519, device.ed25519)));
+                }
+            }
+        }
+        if decrypted.sender_device_curve25519.to_base64() == content.sender_key {
+            return Ok(Some((
+                decrypted.sender.clone(),
+                decrypted.sender_device_curve25519,
+                decrypted.sender_ed25519,
+            )));
+        }
+        Ok(None)
+    }
+
+    /// Re-share a session this device holds with the device that asked.
+    /// Inbound export (first known index) is preferred: the outbound
+    /// `session_key` is the current ratchet and cannot decrypt earlier
+    /// messages.
+    fn answer_room_key_request(
+        &mut self,
+        decrypted: &DecryptedToDevice,
+        content: &RoomKeyRequestContent,
+    ) -> Result<(), MessengerError> {
+        if matches!(content.action, RoomKeyRequestAction::RequestCancellation) {
+            self.key_requests_answered.remove(&(
+                decrypted.sender.clone(),
+                content.requesting_device_id.clone(),
+                content.request_id.clone(),
+            ));
+            return Ok(());
+        }
+        if !matches!(content.action, RoomKeyRequestAction::Request) {
+            return Ok(());
+        }
+        let Some(body) = content.body.as_ref() else { return Ok(()) };
+        if body.algorithm != "m.megolm.v1.aes-sha2" {
+            return Ok(());
+        }
+        let members = self.encrypted_room_member_ids(&body.room_id);
+        if !members.contains(&decrypted.sender) {
+            return Ok(());
+        }
+        if decrypted.sender == self.config.user_id && content.requesting_device_id == self.config.device_id {
+            return Ok(());
+        }
+        let dedup = (decrypted.sender.clone(), content.requesting_device_id.clone(), content.request_id.clone());
+        if self.key_requests_answered.contains(&dedup) {
+            return Ok(());
+        }
+        let Some(target) = self.requester_device(decrypted, &content.requesting_device_id)? else {
+            return Ok(());
+        };
+        let our_curve = self.account.identity_keys().curve25519.to_base64();
+        let (inner_type, payload) =
+            if let Some(forwarded) = GroupSessionManager::forwarded_room_key_content(
+                &self.store,
+                &body.room_id,
+                &body.session_id,
+                &our_curve,
+            )? {
+                ("m.forwarded_room_key", serde_json::to_value(&forwarded)?)
+            } else if let Some(room_key) =
+                GroupSessionManager::outbound_room_key_content(&self.store, &body.room_id, &body.session_id)?
+            {
+                ("m.room_key", serde_json::to_value(&room_key)?)
+            } else {
+                return Ok(());
+            };
+        let sent = self.enqueue_olm_to_devices(std::slice::from_ref(&target), inner_type, payload)?;
+        if sent > 0 {
+            self.key_requests_answered.insert(dedup);
+        }
+        Ok(())
+    }
+
+    /// The device a key request should be encrypted back to. Prefers the
+    /// stored device with `requesting_device_id`, then the Olm sender's
+    /// curve key. A blocked device is not answered.
+    fn requester_device(
+        &self,
+        decrypted: &DecryptedToDevice,
+        requesting_device_id: &DeviceId,
+    ) -> Result<Option<StoredDevice>, MessengerError> {
+        let devices = DeviceTracker::devices_for_user(&self.store, &decrypted.sender)?;
+        if let Some(device) = devices.iter().find(|device| &device.device_id == requesting_device_id) {
+            return Ok((!device.blocked).then(|| device.clone()));
+        }
+        let curve = decrypted.sender_device_curve25519.to_base64();
+        if let Some(device) = devices.iter().find(|device| device.curve25519.to_base64() == curve) {
+            return Ok((!device.blocked).then(|| device.clone()));
+        }
+        Ok(None)
+    }
+
+    /// Ask the event sender and this account's other devices for one
+    /// missing Megolm session. Does nothing when this process already
+    /// asked, or when the peer withheld it. A send that reaches no device
+    /// stays unmarked so a later drive tries again.
+    fn request_missing_room_key(
+        &mut self,
+        room_id: &RoomId,
+        sender: &UserId,
+        content: &MegolmEncryptedContent,
+    ) -> Result<(), MessengerError> {
+        let key = (room_id.clone(), content.session_id.clone());
+        if self.key_requests_sent.contains(&key) || self.withheld_sessions.contains(&key) {
+            return Ok(());
+        }
+        let sender_key = match content.sender_key.clone() {
+            Some(sender_key) => sender_key,
+            None => {
+                let devices = DeviceTracker::devices_for_user(&self.store, sender)?;
+                let found = content
+                    .device_id
+                    .as_ref()
+                    .and_then(|device_id| devices.iter().find(|device| &device.device_id == device_id))
+                    .or_else(|| devices.iter().find(|device| !device.blocked));
+                match found {
+                    Some(device) => device.curve25519.to_base64(),
+                    None => return Ok(()),
+                }
+            }
+        };
+        let mut targets = DeviceTracker::devices_for_user(&self.store, sender)?;
+        targets.extend(DeviceTracker::devices_for_user(&self.store, &self.config.user_id)?);
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let request_id = self.next_txn_id()?;
+        let body = RoomKeyRequestContent {
+            action: RoomKeyRequestAction::Request,
+            body: Some(RoomKeyRequestBody {
+                algorithm: "m.megolm.v1.aes-sha2".to_string(),
+                room_id: room_id.clone(),
+                session_id: content.session_id.clone(),
+                sender_key,
+            }),
+            request_id: request_id.as_str().to_string(),
+            requesting_device_id: self.config.device_id.clone(),
+        };
+        let sent = self.enqueue_olm_to_devices(&targets, "m.room_key_request", serde_json::to_value(&body)?)?;
+        if sent > 0 {
+            self.key_requests_sent.insert(key);
+        }
+        Ok(())
+    }
+
+    /// Olm-encrypt `content` as `inner_type` to every device that already
+    /// has a session, and enqueue one `sendToDevice` per chunk. Devices
+    /// with no Olm session are skipped. Returns how many devices were
+    /// addressed.
+    fn enqueue_olm_to_devices(
+        &mut self,
+        devices: &[StoredDevice],
+        inner_type: &str,
+        content: serde_json::Value,
+    ) -> Result<usize, MessengerError> {
+        let mut unique = Vec::new();
+        for device in devices {
+            if device.blocked || (device.user_id == self.config.user_id && device.device_id == self.config.device_id) {
+                continue;
+            }
+            if unique.iter().any(|have: &StoredDevice| have.user_id == device.user_id && have.device_id == device.device_id)
+            {
+                continue;
+            }
+            unique.push(device.clone());
+        }
+        let missing = OlmSessionManager::sessions_missing_for(&self.store, &unique)?;
+        let missing_ids: BTreeSet<(UserId, DeviceId)> =
+            missing.into_iter().map(|device| (device.user_id.clone(), device.device_id.clone())).collect();
+        let ready: Vec<StoredDevice> = unique
+            .into_iter()
+            .filter(|device| !missing_ids.contains(&(device.user_id.clone(), device.device_id.clone())))
+            .collect();
+        let mut sent = 0;
+        for chunk in GroupSessionManager::chunk_recipients_for_send_to_device(&ready) {
+            let body = GroupSessionManager::build_encrypted_to_device_body(
+                &mut self.store,
+                &self.account,
+                &self.config.user_id,
+                &self.config.device_id,
+                chunk,
+                inner_type,
+                content.clone(),
+            )?;
+            let request_id = self.next_request_id()?;
+            let share_txn = self.next_txn_id()?;
+            let request = OutgoingRequest::send_to_device(request_id, ROOM_KEY_SHARE_EVENT_TYPE, &share_txn, body);
+            self.enqueue_request(request, Lane::ToDevice)?;
+            sent += chunk.len();
+        }
+        Ok(sent)
     }
 
     fn queue_unknown_sender_retry(&mut self, event: ToDeviceEvent) {
@@ -2735,6 +3037,9 @@ impl<C: RecordCodec> MessengerCore<C> {
                     }
                 }
                 Err(err) => {
+                    if matches!(err, GroupDecryptError::MissingSession { .. }) {
+                        let _ = self.request_missing_room_key(room_id, &event.sender, &content);
+                    }
                     // Stored as the coarse `UtdReason` variant's own name
                     // (never the full, per-error-variant `Display` message)
                     // -- this is the only place a UI-facing adapter can

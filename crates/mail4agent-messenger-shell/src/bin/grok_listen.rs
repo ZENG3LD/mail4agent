@@ -140,6 +140,9 @@ fn main() {
         for note in &report.wake_notes {
             eprintln!("wake note: {note}");
         }
+        if report.key_requests > 0 {
+            println!("key request n={}", report.key_requests);
+        }
         std::thread::sleep(Duration::from_millis(500));
     }
 }

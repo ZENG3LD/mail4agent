@@ -730,6 +730,9 @@ pub struct OpenedStore {
     /// Joined rooms already paged once. Timelines are not stored, so a
     /// resumed process asks `/messages` from the sync token a single time.
     history_pulled: HashSet<String>,
+    /// Joined rooms whose tip page was fetched once. A sync token behind
+    /// the latest event does not return that event.
+    tip_pulled: HashSet<String>,
 }
 
 struct SyncFlight {
@@ -847,6 +850,7 @@ impl OpenedStore {
             local_peers: Vec::new(),
             pushed_room_events: Vec::new(),
             history_pulled: HashSet::new(),
+            tip_pulled: HashSet::new(),
         };
         // Routine replay is suppressed for whatever is already on disk.
         // A leader prompt is not. Only a recorded successful prompt is.
@@ -957,6 +961,10 @@ impl OpenedStore {
     /// Room texts this session received on the machine push socket.
     pub fn pushed_room_events(&self) -> &[PushedRoomEvent] {
         &self.pushed_room_events
+    }
+
+    pub(crate) fn key_request_count(&self) -> usize {
+        self.core.key_request_count()
     }
 
     pub(crate) fn record_push(&mut self, event: PushedRoomEvent) {
@@ -1329,6 +1337,8 @@ impl OpenedStore {
         self.core.decrypt_loaded_timeline();
         let trace_at = self.http_trace.len();
         let history = self.request_missing_history(now_ms)?;
+        self.pull_pushed_gaps()?;
+        self.pull_room_tips()?;
         let mut waited_long_poll = false;
         if wait_for_sync && self.sync_flight.is_some() {
             // A poll that already finished is a stale catch-up. Do not
@@ -1371,6 +1381,63 @@ impl OpenedStore {
             self.wake_inbound();
         }
         self.note_history_pages(&history, trace_at);
+        Ok(())
+    }
+
+    /// An encrypted push has an empty body. If that event is not yet
+    /// plaintext, fetch the latest `/messages` page. `/sync?since=` will
+    /// not return an event the token has already passed.
+    fn pull_pushed_gaps(&mut self) -> Result<(), ShellError> {
+        let known: HashSet<String> = self
+            .inbound_plaintexts()
+            .into_iter()
+            .map(|item| item.event_id)
+            .collect();
+        let mut rooms: Vec<String> = Vec::new();
+        self.pushed_room_events.retain(|event| {
+            let prompted = self
+                .leader_sent
+                .iter()
+                .any(|key| key.ends_with(&format!("\n{}", event.event_id)));
+            if prompted || known.contains(&event.event_id) {
+                return false;
+            }
+            if !rooms.contains(&event.room) {
+                rooms.push(event.room.clone());
+            }
+            true
+        });
+        for room in rooms {
+            let room_id = RoomId::parse(&room)?;
+            self.core.pull_latest_page(room_id)?;
+        }
+        Ok(())
+    }
+
+    /// One tip page per joined room. Startup backfill walks backward from
+    /// the stored sync token, which misses an event the token has not
+    /// reached.
+    fn pull_room_tips(&mut self) -> Result<(), ShellError> {
+        let me = self.core.user_id().clone();
+        let ids: Vec<RoomId> = self.core.room_ids().cloned().collect();
+        for room_id in ids {
+            if self.tip_pulled.contains(room_id.as_str()) {
+                continue;
+            }
+            let joined = match self
+                .core
+                .room_state(&room_id)
+                .and_then(|state| state.members.get(&me))
+            {
+                Some(member) => matches!(member.membership, Membership::Join),
+                None => false,
+            };
+            if !joined {
+                continue;
+            }
+            self.tip_pulled.insert(room_id.as_str().to_string());
+            self.core.pull_latest_page(room_id)?;
+        }
         Ok(())
     }
 

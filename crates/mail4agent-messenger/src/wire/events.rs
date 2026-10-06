@@ -827,9 +827,11 @@ pub struct RoomKeyRequestBody {
     pub sender_key: String,
 }
 
-/// `m.room_key_request` content (research doc §3.3). Only auto-serviced
-/// from the requester's own verified devices — this crate's own policy, not
-/// something this type enforces.
+/// `m.room_key_request` content (research doc §3.3). Answered for a joined
+/// or invited member of the room, and for this account's other devices.
+/// Device verification is not required: nothing in this deployment marks a
+/// device verified, and the peer who sent the Megolm event is who holds
+/// the session.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoomKeyRequestContent {
     /// Whether this is a request or a cancellation of an earlier one.
