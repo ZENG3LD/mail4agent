@@ -195,27 +195,31 @@ pub fn mechanisms(kind: SessionKind, vendor: Option<WebVendor>) -> Vec<Mechanism
         ],
         (Surface::Local, ProviderKind::Codex) => vec![
             m("codex-app-server-turn", InSession, true),
-            m("codex-stop-hook", Hook, false),
+            m("codex-stop-hook", Hook, true),
             m("inbox-queue", Queue, true),
-            m("codex-exec-resume-spawn", Spawn, false),
+            m("codex-exec-resume-spawn", Spawn, true),
         ],
         (Surface::Local, ProviderKind::KimiCode) => vec![
             m("kimi-server-prompt", InSession, true),
-            m("kimi-stop-hook", Hook, false),
+            m("kimi-stop-hook", Hook, true),
             m("inbox-queue", Queue, true),
-            m("kimi-resume-spawn", Spawn, false),
+            m("kimi-resume-spawn", Spawn, true),
         ],
         (Surface::Local, ProviderKind::ClaudeCode) => vec![
+            m("claude-uds-inject", InSession, true),
+            m("claude-async-rewake", InSession, true),
             m("claude-channel", InSession, false),
-            m("claude-async-rewake", InSession, false),
-            m("claude-stop-hook", Hook, false),
+            m("claude-stop-hook", Hook, true),
             m("inbox-queue", Queue, true),
-            m("claude-resume-spawn", Spawn, false),
+            m("claude-resume-spawn", Spawn, true),
+            m("claude-agent-acp-host", Spawn, true),
         ],
         (Surface::Local, ProviderKind::Cursor) => vec![
             m("cursor-stop-followup", Hook, false),
             m("inbox-queue", Queue, true),
             m("cursor-resume-spawn", Spawn, false),
+            m("cursor-agent-acp-host", Spawn, false),
+            m("cursor-community-acp-host", Spawn, false),
         ],
         (Surface::Web, provider) => {
             let mut rows = Vec::new();
@@ -230,6 +234,7 @@ pub fn mechanisms(kind: SessionKind, vendor: Option<WebVendor>) -> Vec<Mechanism
             }
             match provider {
                 ProviderKind::ClaudeCode => {
+                    rows.push(m("claude-uds-inject", InSession, false));
                     rows.push(m("claude-async-rewake", InSession, false));
                     rows.push(m("claude-stop-hook", Hook, false));
                     rows.push(m("inbox-queue", Queue, true));
@@ -353,6 +358,22 @@ pub fn plan_chain(session: &ProviderSession, host: &HostEnv, config: &AdapterCon
                 config.kimi_bearer.clone(),
             )),
             "claude-channel" => Box::new(ClaudeChannelAdapter::new(inbox.clone())),
+            "claude-uds-inject" => Box::new(super::claude_uds::ClaudeUdsAdapter::new(
+                kind.surface,
+                config.claude_config_dir.clone(),
+            )),
+            "claude-agent-acp-host" => Box::new(super::acp_host::AcpHostAdapter::new(
+                super::acp_host::AcpHost::ClaudeAgentAcp,
+                config.acp_program.clone(),
+            )),
+            "cursor-agent-acp-host" => Box::new(super::acp_host::AcpHostAdapter::new(
+                super::acp_host::AcpHost::CursorAgentAcp,
+                config.acp_program.clone(),
+            )),
+            "cursor-community-acp-host" => Box::new(super::acp_host::AcpHostAdapter::new(
+                super::acp_host::AcpHost::CursorCommunityAcp,
+                config.acp_program.clone(),
+            )),
             "routine-webhook" => Box::new(RoutineWebhookAdapter {
                 provider: kind.provider,
                 url: config.routine_url.clone(),
@@ -392,6 +413,47 @@ pub fn plan_chain(session: &ProviderSession, host: &HostEnv, config: &AdapterCon
     chain
 }
 
+/// What the client concluded about the session it runs inside.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Classified {
+    /// Host (surface + web vendor).
+    pub host: HostEnv,
+    /// Provider + surface of the session.
+    pub kind: SessionKind,
+    /// Vendor session id from env, when the CLI exports one.
+    pub session_id: Option<String>,
+    /// `M4A_HEADLESS=1`.
+    pub headless: bool,
+}
+
+impl Classified {
+    /// The ordered mechanism rows [`plan_chain`] follows for this session.
+    pub fn mechanisms(&self) -> Vec<Mechanism> {
+        mechanisms(self.kind, self.host.vendor)
+    }
+}
+
+/// Classifies the session this process runs inside: host markers
+/// ([`HostEnv::detect_from`]), provider markers ([`detect_provider`],
+/// `M4A_PROVIDER` first) and `M4A_HEADLESS`. `None` without a provider.
+pub fn classify_from(
+    get: impl Fn(&str) -> Option<String>,
+    exists: impl Fn(&Path) -> bool,
+) -> Option<Classified> {
+    let host = HostEnv::detect_from(&get, exists);
+    let provider = detect_provider(&get)?;
+    let kind = SessionKind {
+        provider,
+        surface: host.surface,
+    };
+    Some(Classified {
+        host,
+        kind,
+        session_id: detect_session_id(provider, &get),
+        headless: get(HEADLESS_ENV).is_some_and(|v| v.trim() == "1"),
+    })
+}
+
 /// Chain for a session the WEB machine client holds, when the session has
 /// no webhook routine: only on a detected web vendor host other than the
 /// Grok Bot box (which wakes through its routine), with the provider read
@@ -401,17 +463,17 @@ pub fn detected_web_chain(
     nick: &str,
     store_root: &Path,
 ) -> Option<(ProviderSession, WakeChain)> {
-    let host = HostEnv::detect();
+    let found = classify_from(|key| std::env::var(key).ok(), |path| path.exists())?;
+    let host = found.host;
     if host.surface != Surface::Web || host.vendor == Some(WebVendor::GrokBot) {
         return None;
     }
-    let provider = detect_provider(|key| std::env::var(key).ok())?;
     let session = ProviderSession {
-        kind: SessionKind::web(provider),
+        kind: found.kind,
         session_id: session_id.to_string(),
         nick: nick.to_string(),
         cwd: std::env::current_dir().ok(),
-        headless: std::env::var(HEADLESS_ENV).is_ok_and(|v| v == "1"),
+        headless: found.headless,
     };
     let config = AdapterConfig::from_env(Some(super::registry::inbox_dir(store_root, session_id)));
     let chain = plan_chain(&session, &host, &config);
@@ -520,6 +582,8 @@ mod tests {
         let config = AdapterConfig {
             inbox_dir: Some(dir.clone()),
             spawn_program: Some("/bin/false".into()),
+            acp_program: Some("/bin/false".into()),
+            claude_config_dir: Some(dir.join("no-claude")),
             ..AdapterConfig::default()
         };
         let host = HostEnv {
@@ -533,7 +597,11 @@ mod tests {
         assert_eq!(id, "inbox-queue");
         assert!(matches!(outcome, WakeOutcome::Queued(_)));
         // With a live channel server the primary wins.
-        let _live = inbox::Presence::announce(&dir, inbox::consumer::CLAUDE_CHANNEL).unwrap();
+        let _live = inbox::Presence::announce(
+            &dir.join(super::super::claude_channel::CHANNEL_SUBDIR),
+            inbox::consumer::CLAUDE_CHANNEL,
+        )
+        .unwrap();
         assert_eq!(chain.best(&s), Some("claude-channel"));
         let (id, _) = chain.wake(&s, &letter("hi")).unwrap();
         assert_eq!(id, "claude-channel");

@@ -48,6 +48,12 @@ Answer every direct letter in this turn by running that Reply command in the she
 or \"НЕ МОГУ: <reason>; нужно: <what>\". Stay silent only on a pure ack of an ack. \
 Never put secrets, webhook URLs or session names in a letter.";
 
+/// Sub-directory of the session inbox that only the channel server drains.
+/// Hooks never read it: Claude Code may drop channel notifications (feature
+/// gate "channels are not currently available"), and a letter the server
+/// already took must not also be lost for the hook links.
+pub const CHANNEL_SUBDIR: &str = "channel";
+
 /// Local-client side: queue the letter for the channel server.
 pub struct ClaudeChannelAdapter {
     inbox_dir: Option<PathBuf>,
@@ -67,7 +73,11 @@ impl WakeAdapter for ClaudeChannelAdapter {
 
     fn probe(&self, _session: &ProviderSession) -> Result<(), WakeError> {
         match &self.inbox_dir {
-            Some(dir) if inbox::is_live(dir, inbox::consumer::CLAUDE_CHANNEL) => Ok(()),
+            Some(dir)
+                if inbox::is_live(&dir.join(CHANNEL_SUBDIR), inbox::consumer::CLAUDE_CHANNEL) =>
+            {
+                Ok(())
+            }
             Some(_) => Err(WakeError::Unavailable(
                 "claude channel server is not running in the session".into(),
             )),
@@ -84,7 +94,7 @@ impl WakeAdapter for ClaudeChannelAdapter {
     ) -> Result<WakeOutcome, WakeError> {
         self.probe(session)?;
         let dir = self.inbox_dir.as_deref().unwrap_or(Path::new("."));
-        inbox::write_letter(dir, session, letter).map(WakeOutcome::Queued)
+        inbox::write_letter(&dir.join(CHANNEL_SUBDIR), session, letter).map(WakeOutcome::Queued)
     }
 }
 
@@ -263,15 +273,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let s = session(SessionKind::local(ProviderKind::ClaudeCode));
         let mut adapter = ClaudeChannelAdapter::new(Some(dir.clone()));
+        let chan = dir.join(CHANNEL_SUBDIR);
         // No channel server yet: the chain must fall through.
         assert!(adapter.probe(&s).is_err());
         assert!(adapter.wake(&s, &letter("ping")).is_err());
-        inbox::write_letter(&dir, &s, &letter("ping")).unwrap();
+        inbox::write_letter(&chan, &s, &letter("ping")).unwrap();
 
         let (mut client, server_side) = UnixStream::pair().unwrap();
         let out = Arc::new(Mutex::new(Vec::new()));
         let writer = Shared(Arc::clone(&out));
-        let server_dir = dir.clone();
+        let server_dir = chan.clone();
         let server = std::thread::spawn(move || {
             serve(
                 BufReader::new(server_side),
@@ -284,7 +295,7 @@ mod tests {
         writeln!(client, "{}", json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18"}})).unwrap();
         std::thread::sleep(Duration::from_millis(100));
         // Not ready yet: the letter must still be on disk.
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(&chan).unwrap().count(), 1);
         writeln!(
             client,
             "{}",

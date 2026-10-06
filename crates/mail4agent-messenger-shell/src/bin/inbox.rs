@@ -13,6 +13,7 @@
 //!                 [--session ID] [--hook-stdin]
 //! m4a-inbox unregister [--session ID] [--hook-stdin]
 //! m4a-inbox hooks --provider P      # prints the hook config to install
+//! m4a-inbox detect                  # JSON: surface, vendor, provider, ordered chain
 //! ```
 //!
 //! `--hook-stdin` reads the hook's JSON payload (`session_id`,
@@ -24,7 +25,9 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use mail4agent_messenger_shell::provider::chain::{detect_provider, detect_session_id};
+use mail4agent_messenger_shell::provider::chain::{
+    classify_from, detect_provider, detect_session_id, Tier,
+};
 use mail4agent_messenger_shell::provider::hook::HookFlavor;
 use mail4agent_messenger_shell::provider::{inbox, registry};
 use mail4agent_messenger_shell::{
@@ -290,8 +293,42 @@ fn main() {
                 .unwrap_or_else(|| fail("--provider is required"));
             println!("{}", hook_config(provider));
         }
-        _ => fail("usage: m4a-inbox register|unregister|drain|wait|hooks ..."),
+        "detect" => println!("{}", detect_json()),
+        _ => fail("usage: m4a-inbox register|unregister|drain|wait|hooks|detect ..."),
     }
+}
+
+/// How the client classifies the session it runs inside and the ordered
+/// wake chain it picks. Ids only: the session id is reported as present
+/// or absent, never printed.
+fn detect_json() -> serde_json::Value {
+    let Some(found) = classify_from(env, |path| path.exists()) else {
+        return serde_json::json!({"provider": null, "chain": []});
+    };
+    let chain: Vec<serde_json::Value> = found
+        .mechanisms()
+        .into_iter()
+        .map(|row| {
+            let tier = match row.tier {
+                Tier::InSession => "in-session",
+                Tier::Hook => "hook",
+                Tier::Queue => "queue",
+                Tier::Spawn => "spawn",
+            };
+            serde_json::json!({"id": row.id, "tier": tier, "verified": row.verified})
+        })
+        .collect();
+    serde_json::json!({
+        "surface": match found.kind.surface {
+            mail4agent_messenger_shell::provider::Surface::Web => "web",
+            mail4agent_messenger_shell::provider::Surface::Local => "local",
+        },
+        "vendor": found.host.vendor.map(|v| format!("{v:?}")),
+        "provider": found.kind.provider.id(),
+        "session_id_present": found.session_id.is_some(),
+        "headless": found.headless,
+        "chain": chain,
+    })
 }
 
 /// Hook config to install for `provider` (no secrets, no paths beyond the

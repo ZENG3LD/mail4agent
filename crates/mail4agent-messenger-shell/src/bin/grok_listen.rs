@@ -110,7 +110,17 @@ fn main() {
             .duration_since(UNIX_EPOCH)
             .map(|elapsed| elapsed.as_millis() as i64)
             .unwrap_or(0);
-        listener.hear_providers(mail4agent_messenger_shell::provider::registry::live_sessions(&store));
+        let mut providers = mail4agent_messenger_shell::provider::registry::live_sessions(&store);
+        // Running Claude Code processes announce themselves in
+        // ~/.claude/sessions; registry records (hooks) win on the same id.
+        if let Some(dir) = mail4agent_messenger_shell::provider::claude_uds::config_dir() {
+            for found in mail4agent_messenger_shell::provider::claude_uds::discover(&dir) {
+                if !providers.iter().any(|p| p.session_id == found.session_id) {
+                    providers.push(found);
+                }
+            }
+        }
+        listener.hear_providers(providers);
         let report = listener.tick(&heard, now, 15);
         if !sent {
             if let Some(job) = &send_once {

@@ -32,8 +32,10 @@
 //! for a headless session. No adapter answers a permission modal or logs
 //! the plaintext or a credential.
 
+pub mod acp_host;
 pub mod chain;
 pub mod claude_channel;
+pub mod claude_uds;
 pub mod codex;
 pub mod hook;
 pub mod inbox;
@@ -46,8 +48,10 @@ use std::path::{Path, PathBuf};
 
 use crate::{post_decrypted_with_bearer, reply_hint, DecryptedWake, SEND_COMMAND};
 
+pub use acp_host::{AcpHost, AcpHostAdapter};
 pub use chain::{plan_chain, ChainError, HostEnv, Mechanism, Tier, WakeChain, WebVendor};
 pub use claude_channel::ClaudeChannelAdapter;
+pub use claude_uds::ClaudeUdsAdapter;
 pub use codex::{CodexAppServerAdapter, CodexEndpoint};
 pub use hook::{HookFlavor, InboxHookAdapter, InboxQueueAdapter};
 pub use inbox::{InboxEntry, InboxLetter};
@@ -333,6 +337,11 @@ pub struct AdapterConfig {
     pub codex_cloud_env: Option<String>,
     /// Override of the provider binary for resume spawns (tests).
     pub spawn_program: Option<PathBuf>,
+    /// Override of the ACP adapter program for ACP-host links (tests).
+    pub acp_program: Option<PathBuf>,
+    /// Claude config dir (`CLAUDE_CONFIG_DIR` / `~/.claude`) for the
+    /// messaging-socket link; `None` = default.
+    pub claude_config_dir: Option<PathBuf>,
 }
 
 /// Claude routine fire URL env.
@@ -367,6 +376,8 @@ impl AdapterConfig {
             claude_fire_bearer: get(CLAUDE_FIRE_TOKEN_ENV),
             codex_cloud_env: get(spawn::CODEX_CLOUD_ENV_ENV),
             spawn_program: None,
+            acp_program: None,
+            claude_config_dir: None,
         }
     }
 }

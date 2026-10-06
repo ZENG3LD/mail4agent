@@ -6,7 +6,7 @@
 //! | Kind | Command (prompt never in argv when the CLI reads stdin) |
 //! |---|---|
 //! | grok/local | `grok --resume <id> -p <prompt>` |
-//! | codex/local | `codex exec resume <id> -` (prompt on stdin) |
+//! | codex/local | `codex exec --skip-git-repo-check resume <id> -` (prompt on stdin) |
 //! | kimi_code/local | `kimi -S <id> -p <prompt>` |
 //! | claude_code/local | `claude --resume <id> -p` (prompt on stdin) |
 //! | cursor/local | `agent --resume <id> -p <prompt>` |
@@ -60,7 +60,13 @@ pub fn resume_command(
     Ok(match (kind.surface, kind.provider) {
         (Surface::Local, ProviderKind::Grok) => (vec!["--resume".into(), id, "-p".into(), p], None),
         (Surface::Local, ProviderKind::Codex) => (
-            vec!["exec".into(), "resume".into(), id, "-".into()],
+            vec![
+                "exec".into(),
+                "--skip-git-repo-check".into(),
+                "resume".into(),
+                id,
+                "-".into(),
+            ],
             Some(p),
         ),
         (Surface::Local, ProviderKind::KimiCode) => (vec!["-S".into(), id, "-p".into(), p], None),
@@ -196,7 +202,7 @@ mod tests {
     fn commands_keep_prompt_off_argv_where_the_cli_reads_stdin() {
         let (args, stdin) =
             resume_command(SessionKind::local(ProviderKind::Codex), "t1", "hi", None).unwrap();
-        assert_eq!(args, ["exec", "resume", "t1", "-"]);
+        assert_eq!(args, ["exec", "--skip-git-repo-check", "resume", "t1", "-"]);
         assert_eq!(stdin.as_deref(), Some("hi"));
         let (args, stdin) = resume_command(
             SessionKind::local(ProviderKind::ClaudeCode),
@@ -250,7 +256,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         let text = std::fs::read_to_string(&out).unwrap();
-        assert!(text.starts_with("exec resume s-1 -"));
+        assert!(text.starts_with("exec --skip-git-repo-check resume s-1 -"));
         assert!(text.trim_end().ends_with("ping"));
         let _ = std::fs::remove_dir_all(&dir);
     }

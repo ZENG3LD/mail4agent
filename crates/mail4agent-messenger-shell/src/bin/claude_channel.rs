@@ -3,7 +3,7 @@
 //! Claude Code spawns it from `.mcp.json` (server name `mail4agent`) when the
 //! session is started with
 //! `claude --dangerously-load-development-channels server:mail4agent`.
-//! It drains `M4A_INBOX_DIR` (letters queued by the local mail4agent client)
+//! It drains `M4A_INBOX_DIR/channel` (letters queued by the local mail4agent client)
 //! and emits `notifications/claude/channel`. stdout is the MCP channel;
 //! diagnostics go to stderr.
 
@@ -11,7 +11,7 @@ use std::io::BufReader;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use mail4agent_messenger_shell::provider::claude_channel::serve;
+use mail4agent_messenger_shell::provider::claude_channel::{serve, CHANNEL_SUBDIR};
 use mail4agent_messenger_shell::INBOX_DIR_ENV;
 
 fn main() {
@@ -23,7 +23,7 @@ fn main() {
     if let Err(err) = serve(
         stdin,
         std::io::stdout(),
-        PathBuf::from(dir),
+        PathBuf::from(dir).join(CHANNEL_SUBDIR),
         Duration::from_millis(500),
         None,
     ) {
