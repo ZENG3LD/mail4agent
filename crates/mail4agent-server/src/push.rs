@@ -2,12 +2,16 @@
 //!
 //! This is not `/sync` and it is not an outbound webhook. The client
 //! connects. After it registers the device bearers it already holds, a
-//! new `m.room.message` with a text `body`, or a new `m.room.encrypted`
-//! event, is written down that socket for each other member whose device
-//! is on it. History is not replayed. An encrypted event carries the
-//! event id, room, sender, recipient, and wire type. This server does
-//! not hold Megolm keys and does not invent a plaintext body. The client
-//! that holds the keys decrypts after the push.
+//! new `m.room.message` or `m.room.encrypted` event is written down that
+//! socket for each other member whose device is on it. History is not
+//! replayed.
+//!
+//! # Push contract v1 (hard cutover)
+//!
+//! Frames carry `"v": 1` and **never** a plaintext `body` — only room,
+//! sender, event_id, recipient, wire_type. The client that holds Megolm
+//! keys (or can `/sync` the event) decrypts after the push. No legacy
+//! flag; peers must update.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,6 +20,9 @@ use std::sync::Mutex;
 use tokio::sync::mpsc;
 
 use crate::error::MatrixError;
+
+/// Top-level push schema version.
+pub const PUSH_VERSION: u32 = 1;
 
 struct Subscription {
     id: u64,
@@ -80,35 +87,24 @@ impl PushHub {
 
     pub(crate) fn publish_room_text(&self, text: &RoomTextPush) {
         for (user_id, mxid) in &text.recipients {
-            let frame = if text.wire_type == "m.room.encrypted" {
-                encrypted_event_frame(
-                    &self.next_envelope_id(),
-                    &text.room_id,
-                    &text.sender,
-                    &text.event_id,
-                    mxid,
-                )
-            } else {
-                event_frame(
-                    &self.next_envelope_id(),
-                    &text.room_id,
-                    &text.sender,
-                    text.body.as_deref().unwrap_or(""),
-                    &text.event_id,
-                    mxid,
-                )
-            };
+            let frame = metadata_event_frame(
+                &self.next_envelope_id(),
+                &text.room_id,
+                &text.sender,
+                &text.event_id,
+                mxid,
+                &text.wire_type,
+            );
             self.publish(*user_id, &frame);
         }
     }
 }
 
 /// One accepted room event for members other than the sender.
-/// `body` is set only for plaintext `m.room.message`.
+/// Plaintext body of a stored message is never copied onto the push frame.
 pub(crate) struct RoomTextPush {
     pub room_id: String,
     pub sender: String,
-    pub body: Option<String>,
     pub wire_type: String,
     pub event_id: String,
     pub recipients: Vec<(i64, String)>,
@@ -124,22 +120,19 @@ pub(crate) fn recipients_for_room_text(
     event_id: &str,
     wake_ids: &HashSet<i64>,
 ) -> Result<Option<RoomTextPush>, MatrixError> {
-    let (wire_type, body) = if event_type == "m.room.message" {
+    let wire_type = if event_type == "m.room.message" {
+        // Require a non-empty stored body so empty notices do not wake;
+        // the body itself is never put on the push frame.
         let Ok(content) = serde_json::from_str::<serde_json::Value>(content_str) else {
             return Ok(None);
         };
-        let Some(body) = content
-            .get("body")
-            .and_then(|value| value.as_str())
-            .filter(|body| !body.is_empty())
-        else {
+        let Some(body) = content.get("body").and_then(|value| value.as_str()).filter(|b| !b.is_empty()) else {
             return Ok(None);
         };
-        ("m.room.message", Some(body.to_string()))
+        let _ = body;
+        "m.room.message"
     } else if event_type == "m.room.encrypted" {
-        // Ciphertext is not a body. A `body` field inside the encrypted
-        // content is not plaintext and is not copied onto the frame.
-        ("m.room.encrypted", None)
+        "m.room.encrypted"
     } else {
         return Ok(None);
     };
@@ -160,54 +153,31 @@ pub(crate) fn recipients_for_room_text(
     Ok(Some(RoomTextPush {
         room_id: room_id.to_string(),
         sender: sender_mxid.to_string(),
-        body,
         wire_type: wire_type.to_string(),
         event_id: event_id.to_string(),
         recipients,
     }))
 }
 
-/// Outer object says an event happened. The inner object is the room text.
-/// `recipient` is which session on the shared socket the text is for.
-pub(crate) fn event_frame(
-    envelope_id: &str,
-    room: &str,
-    sender: &str,
-    body: &str,
-    event_id: &str,
-    recipient: &str,
-) -> String {
-    serde_json::json!({
-        "type": "event",
-        "envelope_id": envelope_id,
-        "event": {
-            "room": room,
-            "sender": sender,
-            "body": body,
-            "event_id": event_id,
-            "recipient": recipient,
-        },
-    })
-    .to_string()
-}
-
-/// Encrypted push. No `body`: the server cannot decrypt Megolm.
-pub(crate) fn encrypted_event_frame(
+/// Push v1 metadata frame — never includes `body`.
+pub(crate) fn metadata_event_frame(
     envelope_id: &str,
     room: &str,
     sender: &str,
     event_id: &str,
     recipient: &str,
+    wire_type: &str,
 ) -> String {
     serde_json::json!({
         "type": "event",
+        "v": PUSH_VERSION,
         "envelope_id": envelope_id,
         "event": {
             "room": room,
             "sender": sender,
             "event_id": event_id,
             "recipient": recipient,
-            "wire_type": "m.room.encrypted",
+            "wire_type": wire_type,
         },
     })
     .to_string()
@@ -218,48 +188,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn event_frame_is_an_envelope_around_room_sender_body_and_event_id() {
-        let frame = event_frame(
+    fn v1_frame_has_version_wire_type_and_never_a_body() {
+        let frame = metadata_event_frame(
             "p1",
             "!room:example",
             "@sender:example",
-            "hello",
             "$evt",
             "@b:example",
+            "m.room.message",
         );
         let value: serde_json::Value = serde_json::from_str(&frame).expect("json");
         assert_eq!(value["type"], "event");
+        assert_eq!(value["v"], 1);
         assert_eq!(value["envelope_id"], "p1");
         assert_eq!(value["event"]["room"], "!room:example");
         assert_eq!(value["event"]["sender"], "@sender:example");
-        assert_eq!(value["event"]["body"], "hello");
         assert_eq!(value["event"]["event_id"], "$evt");
         assert_eq!(value["event"]["recipient"], "@b:example");
+        assert_eq!(value["event"]["wire_type"], "m.room.message");
+        assert!(value["event"].get("body").is_none());
         assert!(value.get("access_token").is_none());
         assert!(value.get("bearer").is_none());
-        assert!(value["event"].get("access_token").is_none());
     }
 
     #[test]
     fn encrypted_event_frame_names_the_wire_type_and_has_no_body() {
-        let frame = encrypted_event_frame(
-            "p2",
-            "!room:example",
-            "@sender:example",
-            "$evt",
-            "@b:example",
-        );
+        let frame = metadata_event_frame("p2", "!room:example", "@sender:example", "$evt", "@b:example", "m.room.encrypted");
         let value: serde_json::Value = serde_json::from_str(&frame).expect("json");
-        assert_eq!(value["type"], "event");
-        assert_eq!(value["envelope_id"], "p2");
-        assert_eq!(value["event"]["room"], "!room:example");
-        assert_eq!(value["event"]["sender"], "@sender:example");
-        assert_eq!(value["event"]["event_id"], "$evt");
-        assert_eq!(value["event"]["recipient"], "@b:example");
+        assert_eq!(value["v"], 1);
         assert_eq!(value["event"]["wire_type"], "m.room.encrypted");
         assert!(value["event"].get("body").is_none());
-        assert!(value.get("access_token").is_none());
-        assert!(value.get("bearer").is_none());
         assert!(!frame.contains("ciphertext"));
+    }
+
+    #[test]
+    fn publish_room_text_never_puts_plaintext_on_the_wire() {
+        let hub = PushHub::new();
+        let (id, mut rx) = hub.subscribe(vec![2]);
+        hub.publish_room_text(&RoomTextPush {
+            room_id: "!r:ex".into(),
+            sender: "@a:ex".into(),
+            wire_type: "m.room.message".into(),
+            event_id: "$e".into(),
+            recipients: vec![(2, "@b:ex".into())],
+        });
+        let frame = rx.try_recv().expect("frame");
+        let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(v["v"], 1);
+        assert_eq!(v["event"]["wire_type"], "m.room.message");
+        assert!(v["event"].get("body").is_none());
+        hub.unsubscribe(id);
     }
 }
