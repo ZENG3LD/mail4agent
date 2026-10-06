@@ -3738,7 +3738,7 @@ mod tests {
             kind,
             creator_user_id: creator,
             created_at: T0,
-            is_encrypted: kind != RoomKind::Channel,
+            is_encrypted: true,
             join_rule: if kind == RoomKind::Channel { JoinRule::Public } else { JoinRule::Invite },
             history_visibility: HistoryVisibility::Shared,
             dm_pair_key: None,

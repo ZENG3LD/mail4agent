@@ -311,8 +311,8 @@ pub enum CreateRoomKind {
         /// server plan's §5 `group` column.
         members_can_invite: bool,
     },
-    /// A public, announcement-style room (never encrypted — server plan
-    /// §5: "never — server refuses to set it on a public room").
+    /// A public, announcement-style room. Still E2E-encrypted; "public"
+    /// means join_rule public (anyone can join), not plaintext.
     Channel {
         /// The room's display name.
         name: String,
@@ -352,11 +352,11 @@ pub enum MessengerCommand {
     /// and `m.new_content` removed and any earlier forward marker replaced
     /// by this hop's own:
     ///
-    /// - source room encrypted: `"forwarded": true` and
-    ///   nothing else -- no original sender, no room id, no room name;
-    /// - source room unencrypted (a public channel):
+    /// - source is a private/encrypted room (DM/group): `"forwarded": true`
+    ///   and nothing else -- no original sender, no room id, no room name;
+    /// - source is a public channel (`RoomKind::Channel`):
     ///   `"forwarded_from": {"room_id", "room_name"}` --
-    ///   no sender.
+    ///   no sender (public join does not make content plaintext).
     ///
     /// The event type `m.room.message` is kept. An unrecognized `msgtype`
     /// passes through as the raw content object plus the marker.
@@ -2353,12 +2353,12 @@ impl<C: RecordCodec> MessengerCore<C> {
     }
 
     /// The marker a forward out of `from_room` carries: the bare `forwarded:
-    /// true` unless that room is positively known to be unencrypted, in which
-    /// case `forwarded_from` names it. An unknown room is treated as
-    /// encrypted -- the fail-safe direction.
+    /// true` unless that room is a public channel, in which case
+    /// `forwarded_from` names it (Slack-like attribution). Channels are
+    /// still E2E; an unknown room is treated as private -- fail-safe.
     fn forward_marker(&self, from_room: &RoomId) -> (&'static str, serde_json::Value) {
-        let public = self.rooms.get(from_room).is_some_and(|room| room.encryption.is_none());
-        if public {
+        let public_channel = self.room_kind(from_room) == Some(RoomKind::Channel);
+        if public_channel {
             let room_name = self.forward_room_name(from_room);
             (KEY_FORWARDED_FROM, serde_json::json!({ "room_id": from_room.as_str(), "room_name": room_name }))
         } else {
@@ -4242,6 +4242,40 @@ mod tests {
         core.timelines.entry(room_id.clone()).or_default();
     }
 
+    /// Marks `room_id` as a public channel for [`RoomState::derive_room_kind`]
+    /// (join_rule public + raised `events_default`).
+    fn mark_as_channel(core: &mut TestCore, room_id: &RoomId) {
+        let Some(state) = core.rooms.get_mut(room_id) else { return };
+        state
+            .apply_state_event(&state_event_raw(
+                "m.room.join_rules",
+                "",
+                "@alice:example.org",
+                serde_json::json!({ "join_rule": "public" }),
+            ))
+            .expect("join_rules");
+        state
+            .apply_state_event(&state_event_raw(
+                "m.room.power_levels",
+                "",
+                "@alice:example.org",
+                serde_json::json!({ "events_default": 50, "users_default": 0 }),
+            ))
+            .expect("power_levels");
+    }
+
+    fn state_event_raw(event_type: &str, state_key: &str, sender: &str, content: serde_json::Value) -> RawEvent {
+        serde_json::from_value(serde_json::json!({
+            "event_id": format!("${event_type}:example.org"),
+            "type": event_type,
+            "sender": sender,
+            "origin_server_ts": 1,
+            "state_key": state_key,
+            "content": content,
+        }))
+        .expect("valid raw event")
+    }
+
     fn raw_event(event_id: &str, event_type: &str, sender: &str, content: serde_json::Value) -> RawEvent {
         serde_json::from_value(serde_json::json!({
             "event_id": event_id,
@@ -4351,7 +4385,8 @@ mod tests {
         let mut core = open_fresh_core();
         let channel = room("!chan:example.org");
         let target = room("!target:example.org");
-        add_room(&mut core, &channel, false, Some("Announcements"));
+        add_room(&mut core, &channel, true, Some("Announcements"));
+        mark_as_channel(&mut core, &channel);
         add_room(&mut core, &target, false, None);
         seed_plain(
             &mut core,
@@ -4390,7 +4425,8 @@ mod tests {
         let mut core = open_fresh_core();
         let channel = room("!chan:example.org");
         let target = room("!target:example.org");
-        add_room(&mut core, &channel, false, None);
+        add_room(&mut core, &channel, true, None);
+        mark_as_channel(&mut core, &channel);
         if let Some(state) = core.rooms.get_mut(&channel) {
             state.members.insert(
                 UserId::parse("@erin:example.org").expect("valid user id"),

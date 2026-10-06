@@ -159,14 +159,17 @@ pub fn bootstrap_member_events(kind: RoomKind, creator: (i64, &str, &str), invit
 }
 
 
-/// `join_rule`, `history_visibility`, `is_encrypted` per plan §5's table.
-/// `pub(crate)` — also the P12 legacy-DM migration's bootstrap builder (see
-/// `routes::matrix::mod`'s own doc comment on `pub mod rooms`).
+/// `join_rule`, `history_visibility`, `is_encrypted` for a fresh room.
+/// Public vs private differs only in join rights: every kind is E2E
+/// encrypted with `history_visibility: shared`. (Older plan §5 left
+/// channels plaintext/`world_readable`; that contradicted the product
+/// model — server must never see content.)
+/// `pub(crate)` — also the P12 legacy-DM migration's bootstrap builder.
 pub fn room_kind_settings(kind: RoomKind) -> (JoinRule, HistoryVisibility, bool) {
     match kind {
         RoomKind::Dm => (JoinRule::Invite, HistoryVisibility::Shared, true),
         RoomKind::Group => (JoinRule::Invite, HistoryVisibility::Shared, true),
-        RoomKind::Channel => (JoinRule::Public, HistoryVisibility::WorldReadable, false),
+        RoomKind::Channel => (JoinRule::Public, HistoryVisibility::Shared, true),
     }
 }
 
@@ -227,19 +230,17 @@ pub fn power_levels_content(creator_mxid: &str, kind: RoomKind, invite_level: i6
 }
 
 
-/// `PUT state/{eventType}/{stateKey}`'s `m.room.encryption` rule (P5
-/// correction): refuse changing/removing an EXISTING encryption event
-/// outright, and refuse setting it for the first time on a public room.
-/// Every other event type is unconditionally fine as far as this rule goes.
+/// `PUT state/{eventType}/{stateKey}`'s `m.room.encryption` rule: refuse
+/// changing/removing an EXISTING encryption event. Enabling encryption on
+/// a still-unencrypted room (including a public channel) is allowed — all
+/// room kinds are E2E. `join_rule` is retained for call-site compatibility.
 pub fn check_encryption_state_change(event_type: &str, join_rule: JoinRule, already_encrypted: bool) -> Result<(), MatrixError> {
+    let _ = join_rule;
     if event_type != "m.room.encryption" {
         return Ok(());
     }
     if already_encrypted {
         return Err(MatrixError::forbidden("encryption cannot be changed once set"));
-    }
-    if join_rule == JoinRule::Public {
-        return Err(MatrixError::forbidden("encryption cannot be enabled on a public room"));
     }
     Ok(())
 }
@@ -840,4 +841,70 @@ pub fn apply_forget(conn: &Connection, room_id: &str, user_id: i64) -> Result<()
         return Err(MatrixError::forbidden("must have left the room before forgetting it"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod messenger_model_tests {
+    use super::*;
+    use crate::store::{self, HistoryVisibility, JoinRule, RoomKind};
+    use rusqlite::Connection;
+
+    const T0: &str = "2026-10-06T00:00:00+00:00";
+
+    fn test_conn() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory sqlite");
+        store::create_matrix_schema(&conn).expect("schema");
+        conn
+    }
+
+    #[test]
+    fn every_room_kind_is_encrypted_public_differs_only_in_join_rule() {
+        let (jr, hv, enc) = room_kind_settings(RoomKind::Dm);
+        assert_eq!(jr, JoinRule::Invite);
+        assert_eq!(hv, HistoryVisibility::Shared);
+        assert!(enc);
+
+        let (jr, hv, enc) = room_kind_settings(RoomKind::Group);
+        assert_eq!(jr, JoinRule::Invite);
+        assert_eq!(hv, HistoryVisibility::Shared);
+        assert!(enc);
+
+        let (jr, hv, enc) = room_kind_settings(RoomKind::Channel);
+        assert_eq!(jr, JoinRule::Public);
+        assert_eq!(hv, HistoryVisibility::Shared);
+        assert!(enc, "public channels are E2E; join_rule alone marks them public");
+    }
+
+    #[test]
+    fn encryption_may_be_enabled_on_a_public_room_but_never_changed() {
+        check_encryption_state_change("m.room.encryption", JoinRule::Public, false).expect("enable ok");
+        let err = check_encryption_state_change("m.room.encryption", JoinRule::Public, true).unwrap_err();
+        assert!(format!("{err:?}").contains("changed") || format!("{err:?}").to_lowercase().contains("forbidden"));
+    }
+
+    #[test]
+    fn public_channel_join_without_invite_private_group_requires_invite() {
+        let mut conn = test_conn();
+        store::ensure_matrix_user(&conn, 1, "alice000000000000000000000000001", T0).expect("alice");
+        let bob_mxid = store::ensure_matrix_user(&conn, 2, "bob00000000000000000000000000002", T0).expect("bob");
+
+        let channel = "!chan:example.org";
+        let (jr, hv, enc) = room_kind_settings(RoomKind::Channel);
+        store::create_room(&conn, channel, RoomKind::Channel, 1, T0, enc, jr, hv, None, None).expect("channel");
+        match decide_and_apply_join(&mut conn, channel, 2, &bob_mxid, "bob", T0, 1_000).expect("join") {
+            JoinDecision::Joined(_) => {}
+            JoinDecision::AlreadyJoined => panic!("expected fresh join"),
+        }
+
+        let group = "!grp:example.org";
+        let (jr, hv, enc) = room_kind_settings(RoomKind::Group);
+        store::create_room(&conn, group, RoomKind::Group, 1, T0, enc, jr, hv, None, None).expect("group");
+        match decide_and_apply_join(&mut conn, group, 2, &bob_mxid, "bob", T0, 2_000) {
+            Err(err) => {
+                let msg = format!("{err:?}").to_lowercase();
+                assert!(msg.contains("invitation") || msg.contains("forbidden"), "{msg}");
+            }
+            Ok(_) => panic!("stranger must not join a private group without invite"),
+        }
+    }
 }
