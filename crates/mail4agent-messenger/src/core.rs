@@ -174,6 +174,15 @@ pub struct Counters {
 /// primary guarantee: under the write-before-mint discipline
 /// [`MessengerCore::next_request_id`] follows, the persisted value alone
 /// should already dominate every pending id.
+/// Txn seed for a fresh store: microseconds since the Unix epoch, so it is
+/// above every id this device could have minted from an earlier store.
+fn fresh_txn_seed() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0)
+}
+
 fn restore_counter(persisted_next: u64, max_used_seed: Option<u64>) -> u64 {
     match max_used_seed {
         Some(seed) => persisted_next.max(seed.saturating_add(1)),
@@ -1012,7 +1021,7 @@ impl<C: RecordCodec> MessengerCore<C> {
         // persisted token.
         outgoing.discard_kind(&mut store, OutgoingRequestKind::Sync)?;
         let persisted_counters = store.counters()?.unwrap_or_default();
-        let counters = Counters {
+        let mut counters = Counters {
             next_request_id: restore_counter(persisted_counters.next_request_id, max_pending_request_seed),
             next_txn_id: restore_counter(persisted_counters.next_txn_id, None),
         };
@@ -1024,6 +1033,12 @@ impl<C: RecordCodec> MessengerCore<C> {
             // restart.
             store.save_counters(counters)?;
         }
+        // A store lost and recreated for a device that already exists
+        // server-side (the bearer survived in the keychain) must not restart
+        // txn ids low: the server would dedup each send into an OLD event
+        // and report it as sent. Floor the in-memory counter at the wall
+        // clock; `next_txn_id` persists it before the first id is used.
+        counters.next_txn_id = counters.next_txn_id.max(fresh_txn_seed());
 
         let mut core = Self {
             config,
