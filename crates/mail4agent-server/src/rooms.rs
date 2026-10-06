@@ -843,6 +843,100 @@ pub fn apply_forget(conn: &Connection, room_id: &str, user_id: i64) -> Result<()
     Ok(())
 }
 
+
+/// Enable Megolm on every still-plaintext room: write `m.room.encryption`
+/// if missing, flip `rooms.is_encrypted`, and normalize
+/// `history_visibility` to `shared` (public vs private = join_rule only).
+/// Past timeline plaintext rows stay as historical `m.room.message`; new
+/// sends must be encrypted. Idempotent. Returns how many rooms were changed.
+pub fn migrate_plaintext_rooms_to_encrypted(
+    conn: &mut Connection,
+    now: &str,
+    origin_ts: i64,
+) -> Result<usize, MatrixError> {
+    let plaintext: Vec<(String, i64, String)> = {
+        let mut stmt = conn
+            .prepare("SELECT id, creator_user_id, history_visibility FROM rooms WHERE is_encrypted = 0")
+            .map_err(|e| MatrixError::unknown(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .map_err(|e| MatrixError::unknown(e.to_string()))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| MatrixError::unknown(e.to_string()))?
+    };
+    let mut changed = 0usize;
+    for (room_id, creator_user_id, hv) in plaintext {
+        let already = crate::store::current_state_event(conn, &room_id, "m.room.encryption", "")?.is_some();
+        if !already {
+            let event_id = crate::store::new_event_id();
+            crate::store::apply_state_event(
+                conn,
+                &crate::store::StateEventWrite {
+                    event_id: &event_id,
+                    room_id: &room_id,
+                    sender_user_id: creator_user_id,
+                    event_type: "m.room.encryption",
+                    state_key: "",
+                    content: r#"{"algorithm":"m.megolm.v1.aes-sha2"}"#,
+                    origin_server_ts: origin_ts,
+                    now,
+                },
+            )?;
+        }
+        if hv == HistoryVisibility::WorldReadable.as_str() {
+            let event_id = crate::store::new_event_id();
+            crate::store::apply_state_event(
+                conn,
+                &crate::store::StateEventWrite {
+                    event_id: &event_id,
+                    room_id: &room_id,
+                    sender_user_id: creator_user_id,
+                    event_type: "m.room.history_visibility",
+                    state_key: "",
+                    content: r#"{"history_visibility":"shared"}"#,
+                    origin_server_ts: origin_ts,
+                    now,
+                },
+            )?;
+            conn.execute(
+                "UPDATE rooms SET history_visibility = ?1 WHERE id = ?2",
+                rusqlite::params![HistoryVisibility::Shared.as_str(), room_id],
+            )
+            .map_err(|e| MatrixError::unknown(e.to_string()))?;
+        }
+        conn.execute(
+            "UPDATE rooms SET is_encrypted = 1 WHERE id = ?1",
+            rusqlite::params![room_id],
+        )
+        .map_err(|e| MatrixError::unknown(e.to_string()))?;
+        changed += 1;
+    }
+    Ok(changed)
+}
+
+/// Drop empty `legacy_dm_message_map` (P12 scaffold). Refuses if any rows remain.
+pub fn drop_legacy_dm_scaffold_if_empty(conn: &Connection) -> Result<bool, MatrixError> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='legacy_dm_message_map'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| MatrixError::unknown(e.to_string()))?;
+    if count == 0 {
+        return Ok(false);
+    }
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM legacy_dm_message_map", [], |row| row.get(0))
+        .map_err(|e| MatrixError::unknown(e.to_string()))?;
+    if rows > 0 {
+        return Err(MatrixError::forbidden("legacy_dm_message_map still has rows; refuse drop"));
+    }
+    conn.execute_batch("DROP TABLE IF EXISTS legacy_dm_message_map;")
+        .map_err(|e| MatrixError::unknown(e.to_string()))?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod messenger_model_tests {
     use super::*;
@@ -906,5 +1000,50 @@ mod messenger_model_tests {
             }
             Ok(_) => panic!("stranger must not join a private group without invite"),
         }
+    }
+
+    #[test]
+    fn migrate_plaintext_public_channel_sets_encryption_and_shared_hv() {
+        let mut conn = test_conn();
+        store::ensure_matrix_user(&conn, 1, "alice000000000000000000000000001", T0).expect("alice");
+        let channel = "!oldchan:example.org";
+        store::create_room(
+            &conn,
+            channel,
+            RoomKind::Channel,
+            1,
+            T0,
+            false,
+            JoinRule::Public,
+            HistoryVisibility::WorldReadable,
+            None,
+            None,
+        )
+        .expect("legacy channel");
+        let n = migrate_plaintext_rooms_to_encrypted(&mut conn, T0, 1_000).expect("migrate");
+        assert_eq!(n, 1);
+        let room = store::get_room(&conn, channel).expect("get").expect("exists");
+        assert!(room.is_encrypted);
+        assert_eq!(room.history_visibility, HistoryVisibility::Shared);
+        assert!(store::current_state_event(&conn, channel, "m.room.encryption", "")
+            .expect("state")
+            .is_some());
+        let n2 = migrate_plaintext_rooms_to_encrypted(&mut conn, T0, 2_000).expect("idempotent");
+        assert_eq!(n2, 0);
+    }
+
+    #[test]
+    fn drop_legacy_dm_scaffold_when_empty() {
+        let conn = test_conn();
+        // Schema no longer creates the table; simulate an old DB.
+        conn.execute_batch(
+            "CREATE TABLE legacy_dm_message_map (
+                legacy_message_id INTEGER PRIMARY KEY,
+                event_id TEXT NOT NULL
+            );",
+        )
+        .expect("old table");
+        assert!(drop_legacy_dm_scaffold_if_empty(&conn).expect("drop"));
+        assert!(!drop_legacy_dm_scaffold_if_empty(&conn).expect("already gone"));
     }
 }

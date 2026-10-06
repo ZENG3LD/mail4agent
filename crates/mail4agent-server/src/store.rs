@@ -509,10 +509,7 @@ pub fn create_matrix_schema(conn: &Connection) -> rusqlite::Result<()> {
             definition TEXT NOT NULL
         );
 
-        CREATE TABLE IF NOT EXISTS legacy_dm_message_map (
-            legacy_message_id INTEGER PRIMARY KEY,
-            event_id          TEXT NOT NULL UNIQUE REFERENCES events(event_id)
-        );
+        -- legacy_dm_message_map removed (M2); drop_legacy_dm_scaffold_if_empty cleans old DBs
         "#,
     )
 }
@@ -2428,6 +2425,8 @@ fn upsert_receipt_in_tx(
 /// (state events, `m.reaction`, `m.room.redaction`) is excluded. A legacy DM
 /// migrated from `dm_conversations` (plan §7) lands as
 /// `org.example.legacy_dm`, which counts the same as a live message.
+/// Includes historical `org.example.legacy_dm` so unread counts stay correct
+/// until those timeline rows age out; new writes of that type are refused.
 const NOTIFICATION_MESSAGE_TYPES_SQL: &str = "('m.room.message', 'm.room.encrypted', 'org.example.legacy_dm')";
 
 /// `unread_notifications.notification_count` for `user_id` in `room` (plan
@@ -3135,6 +3134,16 @@ mod tests {
         conn
     }
 
+    fn ensure_legacy_dm_map_table(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS legacy_dm_message_map (
+                legacy_message_id INTEGER PRIMARY KEY,
+                event_id TEXT NOT NULL UNIQUE REFERENCES events(event_id)
+            );",
+        )
+        .expect("legacy map table for remaining unit tests");
+    }
+
     fn make_room(conn: &Connection) {
         create_room(conn, ROOM, RoomKind::Group, 1, T0, false, JoinRule::Invite, HistoryVisibility::Shared, None, None).expect("create room");
     }
@@ -3621,6 +3630,7 @@ mod tests {
     fn legacy_dm_message_map_insert_and_get_round_trip() {
         let mut conn = test_conn();
         make_room(&conn);
+        ensure_legacy_dm_map_table(&conn);
         let event = insert_timeline_event(&mut conn, "$legacy1", ROOM, 1, "org.example.legacy_dm", "{}", 1000).expect("insert");
         insert_legacy_dm_message_map(&conn, 42, &event.event_id).expect("map insert");
         assert_eq!(legacy_dm_message_event_id(&conn, 42).expect("map get"), Some(event.event_id));
@@ -4085,6 +4095,7 @@ mod tests {
     #[test]
     fn adopt_dm_room_for_legacy_binds_the_room_and_imports_the_messages() {
         let mut conn = test_conn();
+        ensure_legacy_dm_map_table(&conn);
         native_dm_room(&conn);
 
         let counts = adopt_dm_room_for_legacy(&mut conn, adoption_of(7), &[legacy_import(1, "$l1"), legacy_import(2, "$l2")], &[])
@@ -4099,6 +4110,7 @@ mod tests {
     #[test]
     fn adopt_dm_room_for_legacy_writes_a_key_event_only_where_the_room_has_none() {
         let mut conn = test_conn();
+        ensure_legacy_dm_map_table(&conn);
         native_dm_room(&conn);
         let existing = apply_state_event(&mut conn, &StateEventWrite { event_id: "$k-existing", room_id: ROOM, sender_user_id: 1, event_type: "org.example.legacy_dm_key", state_key: "@a:example.org", content: r#"{"public_key_b64":"AAAA"}"#, origin_server_ts: 900, now: T0 })
             .expect("existing key event");
@@ -4130,6 +4142,7 @@ mod tests {
     #[test]
     fn adopt_dm_room_for_legacy_refuses_a_room_that_is_bound_or_not_a_dm() {
         let mut conn = test_conn();
+        ensure_legacy_dm_map_table(&conn);
         make_room(&conn);
         assert!(adopt_dm_room_for_legacy(&mut conn, adoption_of(7), &[legacy_import(1, "$l1")], &[]).expect("adopt").is_none(), "a group room is never adopted");
         assert!(room_by_legacy_dm_id(&conn, 7).expect("query").is_none());
@@ -4144,6 +4157,7 @@ mod tests {
     #[test]
     fn adopt_dm_room_for_legacy_rolls_back_the_binding_when_an_import_fails() {
         let mut conn = test_conn();
+        ensure_legacy_dm_map_table(&conn);
         native_dm_room(&conn);
 
         // The second import reuses the first one's event id — refused by the
