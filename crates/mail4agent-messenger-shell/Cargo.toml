@@ -48,5 +48,9 @@ name = "m4a-claude-channel"
 path = "src/bin/claude_channel.rs"
 
 [[bin]]
+name = "m4a-inbox"
+path = "src/bin/inbox.rs"
+
+[[bin]]
 name = "m4a-send"
 path = "src/bin/send.rs"

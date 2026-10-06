@@ -67,7 +67,10 @@ impl WakeAdapter for ClaudeChannelAdapter {
 
     fn probe(&self, _session: &ProviderSession) -> Result<(), WakeError> {
         match &self.inbox_dir {
-            Some(_) => Ok(()),
+            Some(dir) if inbox::is_live(dir, inbox::consumer::CLAUDE_CHANNEL) => Ok(()),
+            Some(_) => Err(WakeError::Unavailable(
+                "claude channel server is not running in the session".into(),
+            )),
             None => Err(WakeError::Unavailable(
                 "claude channel inbox dir unset".into(),
             )),
@@ -169,18 +172,34 @@ where
         })
     };
     let started = Instant::now();
+    let mut presence: Option<inbox::Presence> = None;
+    let mut last_beat = Instant::now();
     loop {
         if closed.load(Ordering::SeqCst) || run_for.is_some_and(|limit| started.elapsed() >= limit)
         {
             break;
         }
         if ready.load(Ordering::SeqCst) {
+            // Announce only once Claude Code is ready to show channel
+            // events, so the local client never prefers a dead channel.
+            match &presence {
+                None => {
+                    presence =
+                        inbox::Presence::announce(&inbox_dir, inbox::consumer::CLAUDE_CHANNEL).ok()
+                }
+                Some(live) if last_beat.elapsed() >= inbox::HEARTBEAT => {
+                    live.beat();
+                    last_beat = Instant::now();
+                }
+                Some(_) => {}
+            }
             for entry in inbox::drain(&inbox_dir) {
                 write_line(&output, &channel_notification(&entry.letter))?;
             }
         }
         std::thread::sleep(poll);
     }
+    drop(presence);
     drop(reader);
     Ok(())
 }
@@ -244,10 +263,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let s = session(SessionKind::local(ProviderKind::ClaudeCode));
         let mut adapter = ClaudeChannelAdapter::new(Some(dir.clone()));
-        assert!(matches!(
-            adapter.wake(&s, &letter("ping")).unwrap(),
-            WakeOutcome::Queued(_)
-        ));
+        // No channel server yet: the chain must fall through.
+        assert!(adapter.probe(&s).is_err());
+        assert!(adapter.wake(&s, &letter("ping")).is_err());
+        inbox::write_letter(&dir, &s, &letter("ping")).unwrap();
 
         let (mut client, server_side) = UnixStream::pair().unwrap();
         let out = Arc::new(Mutex::new(Vec::new()));
@@ -278,6 +297,11 @@ mod tests {
         {
             std::thread::sleep(Duration::from_millis(20));
         }
+        assert!(adapter.probe(&s).is_ok());
+        assert!(matches!(
+            adapter.wake(&s, &letter("pong")).unwrap(),
+            WakeOutcome::Queued(_)
+        ));
         client.shutdown(std::net::Shutdown::Both).unwrap();
         let mut rest = Vec::new();
         let _ = client.read_to_end(&mut rest);
@@ -292,7 +316,8 @@ mod tests {
             .iter()
             .filter(|v| v["method"] == CHANNEL_METHOD)
             .collect();
-        assert_eq!(notes.len(), 1);
+        assert!(!notes.is_empty());
+        assert!(notes.len() <= 2);
         assert_eq!(notes[0]["params"]["meta"]["from_nick"], "carol");
         assert!(notes[0]["params"]["content"]
             .as_str()

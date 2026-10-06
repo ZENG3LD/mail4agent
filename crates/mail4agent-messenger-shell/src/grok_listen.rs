@@ -7,6 +7,12 @@
 //! pushed event is decrypted, [`OpenedStore::drive`] calls
 //! `mail4agent_grok::wake_decrypted_room_blocking` on the leader socket.
 //! This process does not start `grok` and does not create a webhook.
+//!
+//! Other providers (Codex, Kimi Code, Claude Code, Cursor CLI) register
+//! from inside their session (`m4a-inbox register`, see
+//! [`crate::provider::registry`]); [`GrokListener::hear_providers`] adopts
+//! them on the same push socket and wakes each through its detected
+//! [`crate::provider::WakeChain`]. The Grok leader path is unchanged.
 
 use std::collections::HashSet;
 use std::fs::File;
@@ -135,6 +141,10 @@ pub struct GrokListener {
     /// Loopback socket `m4a-send` style. A second process does not open
     /// the store. `None` until [`GrokListener::listen_for_sends`].
     send_listener: Option<SendListener>,
+    /// Non-Grok sessions from the provider registry, as last heard.
+    providers: Vec<crate::provider::ProviderSession>,
+    /// Where this client runs (decides each session's chain).
+    host: crate::provider::HostEnv,
 }
 
 /// What one [`GrokListener::tick`] did. Nicks only. No bearer, no session id.
@@ -146,6 +156,8 @@ pub struct ListenReport {
     /// `room=<id> event=<id>` for sends accepted on the local socket.
     pub sent: Vec<String>,
     pub wake_notes: Vec<String>,
+    /// `<nick> <link id> delivered|queued` for provider-chain wakes.
+    pub wake_routes: Vec<String>,
 }
 
 impl GrokListener {
@@ -165,7 +177,20 @@ impl GrokListener {
             push: None,
             last_full_drive: Instant::now(),
             send_listener: None,
+            providers: Vec::new(),
+            host: crate::provider::HostEnv::detect(),
         }
+    }
+
+    /// Replaces the set of live non-Grok sessions (from
+    /// [`crate::provider::registry::live_sessions`]). Grok rows are
+    /// ignored here: they come from `active_sessions.json` and keep ACP.
+    /// The next [`Self::tick`] adopts new ones and stops driving gone ones.
+    pub fn hear_providers(&mut self, sessions: Vec<crate::provider::ProviderSession>) {
+        self.providers = sessions
+            .into_iter()
+            .filter(|session| session.kind.provider != crate::provider::ProviderKind::Grok)
+            .collect();
     }
 
     /// Bind the local send socket. A live peer already bound there is an
@@ -213,12 +238,33 @@ impl GrokListener {
                 Err(err) => report.errors.push(err.to_string()),
             }
         }
+        let providers = self.providers.clone();
+        for session in &providers {
+            if self
+                .slots
+                .iter()
+                .any(|slot| slot.session_id == session.session_id)
+            {
+                continue;
+            }
+            match self.adopt_provider(session) {
+                Ok(nick) => {
+                    report.adopted.push(nick);
+                    adopted = true;
+                }
+                Err(err) => report.errors.push(err.to_string()),
+            }
+        }
         if adopted || (self.push.is_none() && !self.slots.is_empty()) {
             if let Err(err) = self.refresh_push() {
                 report.errors.push(err.to_string());
             }
         }
-        let live: HashSet<&str> = heard.iter().map(|session| session.session_id.as_str()).collect();
+        let live: HashSet<&str> = heard
+            .iter()
+            .map(|session| session.session_id.as_str())
+            .chain(providers.iter().map(|session| session.session_id.as_str()))
+            .collect();
         let mut pushed_for: HashSet<String> = HashSet::new();
         if let Some(push) = &self.push {
             for (recipient, event) in push.drain() {
@@ -254,6 +300,10 @@ impl GrokListener {
             }
             if let Some(note) = slot.store.wake_note() {
                 report.wake_notes.push(note.to_string());
+            }
+            if let Some(route) = slot.store.take_wake_route() {
+                let nick = slot.store.nick().unwrap_or("?");
+                report.wake_routes.push(format!("{nick} {route}"));
             }
         }
         self.serve_sends(now_ms, &mut report);
@@ -391,6 +441,44 @@ impl GrokListener {
             leader_cwd: Some(session.cwd.clone()),
         };
         let store = OpenedStore::connect_with_wake(&config, wake)?;
+        save_device_bearer(
+            &self.keychain_dir,
+            &session.session_id,
+            store.device_bearer(),
+        );
+        let user_id = store.user_id().to_string();
+        let nick = store.nick().unwrap_or(&session.nick).to_string();
+        self.slots.push(Slot {
+            session_id: session.session_id.clone(),
+            user_id,
+            store,
+            _lock: lock,
+        });
+        Ok(nick)
+    }
+
+    /// Opens the mail store of a registered non-Grok session and installs
+    /// its wake chain (no leader socket, no webhook).
+    fn adopt_provider(
+        &mut self,
+        session: &crate::provider::ProviderSession,
+    ) -> Result<String, ShellError> {
+        let token = load_device_bearer(&self.keychain_dir, &session.session_id);
+        let config = SessionConfig::new(
+            &self.homeserver_url,
+            &session.nick,
+            &session.session_id,
+            &self.store_root,
+            token,
+        )?;
+        let lock = lock_store(&config.store_dir())?;
+        let store_wake = SessionWake::default();
+        let mut store = OpenedStore::connect_with_wake(&config, store_wake)?;
+        let adapters = crate::provider::AdapterConfig::from_env(Some(
+            crate::provider::registry::inbox_dir(&self.store_root, &session.session_id),
+        ));
+        let chain = crate::provider::plan_chain(session, &self.host, &adapters);
+        store.set_wake_chain(session.clone(), chain);
         save_device_bearer(
             &self.keychain_dir,
             &session.session_id,

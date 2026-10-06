@@ -9,37 +9,51 @@
 //! never go through the adapter: every agent answers with the shell command
 //! `m4a-send --as <own-nick> --to <peer-nick> '<text>'`.
 //!
-//! | Kind | Adapter | Channel | State |
+//! Each session gets an ordered [`WakeChain`] ([`chain::plan_chain`],
+//! order in [`chain::mechanisms`]): a turn in the client that already has
+//! the session open first, then hooks inside that session, then the
+//! durable inbox, and a new-process resume only for a headless session.
+//!
+//! | Kind | Primary (in-session) | Fallbacks | Last resort (headless only) |
 //! | --- | --- | --- | --- |
-//! | Cursor / Grok Bot web | [`RoutineWebhookAdapter`] | the bot's own webhook routine | live |
-//! | Claude Code web | [`ClaudeRoutineFireAdapter`] | routine `/fire` (starts a NEW session) | stub, vendor-side fix |
-//! | Codex cloud | [`CodexCloudAdapter`] | none into an existing task | stub, vendor-side fix |
-//! | Kimi web, Grok web | [`NoInboundAdapter`] | none documented | stub |
-//! | Grok CLI | [`GrokLeaderAdapter`] | ACP `session/prompt` on `leader.sock` | live |
-//! | Codex CLI | [`codex::CodexAppServerAdapter`] | app-server `turn/start` (unix:// or ws://) | live, verified on the box |
-//! | Kimi Code CLI | [`kimi::KimiServerAdapter`] | `kimi web` server `POST /api/v1/sessions/{id}/prompts` | live, verified on the box |
-//! | Claude Code CLI | [`ClaudeChannelAdapter`] + `m4a-claude-channel` | channel MCP `notifications/claude/channel` | implemented; live turn unverified (needs login) |
-//! | Cursor CLI | [`CursorAgentAdapter`] | `agent acp` / hooks | stub, optional, Linux-only, verify on the box |
+//! | Grok CLI | [`GrokLeaderAdapter`] ACP on `leader.sock` | Stop hook, inbox | `grok --resume -p` |
+//! | Codex CLI | [`codex::CodexAppServerAdapter`] `turn/start` | Stop hook, inbox | `codex exec resume` |
+//! | Kimi Code CLI | [`kimi::KimiServerAdapter`] `kimi web` prompts | Stop hook, inbox | `kimi -S -p` |
+//! | Claude Code CLI | [`ClaudeChannelAdapter`] channel MCP; `asyncRewake` waiter | Stop hook, inbox | `claude --resume -p` |
+//! | Cursor CLI | none for an idle chat | `stop` hook `followup_message`, inbox | `agent --resume -p` |
+//! | Grok Bot / Cursor web | [`RoutineWebhookAdapter`] | - | - |
+//! | Claude Code web | `asyncRewake` waiter in the cloud session | Stop hook, inbox | [`ClaudeRoutineFireAdapter`] (new session) |
+//! | Codex cloud | - | Stop hook, inbox | `codex cloud exec` (new task) |
+//! | Kimi web, Grok web | none documented ([`NoInboundAdapter`]) | - | - |
 //!
 //! Core four: Grok, Kimi Code, Claude Code, Codex. Cursor CLI is optional.
 //! Design: `project-docs/docs/mail4agent/client-architecture.md`.
-//! No adapter spawns a provider process, answers a permission modal, or
-//! logs the plaintext or a credential.
+//! Only [`spawn::ResumeSpawnAdapter`] starts a provider process, and only
+//! for a headless session. No adapter answers a permission modal or logs
+//! the plaintext or a credential.
 
+pub mod chain;
 pub mod claude_channel;
 pub mod codex;
+pub mod hook;
 pub mod inbox;
 pub mod kimi;
+pub mod registry;
+pub mod spawn;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::{post_decrypted_with_bearer, reply_hint, DecryptedWake, SEND_COMMAND};
 
+pub use chain::{plan_chain, ChainError, HostEnv, Mechanism, Tier, WakeChain, WebVendor};
 pub use claude_channel::ClaudeChannelAdapter;
 pub use codex::{CodexAppServerAdapter, CodexEndpoint};
+pub use hook::{HookFlavor, InboxHookAdapter, InboxQueueAdapter};
 pub use inbox::{InboxEntry, InboxLetter};
 pub use kimi::KimiServerAdapter;
+pub use registry::SessionRecord;
+pub use spawn::ResumeSpawnAdapter;
 
 /// Environment variable naming the provider of a local session.
 pub const PROVIDER_ENV: &str = "M4A_PROVIDER";
@@ -185,6 +199,9 @@ pub struct ProviderSession {
     pub nick: String,
     /// Working directory the session was started in (local only).
     pub cwd: Option<PathBuf>,
+    /// No client holds the session open. Only then may a chain fall back
+    /// to spawning a new process that resumes it.
+    pub headless: bool,
 }
 
 /// One decrypted room text to put in front of the session.
@@ -308,6 +325,50 @@ pub struct AdapterConfig {
     pub routine_url: Option<String>,
     /// Web routine key (`M4A_ROUTINE_BEARER`), in memory only.
     pub routine_bearer: Option<String>,
+    /// Claude routine `/fire` URL (`M4A_CLAUDE_ROUTINE_FIRE_URL`), in memory only.
+    pub claude_fire_url: Option<String>,
+    /// Claude routine token (`M4A_CLAUDE_ROUTINE_TOKEN`), in memory only.
+    pub claude_fire_bearer: Option<String>,
+    /// Codex cloud environment id for `codex cloud exec --env`.
+    pub codex_cloud_env: Option<String>,
+    /// Override of the provider binary for resume spawns (tests).
+    pub spawn_program: Option<PathBuf>,
+}
+
+/// Claude routine fire URL env.
+pub const CLAUDE_FIRE_URL_ENV: &str = "M4A_CLAUDE_ROUTINE_FIRE_URL";
+/// Claude routine token env.
+pub const CLAUDE_FIRE_TOKEN_ENV: &str = "M4A_CLAUDE_ROUTINE_TOKEN";
+
+impl AdapterConfig {
+    /// Endpoints from the environment for one session. `inbox_dir` is the
+    /// session's inbox (see [`registry::inbox_dir`]) unless
+    /// [`INBOX_DIR_ENV`] overrides it. A Kimi server is discovered from
+    /// `~/.kimi-code` when its env is unset. Routine URL/bearer are not
+    /// read here: the web client passes its own.
+    pub fn from_env(inbox_dir: Option<PathBuf>) -> Self {
+        let get = |key: &str| std::env::var(key).ok().filter(|value| !value.is_empty());
+        let mut kimi = KimiServerAdapter::from_env();
+        if !kimi.is_configured() {
+            if let Some(found) = kimi::discover_local_server(None) {
+                kimi = found;
+            }
+        }
+        let (kimi_url, kimi_bearer) = kimi.into_parts();
+        Self {
+            leader_sock: get(crate::LEADER_SOCK_ENV).map(PathBuf::from),
+            inbox_dir: get(INBOX_DIR_ENV).map(PathBuf::from).or(inbox_dir),
+            codex: CodexEndpoint::from_env(),
+            kimi_url,
+            kimi_bearer,
+            routine_url: None,
+            routine_bearer: None,
+            claude_fire_url: get(CLAUDE_FIRE_URL_ENV),
+            claude_fire_bearer: get(CLAUDE_FIRE_TOKEN_ENV),
+            codex_cloud_env: get(spawn::CODEX_CLOUD_ENV_ENV),
+            spawn_program: None,
+        }
+    }
 }
 
 impl fmt::Debug for AdapterConfig {
@@ -319,6 +380,8 @@ impl fmt::Debug for AdapterConfig {
             .field("codex", &self.codex.is_some())
             .field("kimi_url", &self.kimi_url.is_some())
             .field("routine_url", &self.routine_url.is_some())
+            .field("claude_fire_url", &self.claude_fire_url.is_some())
+            .field("codex_cloud_env", &self.codex_cloud_env.is_some())
             .finish()
     }
 }
@@ -347,7 +410,10 @@ pub fn adapter_for(kind: SessionKind, config: &AdapterConfig) -> Box<dyn WakeAda
             url: config.routine_url.clone(),
             bearer: config.routine_bearer.clone(),
         }),
-        (Surface::Web, ProviderKind::ClaudeCode) => Box::new(ClaudeRoutineFireAdapter),
+        (Surface::Web, ProviderKind::ClaudeCode) => Box::new(ClaudeRoutineFireAdapter {
+            url: config.claude_fire_url.clone(),
+            bearer: config.claude_fire_bearer.clone(),
+        }),
         (Surface::Web, ProviderKind::Codex) => Box::new(CodexCloudAdapter),
         (Surface::Web, provider @ (ProviderKind::KimiCode | ProviderKind::Grok)) => {
             Box::new(NoInboundAdapter { provider })
@@ -397,12 +463,11 @@ impl WakeAdapter for GrokLeaderAdapter {
     }
 }
 
-/// Cursor CLI (stub). Optional, Linux-only, verify on the box.
-///
-/// TODO(cursor): `agent acp` (hidden subcommand, 2026.10.01) is an ACP
-/// stdio server, and `agent persist attach` keeps a session alive. Neither
-/// is a documented way into an interactive chat another process owns.
-/// Candidate: ACP host for persist sessions, or hook doorbell via the inbox.
+/// Cursor CLI: the session's own `stop` hook (`m4a-inbox drain --format
+/// cursor-stop`) returns `followup_message`, which Cursor auto-submits as
+/// the next user turn. No documented way into an idle interactive chat
+/// another process owns (`agent acp` / `persist` start their own agent),
+/// so this is a hook doorbell; see [`chain::mechanisms`] for the order.
 pub struct CursorAgentAdapter {
     /// `M4A_INBOX_DIR`.
     pub inbox_dir: Option<PathBuf>,
@@ -413,16 +478,18 @@ impl WakeAdapter for CursorAgentAdapter {
         SessionKind::local(ProviderKind::Cursor)
     }
 
-    fn probe(&self, _session: &ProviderSession) -> Result<(), WakeError> {
-        Err(WakeError::NotImplemented(self.kind()))
+    fn probe(&self, session: &ProviderSession) -> Result<(), WakeError> {
+        InboxHookAdapter::new(self.kind(), HookFlavor::CursorStop, self.inbox_dir.clone())
+            .probe(session)
     }
 
     fn wake(
         &mut self,
-        _session: &ProviderSession,
-        _letter: &WakeLetter<'_>,
+        session: &ProviderSession,
+        letter: &WakeLetter<'_>,
     ) -> Result<WakeOutcome, WakeError> {
-        Err(WakeError::NotImplemented(self.kind()))
+        InboxHookAdapter::new(self.kind(), HookFlavor::CursorStop, self.inbox_dir.clone())
+            .wake(session, letter)
     }
 }
 
@@ -476,14 +543,91 @@ impl WakeAdapter for RoutineWebhookAdapter {
     }
 }
 
-/// Claude Code on the web (stub, vendor-side fix).
-///
-/// TODO(claude-web): routines expose `POST /v1/claude_code/routines/{id}/fire`
-/// with a per-routine bearer and optional `text`, but every fire starts a
-/// NEW cloud session (rate-limited per routine and per account). There is
-/// no documented API to post into an existing cloud session. The Claude web
-/// session itself decides how it wants to be reached.
-pub struct ClaudeRoutineFireAdapter;
+/// Claude Code on the web, LAST resort: routine `/fire`
+/// (`POST https://api.anthropic.com/v1/claude_code/routines/{id}/fire`,
+/// per-routine bearer, `anthropic-beta: experimental-cc-routine-2026-04-01`,
+/// body `{"text": ...}`). Every fire starts a NEW cloud session (rate
+/// limited), so it is used only for a session marked headless. An open
+/// cloud session is reached by its own hooks (`claude-async-rewake`,
+/// `claude-stop-hook`) first.
+pub struct ClaudeRoutineFireAdapter {
+    /// Fire URL. In memory only.
+    pub url: Option<String>,
+    /// Routine token. In memory only.
+    pub bearer: Option<String>,
+}
+
+/// `anthropic-beta` value for routine fire (override `M4A_CLAUDE_ROUTINE_BETA`).
+pub const CLAUDE_ROUTINE_BETA: &str = "experimental-cc-routine-2026-04-01";
+
+impl WakeAdapter for ClaudeRoutineFireAdapter {
+    fn kind(&self) -> SessionKind {
+        SessionKind::web(ProviderKind::ClaudeCode)
+    }
+
+    fn probe(&self, session: &ProviderSession) -> Result<(), WakeError> {
+        if self.url.as_deref().is_none_or(str::is_empty) {
+            return Err(WakeError::Unavailable(
+                "claude routine fire url unset".into(),
+            ));
+        }
+        if self.bearer.as_deref().is_none_or(str::is_empty) {
+            return Err(WakeError::Unavailable("claude routine token unset".into()));
+        }
+        if !session.headless {
+            return Err(WakeError::Unavailable(
+                "session is open; routine fire would start a new session".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn wake(
+        &mut self,
+        session: &ProviderSession,
+        letter: &WakeLetter<'_>,
+    ) -> Result<WakeOutcome, WakeError> {
+        self.probe(session)?;
+        let url = self.url.as_deref().unwrap_or_default();
+        let token = self.bearer.as_deref().unwrap_or_default();
+        let parsed = reqwest::Url::parse(url)
+            .ok()
+            .filter(|u| u.scheme() == "https" || is_loopback_http(u))
+            .ok_or_else(|| WakeError::Unavailable("claude routine fire url invalid".into()))?;
+        let beta = std::env::var("M4A_CLAUDE_ROUTINE_BETA")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| CLAUDE_ROUTINE_BETA.to_string());
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .map_err(|err| WakeError::Transport(err.without_url().to_string()))?;
+        let response = client
+            .post(parsed)
+            .bearer_auth(token)
+            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-beta", beta)
+            .json(&serde_json::json!({"text": wake_prompt(session, letter)}))
+            .send()
+            .map_err(|err| WakeError::Transport(err.without_url().to_string()))?;
+        if response.status().is_success() {
+            Ok(WakeOutcome::Delivered)
+        } else {
+            Err(WakeError::Transport(format!(
+                "routine fire status {}",
+                response.status().as_u16()
+            )))
+        }
+    }
+}
+
+fn is_loopback_http(url: &reqwest::Url) -> bool {
+    url.scheme() == "http"
+        && matches!(
+            url.host_str(),
+            Some("127.0.0.1" | "localhost" | "[::1]" | "::1")
+        )
+}
 
 /// Codex cloud (stub, vendor-side fix).
 ///
@@ -520,11 +664,6 @@ macro_rules! refuse_adapter {
 }
 
 refuse_adapter!(
-    ClaudeRoutineFireAdapter,
-    |_: &ClaudeRoutineFireAdapter| SessionKind::web(ProviderKind::ClaudeCode),
-    NotImplemented
-);
-refuse_adapter!(
     CodexCloudAdapter,
     |_: &CodexCloudAdapter| SessionKind::web(ProviderKind::Codex),
     NotImplemented
@@ -556,6 +695,7 @@ pub(crate) mod tests {
             session_id: "s-1".into(),
             nick: "hostbot".into(),
             cwd: Some(PathBuf::from("/tmp")),
+            headless: false,
         }
     }
 
@@ -600,11 +740,8 @@ pub(crate) mod tests {
     fn stubs_and_unconfigured_adapters_refuse_without_side_effects() {
         let config = AdapterConfig::default();
         let cases = [
-            (SessionKind::local(ProviderKind::Cursor), "not implemented"),
-            (
-                SessionKind::web(ProviderKind::ClaudeCode),
-                "not implemented",
-            ),
+            (SessionKind::local(ProviderKind::Cursor), "unavailable"),
+            (SessionKind::web(ProviderKind::ClaudeCode), "unavailable"),
             (SessionKind::web(ProviderKind::Codex), "not implemented"),
             (SessionKind::web(ProviderKind::KimiCode), "no inbound"),
             (SessionKind::web(ProviderKind::Grok), "no inbound"),

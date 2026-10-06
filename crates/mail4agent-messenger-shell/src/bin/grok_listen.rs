@@ -91,6 +91,7 @@ fn main() {
     let mut sent = send_once.is_none();
     println!("push listener up");
     println!("wake=acp");
+    println!("wake=chain (registered codex/kimi/claude/cursor sessions)");
 
     loop {
         let text = std::fs::read_to_string(&index).unwrap_or_default();
@@ -109,6 +110,7 @@ fn main() {
             .duration_since(UNIX_EPOCH)
             .map(|elapsed| elapsed.as_millis() as i64)
             .unwrap_or(0);
+        listener.hear_providers(mail4agent_messenger_shell::provider::registry::live_sessions(&store));
         let report = listener.tick(&heard, now, 15);
         if !sent {
             if let Some(job) = &send_once {
@@ -139,6 +141,9 @@ fn main() {
         }
         for note in &report.wake_notes {
             eprintln!("wake note: {note}");
+        }
+        for route in &report.wake_routes {
+            println!("wake route={route}");
         }
         std::thread::sleep(Duration::from_millis(500));
     }

@@ -1411,6 +1411,9 @@ impl MachineClient {
                 leader_sock: None,
                 leader_cwd: None,
             });
+            if item.routine_url.is_none() {
+                attach_detected_chain(&mut store, &item.config);
+            }
             store.drive(1_000, false)?;
             store.abandon_inflight_sync(1_000)?;
             opened.push(store);
@@ -1808,6 +1811,9 @@ impl MachineClient {
             leader_sock: None,
             leader_cwd: None,
         });
+        if item.routine_url.is_none() {
+            attach_detected_chain(&mut store, &item.config);
+        }
         store.drive(1_000, false)?;
         store.abandon_inflight_sync(1_000)?;
         if let Some(dir) = self.keychain_dir.as_deref() {
@@ -2559,6 +2565,22 @@ fn seed_session(conn: &Connection, user_id: i64, item: &Prepared) -> Result<(), 
     )
     .map_err(|_| ShellError::Http("local bus could not seed a session".into()))?;
     Ok(())
+}
+
+
+/// A web session without a webhook routine, on a detected vendor host
+/// (Claude web container, Codex cloud, Cursor cloud): install the
+/// provider wake chain (hooks in the open session first, last-resort
+/// spawn only when headless). Nothing changes on the Grok Bot box or for
+/// a session that has a routine.
+fn attach_detected_chain(store: &mut OpenedStore, config: &SessionConfig) {
+    if let Some((session, chain)) = crate::provider::chain::detected_web_chain(
+        config.session_id(),
+        config.nick(),
+        &config.store_root,
+    ) {
+        store.set_wake_chain(session, chain);
+    }
 }
 
 #[cfg(test)]

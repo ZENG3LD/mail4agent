@@ -54,6 +54,71 @@ impl KimiServerAdapter {
     }
 }
 
+impl KimiServerAdapter {
+    /// Whether both origin and bearer are set.
+    pub fn is_configured(&self) -> bool {
+        self.origin.is_some() && self.bearer.is_some()
+    }
+
+    /// `(origin, bearer)`, for [`super::AdapterConfig`].
+    pub fn into_parts(self) -> (Option<String>, Option<String>) {
+        (self.origin, self.bearer)
+    }
+}
+
+/// Finds a running `kimi web` / `kimi rc` server of this user: the newest
+/// `~/.kimi-code/server/instances/*.json` whose pid is alive (Linux) and
+/// whose host is loopback, plus the persistent `server.token` the Kimi
+/// web UI itself uses. `home` overrides `KIMI_CODE_HOME` / `~/.kimi-code`.
+pub fn discover_local_server(home: Option<&std::path::Path>) -> Option<KimiServerAdapter> {
+    let home = home.map(std::path::Path::to_path_buf).or_else(|| {
+        std::env::var_os("KIMI_CODE_HOME")
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+                    .map(|h| std::path::PathBuf::from(h).join(".kimi-code"))
+            })
+    })?;
+    let mut instances: Vec<(std::time::SystemTime, Value)> =
+        std::fs::read_dir(home.join("server").join("instances"))
+            .ok()?
+            .filter_map(Result::ok)
+            .filter_map(|item| {
+                let modified = item.metadata().and_then(|m| m.modified()).ok()?;
+                let value: Value =
+                    serde_json::from_slice(&std::fs::read(item.path()).ok()?).ok()?;
+                Some((modified, value))
+            })
+            .collect();
+    instances.sort_by(|a, b| b.0.cmp(&a.0));
+    let token = std::fs::read_to_string(home.join("server.token")).ok()?;
+    let token = token.trim().to_string();
+    for (_, instance) in instances {
+        if let Some(pid) = instance["pid"].as_u64() {
+            if cfg!(target_os = "linux") && !std::path::Path::new(&format!("/proc/{pid}")).exists()
+            {
+                continue;
+            }
+        }
+        let Some(port) = instance["port"].as_u64() else {
+            continue;
+        };
+        let host = instance["host"].as_str().unwrap_or("127.0.0.1");
+        let host = if host == "0.0.0.0" || host.is_empty() {
+            "127.0.0.1"
+        } else {
+            host
+        };
+        let adapter =
+            KimiServerAdapter::new(Some(format!("http://{host}:{port}")), Some(token.clone()));
+        if adapter.is_configured() {
+            return Some(adapter);
+        }
+    }
+    None
+}
+
 /// Request body for one text prompt.
 pub fn prompt_body(text: &str) -> Value {
     json!({"content": [{"type": "text", "text": text}]})
@@ -241,5 +306,35 @@ mod tests {
             adapter.wake(&s, &letter("live probe")).unwrap(),
             WakeOutcome::Delivered
         );
+    }
+
+    #[test]
+    fn discovers_live_loopback_instance_and_skips_dead_pids() {
+        let home = std::env::temp_dir().join(format!("m4a-kimi-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let inst = home.join("server").join("instances");
+        std::fs::create_dir_all(&inst).unwrap();
+        assert!(discover_local_server(Some(&home)).is_none());
+        std::fs::write(home.join("server.token"), "tok\n").unwrap();
+        std::fs::write(
+            inst.join("dead.json"),
+            r#"{"pid":4000000000,"host":"127.0.0.1","port":1}"#,
+        )
+        .unwrap();
+        if cfg!(target_os = "linux") {
+            assert!(discover_local_server(Some(&home)).is_none());
+        }
+        std::fs::write(
+            inst.join("live.json"),
+            format!(
+                r#"{{"pid":{},"host":"127.0.0.1","port":58627}}"#,
+                std::process::id()
+            ),
+        )
+        .unwrap();
+        let (url, token) = discover_local_server(Some(&home)).unwrap().into_parts();
+        assert_eq!(url.as_deref(), Some("http://127.0.0.1:58627"));
+        assert_eq!(token.as_deref(), Some("tok"));
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

@@ -111,15 +111,120 @@ pub fn drain(dir: &Path) -> Vec<InboxEntry> {
     paths.sort();
     let mut out = Vec::new();
     for (_, name, path) in paths {
-        let parsed = fs::read(&path)
+        // Claim by rename first: two consumers (channel server and a hook)
+        // may drain the same dir, and only the one whose rename wins reads.
+        let claimed = dir.join(format!(".claim-{}-{name}", std::process::id()));
+        if fs::rename(&path, &claimed).is_err() {
+            continue;
+        }
+        let parsed = fs::read(&claimed)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<InboxLetter>(&bytes).ok());
-        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&claimed);
         if let Some(letter) = parsed {
             out.push(InboxEntry { name, letter });
         }
     }
     out
+}
+
+/// Number of letters waiting in `dir` (no claim, no read).
+pub fn pending(dir: &Path) -> usize {
+    fs::read_dir(dir)
+        .map(|read| {
+            read.filter_map(Result::ok)
+                .filter(|item| {
+                    let name = item.file_name().to_string_lossy().into_owned();
+                    !name.starts_with('.') && name.ends_with(".json")
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Sub-directory of an inbox where consumers announce themselves.
+pub const LIVE_DIR: &str = ".live";
+
+/// A consumer that holds the session open right now (channel server,
+/// rewake waiter) refreshes its file at least this often.
+pub const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A heartbeat older than this means the consumer is gone.
+pub const HEARTBEAT_STALE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Consumer names used in `.live/`.
+pub mod consumer {
+    /// `m4a-claude-channel` MCP server inside a running Claude Code.
+    pub const CLAUDE_CHANNEL: &str = "claude-channel";
+    /// `m4a-inbox wait` under a Claude `asyncRewake` hook.
+    pub const CLAUDE_REWAKE: &str = "claude-rewake";
+    /// Stop hooks (`m4a-inbox drain --format <fmt>`): armed, not live.
+    pub fn stop(format: &str) -> String {
+        format!("stop-{format}")
+    }
+}
+
+fn live_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(LIVE_DIR).join(entry_stem(name))
+}
+
+/// A live consumer's heartbeat file. Removed on drop.
+pub struct Presence {
+    path: PathBuf,
+}
+
+impl Presence {
+    /// Writes the heartbeat (pid inside) under `dir/.live/name`.
+    pub fn announce(dir: &Path, name: &str) -> Result<Self, WakeError> {
+        let path = live_path(dir, name);
+        if let Some(parent) = path.parent() {
+            create_private_dir(dir)?;
+            create_private_dir(parent)?;
+        }
+        let presence = Self { path };
+        presence.beat();
+        Ok(presence)
+    }
+
+    /// Refreshes the heartbeat.
+    pub fn beat(&self) {
+        if let Ok(mut file) = private_file(&self.path) {
+            let _ = write!(file, "{}", std::process::id());
+        }
+    }
+}
+
+impl Drop for Presence {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Whether consumer `name` beat within [`HEARTBEAT_STALE`].
+pub fn is_live(dir: &Path, name: &str) -> bool {
+    fs::metadata(live_path(dir, name))
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age <= HEARTBEAT_STALE)
+}
+
+/// Marks a one-shot consumer (a Stop hook) as installed for this inbox.
+/// Unlike [`Presence`] it stays until [`disarm`].
+pub fn arm(dir: &Path, name: &str) -> Result<(), WakeError> {
+    create_private_dir(dir)?;
+    create_private_dir(&dir.join(LIVE_DIR))?;
+    private_file(&live_path(dir, name)).map(|_| ())
+}
+
+/// Removes an [`arm`] marker.
+pub fn disarm(dir: &Path, name: &str) {
+    let _ = fs::remove_file(live_path(dir, name));
+}
+
+/// Whether [`arm`] ran for `name` and was not disarmed.
+pub fn is_armed(dir: &Path, name: &str) -> bool {
+    live_path(dir, name).exists()
 }
 
 fn create_private_dir(dir: &Path) -> Result<(), WakeError> {
@@ -184,6 +289,28 @@ mod tests {
         assert_eq!(drained[0].letter.from_nick, "carol");
         assert!(drained[0].letter.prompt.ends_with("hello"));
         assert!(drain(&dir).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn presence_beats_and_clears_and_arm_sticks() {
+        let dir = temp_dir("live");
+        assert!(!is_live(&dir, consumer::CLAUDE_CHANNEL));
+        {
+            let _p = Presence::announce(&dir, consumer::CLAUDE_CHANNEL).unwrap();
+            assert!(is_live(&dir, consumer::CLAUDE_CHANNEL));
+            assert!(!is_live(&dir, consumer::CLAUDE_REWAKE));
+        }
+        assert!(!is_live(&dir, consumer::CLAUDE_CHANNEL));
+        let stop = consumer::stop("codex-stop");
+        assert!(!is_armed(&dir, &stop));
+        arm(&dir, &stop).unwrap();
+        assert!(is_armed(&dir, &stop));
+        // Markers are not letters.
+        assert_eq!(pending(&dir), 0);
+        assert!(drain(&dir).is_empty());
+        disarm(&dir, &stop);
+        assert!(!is_armed(&dir, &stop));
         let _ = fs::remove_dir_all(&dir);
     }
 

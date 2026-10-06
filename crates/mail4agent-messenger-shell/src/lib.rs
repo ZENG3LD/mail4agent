@@ -105,6 +105,7 @@ pub use grok_listen::{hear, GrokListener, Heard, ListenReport};
 pub use nick::{nick_from_display_name, routine_folder_id};
 pub use node::{NodeClient, NodeTickReport, NODE_DEFAULT_SOCK_NAME};
 pub use provider::{
+    plan_chain, HostEnv, HookFlavor, ResumeSpawnAdapter, SessionRecord, WakeChain, WebVendor,
     adapter_for, wake_prompt, AdapterConfig, ClaudeChannelAdapter, ClaudeRoutineFireAdapter,
     CodexAppServerAdapter, CodexCloudAdapter, CodexEndpoint, CursorAgentAdapter, GrokLeaderAdapter,
     KimiServerAdapter, NoInboundAdapter, ProviderKind, ProviderSession, RoutineWebhookAdapter,
@@ -727,6 +728,12 @@ pub struct OpenedStore {
     /// Last wake failure, clipped. No bearer and no message body.
     wake_note: Option<String>,
     wake_log: Vec<WakeAttempt>,
+    /// Provider wake chain for a session that has no leader socket
+    /// (Codex, Kimi, Claude, Cursor; Claude web / Codex cloud). Uses the
+    /// same `leader-prompted` ledger as the leader path.
+    wake_chain: Option<(provider::ProviderSession, provider::WakeChain)>,
+    /// `<link id> delivered|queued` for the newest chain wake.
+    wake_route: Option<String>,
     /// In-process bus for sessions this machine's client already holds.
     /// `None` on a store opened by itself: every request goes to the homeserver.
     bus: Option<Arc<machine::LocalBus>>,
@@ -849,6 +856,8 @@ impl OpenedStore {
             leader_cwd: None,
             routine_sent: HashSet::new(),
             leader_sent: HashSet::new(),
+            wake_chain: None,
+            wake_route: None,
             wake_note: None,
             wake_log: Vec::new(),
             bus: None,
@@ -1249,6 +1258,35 @@ impl OpenedStore {
             .map(Zeroizing::new);
         self.leader_sock = wake.leader_sock.filter(|path| !path.as_os_str().is_empty());
         self.leader_cwd = wake.leader_cwd.filter(|cwd| !cwd.is_empty());
+    }
+
+    /// Installs the provider wake chain ([`provider::plan_chain`]). Used
+    /// only while no leader socket is set; the Grok leader path and the
+    /// routine POST are unchanged by it.
+    pub fn set_wake_chain(
+        &mut self,
+        session: provider::ProviderSession,
+        chain: provider::WakeChain,
+    ) {
+        self.wake_chain = Some((session, chain));
+    }
+
+    /// Link ids of the installed chain, in order. Empty when none.
+    pub fn wake_chain_ids(&self) -> Vec<&'static str> {
+        self.wake_chain
+            .as_ref()
+            .map(|(_, chain)| chain.ids())
+            .unwrap_or_default()
+    }
+
+    /// `<link id> delivered|queued` for the newest chain wake.
+    pub fn wake_route(&self) -> Option<&str> {
+        self.wake_route.as_deref()
+    }
+
+    /// [`Self::wake_route`], cleared, so a listener prints it once.
+    pub fn take_wake_route(&mut self) -> Option<String> {
+        self.wake_route.take()
     }
 
     /// Whether this store has a routine to wake (URL set).
@@ -1806,7 +1844,7 @@ impl OpenedStore {
     /// row existed. Once history is in memory, keep every inbound except
     /// the newest in each room off the leader.
     fn arm_unprompted_newest(&mut self) {
-        if self.leader_sock.is_none() || !self.leader_sent.is_empty() {
+        if (self.leader_sock.is_none() && self.wake_chain.is_none()) || !self.leader_sent.is_empty() {
             return;
         }
         if self.inbound_plaintexts().is_empty() {
@@ -1817,7 +1855,7 @@ impl OpenedStore {
     }
 
     fn wake_inbound(&mut self) {
-        if self.routine_url.is_none() && self.leader_sock.is_none() {
+        if self.routine_url.is_none() && self.leader_sock.is_none() && self.wake_chain.is_none() {
             return;
         }
         self.arm_unprompted_newest();
@@ -1894,6 +1932,32 @@ impl OpenedStore {
                         }
                     }
                 }
+            }
+            if sock.is_none() && !self.leader_sent.contains(&item.key) {
+                let Some((session, mut chain)) = self.wake_chain.take() else {
+                    continue;
+                };
+                let from_nick = mxid_localpart(&item.from).to_string();
+                let letter = provider::WakeLetter {
+                    body: &item.body,
+                    from_nick: &from_nick,
+                    event_id: &item.event_id,
+                    room: Some(&item.room_id),
+                };
+                match chain.wake(&session, &letter) {
+                    Ok((id, outcome)) => {
+                        self.remember_leader_prompt(&item.key);
+                        let how = match outcome {
+                            provider::WakeOutcome::Delivered => "delivered",
+                            provider::WakeOutcome::Queued(_) => "queued",
+                        };
+                        self.wake_route = Some(format!("{id} {how}"));
+                    }
+                    Err(err) => {
+                        self.wake_note = Some(clip_public(err.to_string()));
+                    }
+                }
+                self.wake_chain = Some((session, chain));
             }
         }
     }
@@ -3028,6 +3092,46 @@ mod tests {
             "fake-token",
         )
         .expect("open")
+    }
+
+    #[test]
+    fn inbound_room_text_goes_through_the_provider_chain_once() {
+        let (base, home_done, home) = spawn_homeserver("wake-chain");
+        let dir = temp_dir("wake-chain");
+        let inbox_dir = dir.0.join("inbox");
+        let mut store = open_against(&base, &dir.0, "session-c");
+        let session = provider::ProviderSession {
+            kind: provider::SessionKind::local(provider::ProviderKind::Codex),
+            session_id: "thread-c".into(),
+            nick: "builder".into(),
+            cwd: None,
+            headless: false,
+        };
+        let host = provider::HostEnv {
+            surface: provider::Surface::Local,
+            vendor: None,
+            os: "linux",
+        };
+        let config = provider::AdapterConfig {
+            inbox_dir: Some(inbox_dir.clone()),
+            spawn_program: Some("/bin/false".into()),
+            ..provider::AdapterConfig::default()
+        };
+        let chain = provider::plan_chain(&session, &host, &config);
+        store.set_wake_chain(session, chain);
+        assert_eq!(store.wake_chain_ids()[0], "codex-app-server-turn");
+        store.drive(1_000, false).expect("drive");
+        store.drive(3_000, false).expect("drive again");
+        let route = store.take_wake_route();
+        let note = store.wake_note().unwrap_or("").to_string();
+        drop(store);
+        stop(&home_done, home);
+        // No app-server and no hook armed: the durable queue took it, once.
+        assert_eq!(route.as_deref(), Some("inbox-queue queued"), "note={note}");
+        let letters = provider::inbox::drain(&inbox_dir);
+        assert_eq!(letters.len(), 1);
+        assert!(letters[0].letter.prompt.ends_with("wake-chain"));
+        assert!(letters[0].letter.prompt.contains("m4a-send --as builder"));
     }
 
     #[test]
