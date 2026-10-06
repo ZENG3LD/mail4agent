@@ -727,6 +727,10 @@ pub struct OpenedStore {
     /// older keys into [`ROUTINE_WOKEN_FILE`] (newest still POSTs once) —
     /// first open after a missing/empty ledger, once tip/history has landed.
     routine_woken_seed_pending: bool,
+    /// Restart with an existing [`ROUTINE_WOKEN_FILE`]: tip/history may show
+    /// more rows than the ledger. While true, remember every inbound key
+    /// without POSTing. Cleared at the end of the first [`Self::drive`].
+    routine_restart_catchup: bool,
     /// Inbound event keys whose leader prompt already succeeded.
     leader_sent: HashSet<String>,
     /// Last wake failure, clipped. No bearer and no message body.
@@ -863,6 +867,7 @@ impl OpenedStore {
             leader_cwd: None,
             routine_sent: HashSet::new(),
             routine_woken_seed_pending: false,
+            routine_restart_catchup: false,
             leader_sent: HashSet::new(),
             wake_chain: None,
             wake_route: None,
@@ -1428,6 +1433,7 @@ impl OpenedStore {
         }
         self.note_history_pages(&history, trace_at);
         self.note_room_tips();
+        self.routine_restart_catchup = false;
         Ok(())
     }
 
@@ -1840,10 +1846,14 @@ impl OpenedStore {
                     self.routine_sent.insert(format!("{room}\n{event}"));
                 }
                 self.routine_woken_seed_pending = false;
+                // Tip/history after restart can surface rows the ledger never
+                // saw; silence them for the first drive instead of re-POSTing.
+                self.routine_restart_catchup = true;
             }
             Ok(_) | Err(_) => {
                 // Missing or empty ledger: seed once tip/history fills the timeline.
                 self.routine_woken_seed_pending = true;
+                self.routine_restart_catchup = false;
             }
         }
     }
@@ -1985,7 +1995,15 @@ impl OpenedStore {
         if self.routine_url.is_none() && self.leader_sock.is_none() && self.wake_chain.is_none() {
             return;
         }
-        if self.routine_woken_seed_pending && self.routine_url.is_some() {
+        if self.routine_restart_catchup && self.routine_url.is_some() {
+            // Existing ledger + tip/history catch-up: persist every inbound
+            // key without POSTing. Cleared when this drive finishes.
+            for item in self.inbound_plaintexts() {
+                if !self.routine_sent.contains(&item.key) {
+                    self.remember_routine_wake(&item.key);
+                }
+            }
+        } else if self.routine_woken_seed_pending && self.routine_url.is_some() {
             // Tip/history may have just filled an empty timeline. Mark older
             // rows woken without POSTing; newest still fires once, then the
             // ledger persists across restarts.
@@ -2002,7 +2020,8 @@ impl OpenedStore {
         let items = self.inbound_plaintexts();
         for item in items {
             if let Some(url) = url.as_deref() {
-                if !self.routine_sent.contains(&item.key) {
+                // Restart catch-up already remembered keys; skip POSTs.
+                if !self.routine_restart_catchup && !self.routine_sent.contains(&item.key) {
                     let from_nick = mxid_localpart(&item.from).to_string();
                     let to = self.nick.clone();
                     let reply = to.as_deref().map(|to| reply_hint(to, &from_nick));
