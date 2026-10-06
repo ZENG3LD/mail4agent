@@ -69,7 +69,7 @@ mod ipc;
 mod machine;
 mod nick;
 mod node;
-mod provider;
+pub mod provider;
 mod push;
 mod send;
 
@@ -105,9 +105,11 @@ pub use grok_listen::{hear, GrokListener, Heard, ListenReport};
 pub use nick::{nick_from_display_name, routine_folder_id};
 pub use node::{NodeClient, NodeTickReport, NODE_DEFAULT_SOCK_NAME};
 pub use provider::{
-    adapter_for, wake_prompt, ClaudeCodeAdapter, CodexAdapter, CursorAgentAdapter,
-    GrokLeaderAdapter, KimiCodeAdapter, ProviderKind, ProviderSession, WakeAdapter, WakeError,
-    WakeLetter, WakeOutcome, INBOX_DIR_ENV, PROVIDER_ENV,
+    adapter_for, wake_prompt, AdapterConfig, ClaudeChannelAdapter, ClaudeRoutineFireAdapter,
+    CodexAppServerAdapter, CodexCloudAdapter, CodexEndpoint, CursorAgentAdapter, GrokLeaderAdapter,
+    KimiServerAdapter, NoInboundAdapter, ProviderKind, ProviderSession, RoutineWebhookAdapter,
+    SessionKind, Surface, WakeAdapter, WakeError, WakeLetter, WakeOutcome, INBOX_DIR_ENV,
+    PROVIDER_ENV,
 };
 pub use push::PushedRoomEvent;
 pub use send::{
