@@ -328,7 +328,7 @@ fn e2e_mis_signed_otk_is_refused() {
 }
 
 #[test]
-fn e2e_device_key_change_is_flagged_not_applied() {
+fn e2e_device_key_change_is_applied_and_flagged() {
     let mut server = FakeServer::new();
     let mut alice = TestClient::new("alice", "ALICEDEV");
     let mut bob = TestClient::new("bob", "BOBDEV");
@@ -342,25 +342,20 @@ fn e2e_device_key_change_is_flagged_not_applied() {
     assert_eq!(first_outcome.accepted_devices, vec![(bob_user.clone(), bob_device_id.clone())]);
     let original = alice.devices_of(&bob_user).into_iter().next().expect("bob is known");
 
-    // Bob's device id gets re-issued under a DIFFERENT identity key pair --
-    // a device-takeover/re-registration bug, never a legitimate key
-    // rotation (module doc). A fresh, independent account self-signs the
-    // SAME device id and re-uploads directly (a real impostor would not
-    // have access to bob's own `OlmAccountState`).
-    let mut impostor_store = Store::new(bob_device_id.clone(), InsecurePlainCodecForTests);
-    let impostor_account = OlmAccountState::load_or_create(&mut impostor_store).expect("fresh impostor account");
-    let impostor_device_keys =
-        impostor_account.device_keys_json(&bob_user, &bob_device_id).expect("impostor self-signs its own keys");
-    assert_ne!(impostor_account.identity_keys().ed25519, original.ed25519, "the impostor has different keys");
+    // Same device id, new Olm identity — the authenticated store-loss reset
+    // the server now accepts. Alice must take the new keys or Megolm to bob
+    // stays black-holed under the old curve25519.
+    let mut reset_store = Store::new(bob_device_id.clone(), InsecurePlainCodecForTests);
+    let reset_account = OlmAccountState::load_or_create(&mut reset_store).expect("fresh reset account");
+    let reset_device_keys =
+        reset_account.device_keys_json(&bob_user, &bob_device_id).expect("reset self-signs its own keys");
+    assert_ne!(reset_account.identity_keys().ed25519, original.ed25519, "reset has different keys");
 
     let reupload_id = alice.next_request_id();
-    let reupload = OutgoingRequest::keys_upload(reupload_id, serde_json::json!({ "device_keys": impostor_device_keys }));
+    let reupload = OutgoingRequest::keys_upload(reupload_id, serde_json::json!({ "device_keys": reset_device_keys }));
     let response = server.dispatch(&bob_user, &bob_device_id, &reupload);
     assert_eq!(response.status, 200);
 
-    // Alice learns about the change the way a real client would: the
-    // server reports it on her next `/sync`, not by her polling bob again
-    // on a whim.
     server.note_device_list_changed(&alice.user_id, &alice.device_id, &bob_user);
     alice.sync_device_lists(&mut server);
     let second_outcome =
@@ -369,10 +364,11 @@ fn e2e_device_key_change_is_flagged_not_applied() {
         second_outcome.key_changes,
         vec![DeviceKeyChanged { user_id: bob_user.clone(), device_id: bob_device_id.clone() }]
     );
-    assert!(second_outcome.accepted_devices.is_empty(), "the impostor's keys are never accepted as an update");
 
     let after = alice.devices_of(&bob_user).into_iter().next().expect("still known");
-    assert_eq!(after, original, "the OLD keys are kept, never silently replaced");
+    assert_ne!(after.curve25519, original.curve25519, "new identity keys are applied");
+    assert_eq!(after.curve25519, reset_account.identity_keys().curve25519);
+    assert!(!after.verified, "verification cleared on key reset");
 }
 
 #[test]

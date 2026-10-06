@@ -24,22 +24,19 @@
 //! are Olm-shared to every one of a room's members' devices, including the
 //! sending device's own siblings (plan §4.2).
 //!
-//! # Why a key change is never silently applied
+//! # Why a verified key change is applied, not kept forever
 //!
-//! A device id is minted once by the homeserver at login and never
-//! legitimately changes the Curve25519/Ed25519 keys it was first seen with
-//! (research doc §4.5's device-list-desync pitfall, one layer down: the
-//! failure mode this guards against is a compromised or malicious server
-//! substituting a different device's keys under a familiar device id to
-//! intercept a room key). [`DeviceTracker::on_keys_query_response`] treats a
-//! same-device-id, different-keys response as a security event
-//! ([`DeviceKeyChanged`]), not an update: the OLD, previously-verified keys
-//! are kept, and the caller decides what to do about the alert (surface a
-//! "device changed" warning, refuse to share new room keys to it until the
-//! user re-verifies, ...). The same holds for a device whose self-signature
-//! no longer verifies at all -- it is dropped, and if a previously-known,
-//! still-valid record exists for that device id, that old record is kept
-//! rather than erased by an unverifiable update.
+//! A device id is minted once by the homeserver. Classic Matrix UI clients
+//! refuse a same-device-id key swap because a compromised server could
+//! substitute keys. This crate serves agent mail: a sealed store can be
+//! lost while the device bearer survives, the server accepts that as an
+//! authenticated identity reset, and peers MUST take the new keys or mail
+//! black-holes forever. [`DeviceTracker::on_keys_query_response`] therefore
+//! applies a same-device-id key change when the new object self-signs, clears
+//! `verified`, keeps `blocked`, and still emits [`DeviceKeyChanged`] so the
+//! core can forget outbound Megolm shares to that device and re-establish
+//! Olm. A device whose self-signature no longer verifies is still dropped,
+//! and a previously-known valid record for that id is kept.
 //!
 //! # `left` users have no store-level "forget"
 //!
@@ -101,8 +98,9 @@ pub struct DroppedDevice {
 }
 
 /// A previously-known device whose Curve25519 or Ed25519 key changed in a
-/// new `/keys/query` response -- the OLD keys are kept (see the module
-/// doc). A caller should surface this as a security event.
+/// new `/keys/query` response -- the NEW keys were applied with
+/// `verified = false` (see the module doc). A caller should re-share
+/// Megolm and drop stale Olm sessions for this device.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceKeyChanged {
     /// The device's owner.
@@ -123,8 +121,8 @@ pub struct KeysQueryOutcome {
     /// A device this response carried that failed validation and was never
     /// stored.
     pub dropped_devices: Vec<DroppedDevice>,
-    /// A previously-known device whose keys changed -- flagged, not
-    /// applied.
+    /// A previously-known device whose keys changed -- new keys applied
+    /// (`verified` cleared) and flagged for the caller.
     pub key_changes: Vec<DeviceKeyChanged>,
 }
 
@@ -242,10 +240,11 @@ impl DeviceTracker {
 
     /// Applies a `/keys/query` response body (plan §3): verifies each
     /// device's self-signature over canonical JSON with its OWN claimed
-    /// Ed25519 key, drops anything that doesn't check out, flags (without
-    /// applying) a key change on an already-known device id, and persists
-    /// the resulting per-user device lists. Marks every user present in
-    /// `device_keys` (even with zero devices) not-outdated.
+    /// Ed25519 key, drops anything that doesn't check out, applies a key
+    /// change on an already-known device id (clears `verified`, keeps
+    /// `blocked`, emits [`DeviceKeyChanged`]), and persists the resulting
+    /// per-user device lists. Marks every user present in `device_keys`
+    /// (even with zero devices) not-outdated.
     pub fn on_keys_query_response<S: CryptoStore>(
         store: &mut S,
         body: &[u8],
@@ -269,7 +268,14 @@ impl DeviceTracker {
                                 user_id: user_id.clone(),
                                 device_id: device_id.clone(),
                             });
-                            merged.push(known);
+                            // Authenticated identity reset on the server:
+                            // take the new keys so Megolm/Olm can recover.
+                            // Clear verified; keep an explicit block.
+                            merged.push(StoredDevice {
+                                verified: false,
+                                blocked: known.blocked,
+                                ..candidate
+                            });
                         }
                         Some(known) => {
                             outcome.accepted_devices.push((user_id.clone(), device_id.clone()));
@@ -487,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    fn key_change_on_a_known_device_id_is_flagged_and_the_old_keys_are_kept() {
+    fn key_change_on_a_known_device_id_is_applied_and_flagged() {
         let mut store = new_store();
         let bob = user("bob");
         let dev1 = device("DEV1");
@@ -499,15 +505,17 @@ mod tests {
         let original =
             DeviceTracker::devices_for_user(&store, &bob).expect("no error").into_iter().next().expect("stored");
 
-        let impostor_account = Account::new();
+        let reset_account = Account::new();
         let second_body =
-            keys_query_body(&[(&bob, &dev1, signed_device_keys(&impostor_account, &bob, &dev1))]);
+            keys_query_body(&[(&bob, &dev1, signed_device_keys(&reset_account, &bob, &dev1))]);
         let outcome = DeviceTracker::on_keys_query_response(&mut store, &second_body).expect("second query applies");
 
         assert_eq!(outcome.key_changes, vec![DeviceKeyChanged { user_id: bob.clone(), device_id: dev1.clone() }]);
-        assert!(outcome.accepted_devices.is_empty());
+        assert!(outcome.accepted_devices.is_empty(), "a key change is reported via key_changes, not accepted_devices");
 
         let stored = DeviceTracker::devices_for_user(&store, &bob).expect("no error").into_iter().next().expect("kept");
-        assert_eq!(stored, original, "the OLD keys are kept, never overwritten by an unexplained key change");
+        assert_ne!(stored.curve25519, original.curve25519, "new identity keys are applied");
+        assert_eq!(stored.curve25519, reset_account.identity_keys().curve25519);
+        assert!(!stored.verified, "verification is cleared on a key reset");
     }
 }

@@ -488,6 +488,16 @@ pub fn upsert_device_keys(
     Ok(())
 }
 
+/// Wipe one-time and fallback keys for `(user_id, device_id)` — used when an
+/// authenticated device resets its Olm identity under the same device id.
+/// Does not touch `device_keys` itself (the caller replaces that row) or
+/// `device_list_changes` (the following `upsert_device_keys` logs the change).
+pub fn clear_device_one_time_material(conn: &Connection, user_id: i64, device_id: &str) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM one_time_keys WHERE user_id = ?1 AND device_id = ?2", params![user_id, device_id])?;
+    conn.execute("DELETE FROM fallback_keys WHERE user_id = ?1 AND device_id = ?2", params![user_id, device_id])?;
+    Ok(())
+}
+
 /// Every device-keys row belonging to any of `user_ids` — the `/keys/query`
 /// batch shape. Empty input returns an empty vec without touching the
 /// database.

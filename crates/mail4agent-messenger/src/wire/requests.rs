@@ -438,6 +438,25 @@ impl OutgoingRequest {
         }
     }
 
+    /// Latest page, `dir=b`, no `from`. The server starts at the tip.
+    /// An encrypted push carries no ciphertext, and a `/sync` token that
+    /// has already moved on will not return that event again.
+    pub fn room_messages_latest(id: RequestId, room_id: &RoomId, limit: u32) -> Self {
+        const PATH_TEMPLATE: &str = "/_matrix/client/v3/rooms/{room_id}/messages";
+        let path = substitute(PATH_TEMPLATE, &[("{room_id}", room_id.as_str())]);
+        Self {
+            id,
+            method: HttpMethod::Get,
+            path,
+            query: vec![
+                ("dir".to_string(), "b".to_string()),
+                ("limit".to_string(), limit.to_string()),
+            ],
+            body: None,
+            kind: OutgoingRequestKind::RoomMessages,
+        }
+    }
+
     /// `GET /_matrix/client/v3/rooms/{roomId}/members`.
     pub fn room_members(id: RequestId, room_id: &RoomId) -> Self {
         const PATH_TEMPLATE: &str = "/_matrix/client/v3/rooms/{room_id}/members";

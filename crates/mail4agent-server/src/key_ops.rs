@@ -215,18 +215,29 @@ pub fn check_device_keys_ownership(device_keys: &serde_json::Value, caller_mxid:
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceKeysUploadAction {
+    /// No device_keys row yet — first publish.
     Insert,
+    /// Same identity keys resent — silent no-op.
     Noop,
+    /// Authenticated device bearer replaced its Olm identity (lost sealed
+    /// store, same device id). Peers must re-query and re-share Megolm.
+    Reset,
 }
 
 
-/// A device never changes identity keys once set (plan P9 brief: "a CHANGE
-/// to an already-stored device key set for the same device id is refused —
-/// a device never changes identity keys; the client must log in again").
-/// Compares only the `keys` object (the actual curve25519/ed25519 identity),
-/// not `algorithms`/`signatures`, which may legitimately be resent — an
-/// identical `keys` resubmission is a silent no-op (many clients re-upload
-/// their unchanged device keys on every restart).
+/// Decide what a `device_keys` upload does for an already-authenticated
+/// device bearer. Compares only the `keys` object (curve25519/ed25519
+/// identity), not `algorithms`/`signatures`.
+///
+/// - No row yet → [`DeviceKeysUploadAction::Insert`].
+/// - Identical `keys` → [`DeviceKeysUploadAction::Noop`] (clients re-upload
+///   on restart).
+/// - Different `keys` → [`DeviceKeysUploadAction::Reset`]: the sealed store
+///   was lost and the same device bearer minted a new Olm identity. The
+///   bearer already authenticated this call, so we accept the new identity,
+///   invalidate old OTKs, and wake peers via `device_lists.changed`. A silent
+///   refuse used to black-hole mail: peers never re-queried keys and never
+///   received a Megolm re-share.
 pub fn decide_device_keys_upload(existing_keys_json: Option<&str>, new_keys_value: &serde_json::Value) -> Result<DeviceKeysUploadAction, MatrixError> {
     let Some(existing_keys_json) = existing_keys_json else {
         return Ok(DeviceKeysUploadAction::Insert);
@@ -235,9 +246,7 @@ pub fn decide_device_keys_upload(existing_keys_json: Option<&str>, new_keys_valu
     if &existing_keys == new_keys_value {
         Ok(DeviceKeysUploadAction::Noop)
     } else {
-        Err(MatrixError::invalid_param(
-            "a device's identity keys cannot change once set — log in again to mint a new device",
-        ))
+        Ok(DeviceKeysUploadAction::Reset)
     }
 }
 
@@ -261,12 +270,12 @@ pub struct KeysUploadOutcome {
 }
 
 
-/// DB-only core for `POST /keys/upload` (plan P9 brief): ownership + no-
-/// identity-change checks on `device_keys` (a first upload or an identical
-/// resubmission only — a change is refused), OTK-id validation, then pure
-/// storage of everything provided. Returns the fresh
-/// `one_time_key_counts` plus whether `device_keys` actually changed (the
-/// caller only wakes peers when it did).
+/// DB-only core for `POST /keys/upload`: ownership check on `device_keys`,
+/// then insert / no-op / authenticated identity reset (see
+/// [`decide_device_keys_upload`]), OTK-id validation, and storage. On
+/// [`DeviceKeysUploadAction::Reset`] old one-time and fallback keys for this
+/// device are wiped before the new identity is stored. Returns whether
+/// `device_keys` actually changed (the caller wakes peers when it did).
 pub fn apply_keys_upload(
     conn: &mut Connection,
     caller_user_id: i64,
@@ -284,7 +293,10 @@ pub fn apply_keys_upload(
             .into_iter()
             .find(|d| d.device_id == caller_device_id);
         let action = decide_device_keys_upload(existing.as_ref().map(|d| d.keys.as_str()), &new_keys_value)?;
-        if action == DeviceKeysUploadAction::Insert {
+        if matches!(action, DeviceKeysUploadAction::Insert | DeviceKeysUploadAction::Reset) {
+            if action == DeviceKeysUploadAction::Reset {
+                crate::keys::clear_device_one_time_material(conn, caller_user_id, caller_device_id)?;
+            }
             let algorithms_json = device_keys.get("algorithms").cloned().unwrap_or(serde_json::json!([])).to_string();
             let keys_json = new_keys_value.to_string();
             let signatures_json = device_keys.get("signatures").cloned().unwrap_or(serde_json::json!({})).to_string();
@@ -976,5 +988,101 @@ pub fn backup_sessions_to_response(room_id: Option<&str>, session_id: Option<&st
             }
             Ok(serde_json::json!({ "rooms": rooms_out }))
         }
+    }
+}
+
+
+#[cfg(test)]
+mod device_keys_upload_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    const T0: &str = "2026-10-06T00:00:00+00:00";
+
+    fn test_conn() -> Connection {
+        let conn = Connection::open_in_memory().expect("memory");
+        crate::store::create_matrix_schema(&conn).expect("schema");
+        crate::keys::create_matrix_keys_schema(&conn).expect("keys");
+        conn
+    }
+
+    #[test]
+    fn decide_insert_noop_and_reset() {
+        let keys_a = serde_json::json!({"curve25519:D":"aaa","ed25519:D":"bbb"});
+        let keys_b = serde_json::json!({"curve25519:D":"ccc","ed25519:D":"ddd"});
+        assert_eq!(decide_device_keys_upload(None, &keys_a).unwrap(), DeviceKeysUploadAction::Insert);
+        assert_eq!(
+            decide_device_keys_upload(Some(&keys_a.to_string()), &keys_a).unwrap(),
+            DeviceKeysUploadAction::Noop
+        );
+        assert_eq!(
+            decide_device_keys_upload(Some(&keys_a.to_string()), &keys_b).unwrap(),
+            DeviceKeysUploadAction::Reset
+        );
+    }
+
+    #[test]
+    fn apply_keys_upload_reset_replaces_identity_clears_otks_and_logs_change() {
+        let mut conn = test_conn();
+        crate::store::ensure_matrix_user(&conn, 1, "alice00000000000000000000000001", T0).expect("user");
+        let device_id = crate::keys::create_device(&conn, 1, crate::keys::CredentialKind::Bearer, "tok", T0).expect("device");
+        let mxid = crate::store::mxid_of(&conn, 1).expect("mxid").expect("row");
+
+        let first = KeysUploadRequest {
+            device_keys: Some(serde_json::json!({
+                "user_id": mxid,
+                "device_id": device_id,
+                "algorithms": ["m.olm.v1.curve25519-aes-sha2"],
+                "keys": {"curve25519:D":"oldcurve","ed25519:D":"olded"},
+                "signatures": {}
+            })),
+            one_time_keys: Some(std::collections::BTreeMap::from([(
+                "signed_curve25519:AAAAAQ".to_string(),
+                serde_json::json!({"key":"otk1"}),
+            )])),
+            fallback_keys: Some(std::collections::BTreeMap::from([(
+                "signed_curve25519:FALLBACK".to_string(),
+                serde_json::json!({"key":"fb1"}),
+            )])),
+        };
+        let first_out = apply_keys_upload(&mut conn, 1, &mxid, &device_id, &first, T0).expect("first");
+        assert!(first_out.device_keys_changed);
+        assert_eq!(crate::keys::count_one_time_keys(&conn, 1, &device_id).unwrap().get("signed_curve25519"), Some(&1));
+
+        let before_changes: i64 = conn
+            .query_row("SELECT COUNT(*) FROM device_list_changes WHERE user_id = 1", [], |r| r.get(0))
+            .unwrap();
+
+        let reset = KeysUploadRequest {
+            device_keys: Some(serde_json::json!({
+                "user_id": mxid,
+                "device_id": device_id,
+                "algorithms": ["m.olm.v1.curve25519-aes-sha2"],
+                "keys": {"curve25519:D":"newcurve","ed25519:D":"newed"},
+                "signatures": {}
+            })),
+            one_time_keys: Some(std::collections::BTreeMap::from([(
+                "signed_curve25519:BBBBBQ".to_string(),
+                serde_json::json!({"key":"otk2"}),
+            )])),
+            fallback_keys: None,
+        };
+        let reset_out = apply_keys_upload(&mut conn, 1, &mxid, &device_id, &reset, T0).expect("reset");
+        assert!(reset_out.device_keys_changed);
+
+        let stored = crate::keys::device_keys_for(&conn, &[1]).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(stored[0].keys.contains("newcurve"), "new identity stored: {}", stored[0].keys);
+        assert!(!stored[0].keys.contains("oldcurve"));
+
+        let otk = crate::keys::count_one_time_keys(&conn, 1, &device_id).unwrap();
+        assert_eq!(otk.get("signed_curve25519"), Some(&1), "old OTKs wiped; only the new batch remains");
+        let fallback = crate::keys::unused_fallback_key_types(&conn, 1, &device_id).unwrap();
+        assert!(fallback.is_empty(), "old fallback wiped on reset");
+
+        let after_changes: i64 = conn
+            .query_row("SELECT COUNT(*) FROM device_list_changes WHERE user_id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(after_changes, before_changes + 1, "reset logs device_lists.changed");
     }
 }

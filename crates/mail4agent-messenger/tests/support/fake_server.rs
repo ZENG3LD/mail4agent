@@ -443,24 +443,58 @@ impl FakeServer {
 
     fn handle_keys_upload(&mut self, as_user: &UserId, as_device: &DeviceId, request: &OutgoingRequest) -> HttpResponseDescriptor {
         let body = request.body.clone().unwrap_or_else(|| Value::Object(Map::new()));
-        let state = self.device_mut(as_user, as_device);
-
-        if let Some(device_keys) = body.get("device_keys") {
-            state.device_keys = Some(device_keys.clone());
-        }
-        if let Some(one_time_keys) = body.get("one_time_keys").and_then(Value::as_object) {
-            for (key_id, value) in one_time_keys {
-                state.one_time_keys.insert(key_id.clone(), value.clone());
+        let mut identity_reset = false;
+        {
+            let state = self.device_mut(as_user, as_device);
+            if let Some(device_keys) = body.get("device_keys") {
+                let new_keys = device_keys.get("keys");
+                let old_keys = state.device_keys.as_ref().and_then(|v| v.get("keys"));
+                match (old_keys, new_keys) {
+                    (None, Some(_)) => {
+                        // First publish for this device — wake peers.
+                        identity_reset = true;
+                    }
+                    (Some(old), Some(newk)) if old != newk => {
+                        // Authenticated identity reset: wipe OTKs/fallback and
+                        // wake peers via device_lists.changed (mirrors production).
+                        state.one_time_keys.clear();
+                        state.fallback = None;
+                        state.fallback_used = false;
+                        identity_reset = true;
+                    }
+                    _ => {}
+                }
+                state.device_keys = Some(device_keys.clone());
+            }
+            if let Some(one_time_keys) = body.get("one_time_keys").and_then(Value::as_object) {
+                for (key_id, value) in one_time_keys {
+                    state.one_time_keys.insert(key_id.clone(), value.clone());
+                }
+            }
+            if let Some(fallback_keys) = body.get("fallback_keys").and_then(Value::as_object) {
+                if let Some((key_id, value)) = fallback_keys.iter().next() {
+                    state.fallback = Some((key_id.clone(), value.clone()));
+                    state.fallback_used = false;
+                }
             }
         }
-        if let Some(fallback_keys) = body.get("fallback_keys").and_then(Value::as_object) {
-            if let Some((key_id, value)) = fallback_keys.iter().next() {
-                state.fallback = Some((key_id.clone(), value.clone()));
-                state.fallback_used = false;
+        if identity_reset {
+            // Notify every other user this fake has a device for — peers in
+            // shared rooms learn via the next /sync.
+            let peers: Vec<UserId> = self
+                .devices
+                .keys()
+                .map(|(user, _)| user.clone())
+                .filter(|user| user != as_user)
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            for peer in peers {
+                self.broadcast_device_list_change(&peer, as_user);
             }
         }
 
-        let count = state.one_time_keys.len() as u64;
+        let count = self.device_mut(as_user, as_device).one_time_keys.len() as u64;
         json_response(200, &serde_json::json!({ "one_time_key_counts": { "signed_curve25519": count } }))
     }
 
