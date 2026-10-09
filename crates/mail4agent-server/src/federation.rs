@@ -464,29 +464,78 @@ impl Default for HttpKeyFetcher {
     }
 }
 
+impl HttpKeyFetcher {
+    /// Base URL (`scheme://authority`) for a server name: staging override,
+    /// else `.well-known` delegation, else `name:8448`.
+    pub async fn base_url(&self, server: &str) -> Result<String, FedError> {
+        if let Some(base) = self.overrides.get(server) {
+            return Ok(base.clone());
+        }
+        let (host, port, is_ip) = parse_server_name(server).ok_or_else(|| FedError::Malformed("server name".into()))?;
+        let well_known = if is_ip || port.is_some() {
+            None
+        } else {
+            match self.get_limited(&format!("https://{host}/.well-known/matrix/server")).await {
+                Ok(b) => serde_json::from_slice::<Value>(&b).ok().and_then(|v| v.get("m.server").and_then(Value::as_str).map(str::to_string)),
+                Err(_) => None,
+            }
+        };
+        let target = resolve_target(server, well_known.as_deref()).ok_or_else(|| FedError::Malformed("delegate".into()))?;
+        Ok(format!("https://{}", target.authority()))
+    }
+}
+
 impl RemoteKeys for HttpKeyFetcher {
     fn fetch_server_keys<'a>(&'a self, server: &'a str) -> FetchFuture<'a> {
         Box::pin(async move {
-            if let Some(base) = self.overrides.get(server) {
-                let body = self.get_limited(&format!("{base}/_matrix/key/v2/server")).await?;
-                return serde_json::from_slice(&body).map_err(|_| FedError::Malformed("key json".into()));
-            }
-            let (host, port, is_ip) = parse_server_name(server).ok_or_else(|| FedError::Malformed("server name".into()))?;
-            let well_known = if is_ip || port.is_some() {
-                None
-            } else {
-                match self.get_limited(&format!("https://{host}/.well-known/matrix/server")).await {
-                    Ok(b) => serde_json::from_slice::<Value>(&b)
-                        .ok()
-                        .and_then(|v| v.get("m.server").and_then(Value::as_str).map(str::to_string)),
-                    Err(_) => None,
-                }
-            };
-            let target = resolve_target(server, well_known.as_deref()).ok_or_else(|| FedError::Malformed("delegate".into()))?;
-            let body = self.get_limited(&format!("https://{}/_matrix/key/v2/server", target.authority())).await?;
+            let base = self.base_url(server).await?;
+            let body = self.get_limited(&format!("{base}/_matrix/key/v2/server")).await?;
             serde_json::from_slice(&body).map_err(|_| FedError::Malformed("key json".into()))
         })
     }
+}
+
+/// Boxed future returned by [`FedTransport::request`].
+pub type ReqFuture<'a> = Pin<Box<dyn Future<Output = Result<(u16, Value), FedError>> + Send + 'a>>;
+
+/// Sends one signed federation request and returns `(status, json body)`.
+/// `uri` is the full path and query including `/_matrix`.
+pub trait FedTransport: Send + Sync {
+    /// Deliver to `destination`; `authorization` is the complete `X-Matrix` header value.
+    fn request<'a>(&'a self, destination: &'a str, method: &'a str, uri: &'a str, authorization: &'a str, body: Option<&'a Value>) -> ReqFuture<'a>;
+}
+
+impl FedTransport for HttpKeyFetcher {
+    fn request<'a>(&'a self, destination: &'a str, method: &'a str, uri: &'a str, authorization: &'a str, body: Option<&'a Value>) -> ReqFuture<'a> {
+        Box::pin(async move {
+            let base = self.base_url(destination).await?;
+            let m = reqwest::Method::from_bytes(method.as_bytes()).map_err(|_| FedError::Malformed("method".into()))?;
+            let mut req = self.client.request(m, format!("{base}{uri}")).header("Authorization", authorization);
+            if let Some(b) = body {
+                req = req.header("Content-Type", "application/json").body(canonical_json(b));
+            }
+            let resp = req.send().await.map_err(|e| FedError::Network(e.to_string()))?;
+            let status = resp.status().as_u16();
+            let bytes = resp.bytes().await.map_err(|e| FedError::Network(e.to_string()))?;
+            if bytes.len() > 8 * 1024 * 1024 {
+                return Err(FedError::Network("body too large".into()));
+            }
+            Ok((status, serde_json::from_slice(&bytes).unwrap_or(Value::Null)))
+        })
+    }
+}
+
+/// Percent-encode one path segment (RFC 3986 unreserved characters pass through).
+pub fn enc(segment: &str) -> String {
+    let mut out = String::new();
+    for b in segment.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 #[cfg(test)]

@@ -358,6 +358,17 @@ pub fn build_keys_query_response(
     requested: &BTreeMap<String, Vec<String>>,
 ) -> Result<serde_json::Value, MatrixError> {
     let visible = peers_sharing_a_room_with(conn, caller_user_id)?;
+    build_keys_query_visible(conn, &visible, Some((caller_user_id, caller_mxid)), requested)
+}
+
+/// [`build_keys_query_response`] with an explicit visible-user set; `caller`
+/// is `None` for a federation request (no user-signing key is returned).
+pub fn build_keys_query_visible(
+    conn: &Connection,
+    visible: &HashSet<i64>,
+    caller: Option<(i64, &str)>,
+    requested: &BTreeMap<String, Vec<String>>,
+) -> Result<serde_json::Value, MatrixError> {
 
     let mut device_keys_out = serde_json::Map::new();
     let mut master_keys_out = serde_json::Map::new();
@@ -406,8 +417,10 @@ pub fn build_keys_query_response(
     }
 
     let mut user_signing_keys_out = serde_json::Map::new();
-    if let Some(row) = crate::keys::cross_signing_key_for(conn, caller_user_id, CrossSigningUsage::UserSigning)? {
-        user_signing_keys_out.insert(caller_mxid.to_string(), serde_json::from_str(&row.key_json)?);
+    if let Some((caller_user_id, caller_mxid)) = caller {
+        if let Some(row) = crate::keys::cross_signing_key_for(conn, caller_user_id, CrossSigningUsage::UserSigning)? {
+            user_signing_keys_out.insert(caller_mxid.to_string(), serde_json::from_str(&row.key_json)?);
+        }
     }
 
     Ok(serde_json::json!({
@@ -447,6 +460,11 @@ pub fn count_claim_targets(requested: &BTreeMap<String, BTreeMap<String, String>
 /// any user this caller may not see.
 pub fn build_keys_claim_response(conn: &mut Connection, caller_user_id: i64, requested: &BTreeMap<String, BTreeMap<String, String>>) -> Result<serde_json::Value, MatrixError> {
     let visible = peers_sharing_a_room_with(conn, caller_user_id)?;
+    build_keys_claim_visible(conn, &visible, requested)
+}
+
+/// [`build_keys_claim_response`] with an explicit visible-user set (federation).
+pub fn build_keys_claim_visible(conn: &mut Connection, visible: &HashSet<i64>, requested: &BTreeMap<String, BTreeMap<String, String>>) -> Result<serde_json::Value, MatrixError> {
     let mut out = serde_json::Map::new();
 
     for (mxid, per_device) in requested {

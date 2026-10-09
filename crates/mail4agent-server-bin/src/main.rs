@@ -126,20 +126,30 @@ fn run() -> Result<(), String> {
         if let Ok(spec) = env::var("M4A_FEDERATION_PEER_OVERRIDE") {
             fetcher = fetcher.with_overrides_from(&spec);
         }
-        let _ = hs.key_fetcher.set(Arc::new(fetcher));
+        let fetcher = Arc::new(fetcher);
+        let _ = hs.key_fetcher.set(fetcher.clone());
+        let _ = hs.fed_transport.set(fetcher);
         if let Ok(list) = env::var("M4A_FEDERATION_ALLOW") {
             let _ = hs.federation_allow.set(list.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect());
         }
     }
     spawn_retention(Arc::clone(&hs));
-    let app = router(hs);
+    let fed_worker = hs.federation_enabled.get().is_some().then(|| Arc::clone(&hs));
+    // Served both bare (behind an edge that strips `/_matrix`) and under `/_matrix` (direct federation peers).
+    let inner = router(hs);
+    let app = axum::Router::new().nest("/_matrix", inner.clone()).merge(inner);
     let app = match edge_secret {
         Some(secret) => mail4agent_server::http::edge_auth::require_edge_secret(app, secret),
         None => app,
     };
 
     let runtime = tokio::runtime::Runtime::new().map_err(|err| format!("runtime: {err}"))?;
-    runtime.block_on(serve(bind, app, role == "core"))
+    runtime.block_on(async move {
+        if let Some(hs) = fed_worker {
+            mail4agent_server::http::fed_net::spawn_outbox_worker(hs);
+        }
+        serve(bind, app, role == "core").await
+    })
 }
 
 

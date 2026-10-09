@@ -1371,6 +1371,7 @@ dependencies = [
  "chrono",
  "mail4agent-messenger-shell",
  "mail4agent-server",
+ "reqwest",
  "rusqlite",
  "serde_json",
  "tokio",

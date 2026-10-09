@@ -105,11 +105,27 @@ async fn keys_query(
     let caller = super::resolve_caller(&state, &headers, None).await?;
     let user_id = caller.user_id;
     let mxid = caller.mxid;
-    on_conn(&state, move |conn| {
-        crate::key_ops::build_keys_query_response(conn, user_id, &mxid, &request.device_keys)
-    })
-    .await
-    .map(Json)
+    let federated = state.federation_enabled.get().is_some();
+    let (local, remote) = if federated { super::fed_net::split_by_domain(&request.device_keys) } else { (request.device_keys.clone(), Default::default()) };
+    let mut out = on_conn(&state, move |conn| crate::key_ops::build_keys_query_response(conn, user_id, &mxid, &local)).await?;
+    if !remote.is_empty() {
+        // Only users the caller shares a room with may be looked up remotely.
+        let allowed = on_conn(&state, move |conn| {
+            let visible = crate::key_ops::peers_sharing_a_room_with(conn, user_id)?;
+            let mut kept: std::collections::BTreeMap<String, std::collections::BTreeMap<String, Vec<String>>> = Default::default();
+            for (domain, users) in remote {
+                for (u, devs) in users {
+                    if crate::store::user_id_of(conn, &u)?.is_some_and(|id| visible.contains(&id)) {
+                        kept.entry(domain.clone()).or_default().insert(u, devs);
+                    }
+                }
+            }
+            Ok(kept)
+        })
+        .await?;
+        super::fed_net::merge_remote_keys_query(&state, allowed, &mut out).await;
+    }
+    Ok(Json(out))
 }
 
 async fn keys_claim(
@@ -123,11 +139,26 @@ async fn keys_claim(
         return Err(MatrixError::limit_exceeded(60_000));
     }
     let user_id = caller.user_id;
-    on_conn(&state, move |conn| {
-        crate::key_ops::build_keys_claim_response(conn, user_id, &request.one_time_keys)
-    })
-    .await
-    .map(Json)
+    let federated = state.federation_enabled.get().is_some();
+    let (local, remote) = if federated { super::fed_net::split_by_domain(&request.one_time_keys) } else { (request.one_time_keys.clone(), Default::default()) };
+    let mut out = on_conn(&state, move |conn| crate::key_ops::build_keys_claim_response(conn, user_id, &local)).await?;
+    if !remote.is_empty() {
+        let allowed = on_conn(&state, move |conn| {
+            let visible = crate::key_ops::peers_sharing_a_room_with(conn, user_id)?;
+            let mut kept: std::collections::BTreeMap<String, std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>> = Default::default();
+            for (domain, users) in remote {
+                for (u, devs) in users {
+                    if crate::store::user_id_of(conn, &u)?.is_some_and(|id| visible.contains(&id)) {
+                        kept.entry(domain.clone()).or_default().insert(u, devs);
+                    }
+                }
+            }
+            Ok(kept)
+        })
+        .await?;
+        super::fed_net::merge_remote_keys_claim(&state, allowed, &mut out).await;
+    }
+    Ok(Json(out))
 }
 
 async fn keys_changes(
@@ -193,8 +224,15 @@ async fn send_to_device(
     let caller = super::resolve_caller(&state, &headers, None).await?;
     let user_id = caller.user_id;
     let device_id = caller.device_id;
-    let messages = body.messages;
+    let federated = state.federation_enabled.get().is_some();
+    let (messages, remote_msgs) = if federated { super::fed_net::split_by_domain(&body.messages) } else { (body.messages, Default::default()) };
+    let sender_mxid = caller.mxid.clone();
+    let (ev_type2, txn2) = (event_type.clone(), txn_id.clone());
     let wake_ids = on_conn(&state, move |conn| {
+        for (domain, users) in &remote_msgs {
+            let value = serde_json::to_value(users).map_err(|_| MatrixError::internal())?;
+            super::fed_net::enqueue_to_device_edu(conn, domain, &sender_mxid, &ev_type2, &format!("{txn2}.{user_id}.{device_id}.{domain}"), &value)?;
+        }
         let now = now_rfc3339();
         match crate::key_ops::apply_send_to_device(conn, user_id, &device_id, &event_type, &txn_id, &messages, &now)? {
             crate::key_ops::SendToDeviceOutcome::New(wake_ids) => Ok(wake_ids),

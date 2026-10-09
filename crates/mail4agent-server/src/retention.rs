@@ -110,6 +110,7 @@ fn eligible_ids(conn: &Connection, now_ms: i64, policy: &RetentionPolicy) -> rus
             "SELECT event_id FROM events WHERE room_id = ?1 AND state_key IS NULL
                AND stream_id NOT IN (SELECT stream_id FROM events WHERE room_id = ?1 AND state_key IS NULL
                                      ORDER BY stream_id DESC LIMIT ?2)
+               AND event_id NOT IN (SELECT event_id FROM fed_skeleton)
                AND ((stream_id <= ?3 AND origin_server_ts <= ?4) OR origin_server_ts <= ?5)",
         )?;
         let ids = ev.query_map(
@@ -137,6 +138,16 @@ pub fn purge_delivered_events(conn: &mut Connection, now_ms: i64, policy: &Reten
     let tx = conn.transaction()?;
     let mut removed = 0;
     for id in &ids {
+        // Federated closed rooms keep a skeleton (event id, sender, signature, hashes) so
+        // the room's history stays verifiable for remote servers; only the ciphertext goes.
+        let room: Option<String> = tx.query_row("SELECT room_id FROM events WHERE event_id = ?1", params![id], |r| r.get(0)).ok();
+        if let Some(room) = room {
+            if crate::fed_rooms::room_is_federated(&tx, &room)? {
+                crate::fed_rooms::skeletonize_event(&tx, id)?;
+                removed += 1;
+                continue;
+            }
+        }
         tx.execute("DELETE FROM relations WHERE event_id = ?1 OR target_id = ?1", params![id])?;
         tx.execute("DELETE FROM receipts WHERE event_id = ?1", params![id])?;
         tx.execute("DELETE FROM txn_dedup WHERE event_id = ?1", params![id])?;

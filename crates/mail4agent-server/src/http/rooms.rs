@@ -94,8 +94,14 @@ fn now_stamp() -> (String, i64) {
     (chrono::Utc::now().to_rfc3339(), chrono::Utc::now().timestamp_millis())
 }
 
-fn known_user_id(conn: &Connection, mxid: &str) -> Result<i64, MatrixError> {
-    crate::store::user_id_of(conn, mxid)?.ok_or_else(|| MatrixError::not_found(format!("Unknown user: {mxid}")))
+fn known_user_id(conn: &Connection, mxid: &str, federated: bool) -> Result<i64, MatrixError> {
+    match crate::store::user_id_of(conn, mxid)? {
+        Some(id) => Ok(id),
+        None if federated && crate::fed_rooms::is_remote_mxid(mxid) => {
+            crate::fed_rooms::ensure_remote_user(conn, mxid, &chrono::Utc::now().to_rfc3339()).map_err(|_| MatrixError::invalid_param("invalid remote user id"))
+        }
+        None => Err(MatrixError::not_found(format!("Unknown user: {mxid}"))),
+    }
 }
 
 fn require_room(conn: &Connection, room_id: &str) -> Result<crate::store::Room, MatrixError> {
@@ -143,12 +149,13 @@ async fn create_room(
         return Err(MatrixError::invalid_param("room aliases are not supported"));
     }
 
+    let federated = state.federation_enabled.get().is_some();
     let creation = with_conn(&state, move |conn| {
         crate::nick::require_nick(conn, caller.user_id, "choose a nick before creating a room")?;
         let creator_label = crate::nick::effective_label(conn, caller.user_id)?;
         let mut resolved = Vec::with_capacity(req.invite.len());
         for mxid in &req.invite {
-            let user_id = known_user_id(conn, mxid)?;
+            let user_id = known_user_id(conn, mxid, federated)?;
             let displayname = crate::nick::effective_label(conn, user_id)?;
             resolved.push((user_id, displayname));
         }
@@ -193,6 +200,11 @@ async fn join_room(
     Path(room_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, MatrixError> {
     let caller = resolve_caller(&state, &headers, None).await?;
+    if state.federation_enabled.get().is_some() && super::fed_net::room_domain_is_remote(&room_id) {
+        let ids = super::fed_net::federated_join(&state, &caller, &room_id).await?;
+        wake_users(&state, ids);
+        return Ok(Json(serde_json::json!({ "room_id": room_id })));
+    }
     let room_for_db = room_id.clone();
     let decision = with_conn(&state, move |conn| {
         let displayname = crate::nick::effective_label(conn, caller.user_id)?;
@@ -229,10 +241,11 @@ async fn invite_member(
     Json(body): Json<crate::rooms::UserIdBody>,
 ) -> Result<Json<serde_json::Value>, MatrixError> {
     let caller = resolve_caller(&state, &headers, None).await?;
+    let federated = state.federation_enabled.get().is_some();
     let wake_ids = with_conn(&state, move |conn| {
         crate::nick::require_nick(conn, caller.user_id, "choose a nick before inviting")?;
         require_room(conn, &room_id)?;
-        let target_user_id = known_user_id(conn, &body.user_id)?;
+        let target_user_id = known_user_id(conn, &body.user_id, federated)?;
         if target_user_id == caller.user_id {
             return Err(MatrixError::invalid_param("cannot invite yourself"));
         }
@@ -260,9 +273,10 @@ async fn membership_change(
     caller: Caller,
     change: MembershipChange,
 ) -> Result<Json<serde_json::Value>, MatrixError> {
+    let federated = state.federation_enabled.get().is_some();
     let wake_ids = with_conn(&state, move |conn| {
         require_room(conn, &change.room_id)?;
-        let target_user_id = known_user_id(conn, &change.target_mxid)?;
+        let target_user_id = known_user_id(conn, &change.target_mxid, federated)?;
         let (now, origin_ts) = now_stamp();
         apply_membership_power_action(
             conn,

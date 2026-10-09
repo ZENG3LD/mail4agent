@@ -26,6 +26,7 @@ mod compat;
 pub mod edge_auth;
 mod ephemeral;
 mod federation;
+pub mod fed_net;
 mod keys;
 mod messaging;
 mod register;
@@ -55,6 +56,10 @@ pub struct Homeserver {
     pub federation_allow: std::sync::OnceLock<Vec<String>>,
     /// How remote servers' signing keys are fetched; unset = no remote verification.
     pub key_fetcher: std::sync::OnceLock<Arc<dyn crate::federation::RemoteKeys>>,
+    /// Outgoing federation transport; unset = no outgoing federation.
+    pub fed_transport: std::sync::OnceLock<Arc<dyn crate::federation::FedTransport>>,
+    /// Wakes the outbox worker when new federation work exists.
+    pub fed_notify: tokio::sync::Notify,
 }
 
 impl Homeserver {
@@ -70,6 +75,8 @@ impl Homeserver {
             federation_enabled: std::sync::OnceLock::new(),
             federation_allow: std::sync::OnceLock::new(),
             key_fetcher: std::sync::OnceLock::new(),
+            fed_transport: std::sync::OnceLock::new(),
+            fed_notify: tokio::sync::Notify::new(),
         }
     }
 }
@@ -130,6 +137,8 @@ where
 
 pub fn wake_users(state: &Homeserver, ids: impl IntoIterator<Item = i64>) {
     state.live.wake_many(ids.into_iter().map(|id| format!("user:{id}")));
+    // Every write that wakes sync may also owe a federation delivery.
+    state.fed_notify.notify_one();
 }
 
 pub fn router(state: Arc<Homeserver>) -> Router {

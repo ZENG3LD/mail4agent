@@ -8,12 +8,14 @@ use std::sync::Arc;
 
 use axum::extract::{OriginalUri, Path, Query, State};
 use axum::http::{header, HeaderMap, Uri};
-use axum::routing::get;
+use axum::body::Bytes;
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
 use super::{with_conn_pub, Homeserver};
 use crate::error::MatrixError;
+use crate::fed_rooms as fr;
 use crate::federation as fed;
 
 pub(super) fn routes() -> Router<Arc<Homeserver>> {
@@ -22,6 +24,14 @@ pub(super) fn routes() -> Router<Arc<Homeserver>> {
         .route("/key/v2/server/{key_id}", get(own_keys_by_id))
         .route("/federation/v1/version", get(version))
         .route("/federation/v1/query/profile", get(profile))
+        .route("/federation/v1/send/{txn_id}", put(send_txn))
+        .route("/federation/v1/make_join/{room_id}/{user_id}", get(make_join))
+        .route("/federation/v2/send_join/{room_id}/{event_id}", put(send_join))
+        .route("/federation/v2/invite/{room_id}/{event_id}", put(invite))
+        .route("/federation/v1/backfill/{room_id}", get(backfill))
+        .route("/federation/v1/user/keys/query", post(keys_query))
+        .route("/federation/v1/user/keys/claim", post(keys_claim))
+        .route("/federation/v1/user/devices/{user_id}", get(user_devices))
 }
 
 fn require_enabled(state: &Homeserver) -> Result<(), MatrixError> {
@@ -66,6 +76,319 @@ async fn profile(
     } else {
         Err(MatrixError::not_found("user not found"))
     }
+}
+
+fn internal<E>(_: E) -> MatrixError {
+    MatrixError::internal()
+}
+
+fn rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+fn parse_body(body: &Bytes) -> Result<Value, MatrixError> {
+    serde_json::from_slice(body).map_err(|_| MatrixError::bad_json("body is not JSON"))
+}
+
+/// Wake local users and poke the outbox (events ingested may need relaying).
+fn after_ingest(state: &Arc<Homeserver>, wake: impl IntoIterator<Item = i64>) {
+    super::wake_users(state, wake.into_iter().filter(|id| *id > 0));
+    state.fed_notify.notify_one();
+}
+
+async fn send_txn(
+    State(state): State<Arc<Homeserver>>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    Path(_txn): Path<String>,
+    body: Bytes,
+) -> Result<Json<Value>, MatrixError> {
+    require_enabled(&state)?;
+    let origin = authenticate(&state, "PUT", &uri, &headers, &body).await?;
+    let v = parse_body(&body)?;
+    if v.get("origin").and_then(Value::as_str) != Some(origin.as_str()) {
+        return Err(MatrixError::forbidden("origin in body does not match the signing server"));
+    }
+    let pdus = v.get("pdus").and_then(Value::as_array).cloned().unwrap_or_default();
+    let edus = v.get("edus").and_then(Value::as_array).cloned().unwrap_or_default();
+    if pdus.len() > 50 || edus.len() > 100 {
+        return Err(MatrixError::invalid_param("too many pdus or edus"));
+    }
+    let mut results = serde_json::Map::new();
+    let mut wake_all: Vec<i64> = Vec::new();
+    for pdu in pdus {
+        let id = pdu.get("event_id").and_then(Value::as_str).unwrap_or("?").to_string();
+        let outcome = match super::fed_net::verify_pdu(&state, &pdu).await {
+            Ok(content_ok) => {
+                let p = pdu.clone();
+                with_conn_pub(&state, move |c| fr::ingest_pdu(c, &p, content_ok, fr::Mode::Live, &rfc3339())).await
+            }
+            Err(e) => Err(e),
+        };
+        match outcome {
+            Ok(i) => {
+                wake_all.extend(i.wake);
+                results.insert(id, json!({}));
+            }
+            Err(e) => {
+                results.insert(id, json!({ "error": e.error }));
+            }
+        }
+    }
+    for edu in edus {
+        if edu.get("edu_type").and_then(Value::as_str) == Some("m.direct_to_device") {
+            let content = edu.get("content").cloned().unwrap_or(Value::Null);
+            let origin2 = origin.clone();
+            if let Ok(ids) = with_conn_pub(&state, move |c| apply_direct_to_device(c, &origin2, &content)).await {
+                wake_all.extend(ids);
+            }
+        }
+    }
+    after_ingest(&state, wake_all);
+    Ok(Json(json!({ "pdus": results })))
+}
+
+fn apply_direct_to_device(conn: &mut rusqlite::Connection, origin: &str, content: &Value) -> Result<Vec<i64>, MatrixError> {
+    let sender = content.get("sender").and_then(Value::as_str).unwrap_or_default();
+    if fr::domain_of(sender) != Some(origin) {
+        return Err(MatrixError::forbidden("to-device sender is not on the origin server"));
+    }
+    let sender_uid = fr::ensure_remote_user(conn, sender, &rfc3339()).map_err(|_| MatrixError::bad_json("sender"))?;
+    let ty = content.get("type").and_then(Value::as_str).unwrap_or_default().to_string();
+    let message_id = content.get("message_id").and_then(Value::as_str).unwrap_or_default().to_string();
+    let messages: std::collections::BTreeMap<String, std::collections::BTreeMap<String, Value>> =
+        serde_json::from_value(content.get("messages").cloned().unwrap_or(Value::Null)).map_err(|_| MatrixError::bad_json("messages"))?;
+    if ty.is_empty() || message_id.is_empty() {
+        return Err(MatrixError::bad_json("type/message_id"));
+    }
+    match crate::key_ops::apply_send_to_device(conn, sender_uid, &format!("fed:{origin}"), &ty, &message_id, &messages, &rfc3339())? {
+        crate::key_ops::SendToDeviceOutcome::New(ids) => Ok(ids.into_iter().collect()),
+        crate::key_ops::SendToDeviceOutcome::AlreadySent => Ok(Vec::new()),
+    }
+}
+
+async fn make_join(
+    State(state): State<Arc<Homeserver>>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    Path((room_id, user_id)): Path<(String, String)>,
+) -> Result<Json<Value>, MatrixError> {
+    require_enabled(&state)?;
+    let origin = authenticate(&state, "GET", &uri, &headers, &[]).await?;
+    if fr::domain_of(&user_id) != Some(origin.as_str()) {
+        return Err(MatrixError::forbidden("user does not belong to the requesting server"));
+    }
+    with_conn_pub(&state, move |c| {
+        let room = crate::store::get_room(c, &room_id)?.ok_or_else(|| MatrixError::not_found("unknown room"))?;
+        let current = match crate::store::user_id_of(c, &user_id)? {
+            Some(u) => crate::store::room_member(c, &room_id, u)?.map(|m| m.membership),
+            None => None,
+        };
+        match current {
+            Some(crate::store::Membership::Ban) => return Err(MatrixError::forbidden("banned")),
+            Some(crate::store::Membership::Invite) | Some(crate::store::Membership::Join) => {}
+            _ if room.join_rule == crate::store::JoinRule::Public => {}
+            _ => return Err(MatrixError::forbidden("room is not open to this user")),
+        }
+        Ok(Json(json!({
+            "room_version": room.room_version,
+            "event": {
+                "type": "m.room.member", "state_key": user_id, "sender": user_id, "room_id": room_id,
+                "origin_server_ts": fed::now_ms(), "content": { "membership": "join" }
+            }
+        })))
+    })
+    .await
+}
+
+async fn send_join(
+    State(state): State<Arc<Homeserver>>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    Path((room_id, event_id)): Path<(String, String)>,
+    body: Bytes,
+) -> Result<Json<Value>, MatrixError> {
+    require_enabled(&state)?;
+    let origin = authenticate(&state, "PUT", &uri, &headers, &body).await?;
+    let pdu = parse_body(&body)?;
+    let sender = pdu.get("sender").and_then(Value::as_str).unwrap_or_default().to_string();
+    let is_join = pdu.get("type").and_then(Value::as_str) == Some("m.room.member")
+        && pdu.get("content").and_then(|c| c.get("membership")).and_then(Value::as_str) == Some("join")
+        && pdu.get("state_key").and_then(Value::as_str) == Some(sender.as_str());
+    if !is_join
+        || fr::domain_of(&sender) != Some(origin.as_str())
+        || pdu.get("event_id").and_then(Value::as_str) != Some(event_id.as_str())
+        || pdu.get("room_id").and_then(Value::as_str) != Some(room_id.as_str())
+    {
+        return Err(MatrixError::bad_json("not a valid join event for this request"));
+    }
+    let content_ok = super::fed_net::verify_pdu(&state, &pdu).await?;
+    let local = crate::store::matrix_server_name().to_string();
+    let (p, origin2) = (pdu.clone(), origin.clone());
+    let resp = with_conn_pub(&state, move |c| {
+        let ing = fr::ingest_pdu(c, &p, content_ok, fr::Mode::Live, &rfc3339())?;
+        let now = fed::now_ms();
+        if !ing.duplicate {
+            fr::relay_pdu(c, &room_id, &p, &[origin2.as_str()], now).map_err(internal)?;
+        }
+        let mut state_pdus = Vec::new();
+        for ev in crate::store::current_state_all(c, &room_id)? {
+            if let Ok(x) = fr::pdu_for_event(c, &ev, &local, now) {
+                state_pdus.push(x);
+            }
+        }
+        let mut timeline = Vec::new();
+        for ev in crate::store::events_in_room_before(c, &room_id, i64::MAX, 50)? {
+            if ev.state_key.is_none() {
+                if let Ok(x) = fr::pdu_for_event(c, &ev, &local, now) {
+                    timeline.push(x);
+                }
+            }
+        }
+        timeline.reverse();
+        let info = fr::room_info(c, &room_id).map_err(internal)?;
+        Ok((ing.wake, json!({ "origin": local, "state": state_pdus, "auth_chain": [], "members_omitted": false, "m4a_room": info, "m4a_timeline": timeline })))
+    })
+    .await?;
+    after_ingest(&state, resp.0);
+    Ok(Json(resp.1))
+}
+
+async fn invite(
+    State(state): State<Arc<Homeserver>>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    Path((room_id, event_id)): Path<(String, String)>,
+    body: Bytes,
+) -> Result<Json<Value>, MatrixError> {
+    require_enabled(&state)?;
+    let origin = authenticate(&state, "PUT", &uri, &headers, &body).await?;
+    let v = parse_body(&body)?;
+    let event = v.get("event").cloned().ok_or_else(|| MatrixError::bad_json("event"))?;
+    let info = v.get("room_info").cloned().ok_or_else(|| MatrixError::bad_json("room_info"))?;
+    let state_pdus = v.get("invite_room_state").and_then(Value::as_array).cloned().unwrap_or_default();
+    let sender = event.get("sender").and_then(Value::as_str).unwrap_or_default();
+    let invitee = event.get("state_key").and_then(Value::as_str).unwrap_or_default().to_string();
+    let is_invite = event.get("type").and_then(Value::as_str) == Some("m.room.member")
+        && event.get("content").and_then(|c| c.get("membership")).and_then(Value::as_str) == Some("invite");
+    if !is_invite
+        || fr::domain_of(sender) != Some(origin.as_str())
+        || event.get("event_id").and_then(Value::as_str) != Some(event_id.as_str())
+        || event.get("room_id").and_then(Value::as_str) != Some(room_id.as_str())
+        || fr::is_remote_mxid(&invitee)
+    {
+        return Err(MatrixError::bad_json("not a valid invite for this request"));
+    }
+    let mut checked: Vec<(Value, bool)> = Vec::new();
+    for p in &state_pdus {
+        if p.get("room_id").and_then(Value::as_str) != Some(room_id.as_str()) {
+            return Err(MatrixError::bad_json("state event of another room"));
+        }
+        checked.push((p.clone(), super::fed_net::verify_pdu(&state, p).await?));
+    }
+    let ev_ok = super::fed_net::verify_pdu(&state, &event).await?;
+    let (ev2, invitee2) = (event.clone(), invitee.clone());
+    let wake = with_conn_pub(&state, move |c| {
+        if crate::store::user_id_of(c, &invitee2)?.is_none() {
+            return Err(MatrixError::not_found("unknown local user"));
+        }
+        let now = rfc3339();
+        fr::create_replica_room(c, &room_id, &info, &now)?;
+        for (p, ok) in &checked {
+            fr::ingest_pdu(c, p, *ok, fr::Mode::Trusted, &now)?;
+        }
+        Ok(fr::ingest_pdu(c, &ev2, ev_ok, fr::Mode::Live, &now)?.wake)
+    })
+    .await?;
+    after_ingest(&state, wake);
+    Ok(Json(json!({ "event": event })))
+}
+
+#[derive(serde::Deserialize)]
+struct BackfillQuery {
+    v: Option<String>,
+    limit: Option<i64>,
+}
+
+async fn backfill(
+    State(state): State<Arc<Homeserver>>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    Path(room_id): Path<String>,
+    Query(q): Query<BackfillQuery>,
+) -> Result<Json<Value>, MatrixError> {
+    require_enabled(&state)?;
+    let origin = authenticate(&state, "GET", &uri, &headers, &[]).await?;
+    let local = crate::store::matrix_server_name().to_string();
+    let limit = q.limit.unwrap_or(50).clamp(1, 100);
+    with_conn_pub(&state, move |c| {
+        if !fr::remote_domains(c, &room_id)?.contains(&origin) {
+            return Err(MatrixError::forbidden("server has no member in this room"));
+        }
+        let before = match q.v.as_deref() {
+            Some(id) => crate::store::get_event(c, id)?.map(|e| e.stream_id).ok_or_else(|| MatrixError::not_found("unknown event"))?,
+            None => i64::MAX,
+        };
+        let mut pdus = Vec::new();
+        for ev in crate::store::events_in_room_before(c, &room_id, before, limit)? {
+            if let Ok(p) = fr::pdu_for_event(c, &ev, &local, fed::now_ms()) {
+                pdus.push(p);
+            }
+        }
+        Ok(Json(json!({ "origin": local, "origin_server_ts": fed::now_ms(), "pdus": pdus })))
+    })
+    .await
+}
+
+async fn keys_query(State(state): State<Arc<Homeserver>>, OriginalUri(uri): OriginalUri, headers: HeaderMap, body: Bytes) -> Result<Json<Value>, MatrixError> {
+    require_enabled(&state)?;
+    let origin = authenticate(&state, "POST", &uri, &headers, &body).await?;
+    let req: crate::key_ops::KeysQueryRequest = serde_json::from_slice(&body).map_err(|_| MatrixError::bad_json("keys query"))?;
+    with_conn_pub(&state, move |c| {
+        let visible = fr::users_visible_to_origin(c, &origin)?;
+        let local_only: std::collections::BTreeMap<String, Vec<String>> = req.device_keys.into_iter().filter(|(m, _)| !fr::is_remote_mxid(m)).collect();
+        crate::key_ops::build_keys_query_visible(c, &visible, None, &local_only).map(Json)
+    })
+    .await
+}
+
+async fn keys_claim(State(state): State<Arc<Homeserver>>, OriginalUri(uri): OriginalUri, headers: HeaderMap, body: Bytes) -> Result<Json<Value>, MatrixError> {
+    require_enabled(&state)?;
+    let origin = authenticate(&state, "POST", &uri, &headers, &body).await?;
+    let req: crate::key_ops::KeysClaimRequest = serde_json::from_slice(&body).map_err(|_| MatrixError::bad_json("keys claim"))?;
+    with_conn_pub(&state, move |c| {
+        let visible = fr::users_visible_to_origin(c, &origin)?;
+        let local_only: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>> =
+            req.one_time_keys.into_iter().filter(|(m, _)| !fr::is_remote_mxid(m)).collect();
+        crate::key_ops::build_keys_claim_visible(c, &visible, &local_only).map(Json)
+    })
+    .await
+}
+
+async fn user_devices(
+    State(state): State<Arc<Homeserver>>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+) -> Result<Json<Value>, MatrixError> {
+    require_enabled(&state)?;
+    let origin = authenticate(&state, "GET", &uri, &headers, &[]).await?;
+    with_conn_pub(&state, move |c| {
+        let uid = crate::store::user_id_of(c, &user_id)?.filter(|u| *u > 0).ok_or_else(|| MatrixError::not_found("unknown user"))?;
+        if !fr::users_visible_to_origin(c, &origin)?.contains(&uid) {
+            return Err(MatrixError::not_found("unknown user"));
+        }
+        let one: std::collections::BTreeMap<String, Vec<String>> = [(user_id.clone(), Vec::new())].into();
+        let visible: std::collections::HashSet<i64> = [uid].into();
+        let q = crate::key_ops::build_keys_query_visible(c, &visible, None, &one)?;
+        let devices: Vec<Value> = q["device_keys"][&user_id].as_object().map(|m| m.iter().map(|(id, keys)| json!({ "device_id": id, "keys": keys })).collect()).unwrap_or_default();
+        Ok(Json(json!({
+            "user_id": user_id, "stream_id": 0, "devices": devices,
+            "master_key": q["master_keys"].get(&user_id).cloned().unwrap_or(Value::Null),
+            "self_signing_key": q["self_signing_keys"].get(&user_id).cloned().unwrap_or(Value::Null),
+        })))
+    })
+    .await
 }
 
 /// Path+query as the sender signed it: always with the `/_matrix` prefix,
@@ -120,7 +443,7 @@ pub(crate) async fn authenticate(
 
 /// Public key of `server` for `key_id`: cache first, then one resolved fetch
 /// (rate-limited per server), validated before it is stored.
-async fn remote_key(state: &Arc<Homeserver>, server: &str, key_id: &str) -> Result<String, MatrixError> {
+pub(crate) async fn remote_key(state: &Arc<Homeserver>, server: &str, key_id: &str) -> Result<String, MatrixError> {
     let now = fed::now_ms();
     let (s, k) = (server.to_string(), key_id.to_string());
     let cached = with_conn_pub(state, move |c| fed::cached_remote_key(c, &s, &k, now).map_err(|_| MatrixError::internal())).await?;
