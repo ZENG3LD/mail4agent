@@ -852,6 +852,10 @@ fn three_local_shells_exchange_one_text_in_an_encrypted_group() {
         "group room was not encrypted; {}",
         describe(&alice)
     );
+    for _ in 0..4 {
+        settle(&mut alice, &mut alice_now);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
     send_text(&mut alice, &mut alice_now, &room_id, GROUP_TEXT);
     wait_text(&mut bob, &mut bob_now, GROUP_TEXT);
     wait_text(&mut carol, &mut carol_now, GROUP_TEXT);
@@ -975,4 +979,54 @@ fn three_local_shells_exchange_one_text_in_an_encrypted_channel() {
             .all(|(_, event_type, _)| event_type != "m.room.message"),
         "encrypted channel stored a plaintext m.room.message"
     );
+}
+
+#[test]
+fn m4_late_joiner_decrypts_history_from_an_existing_member() {
+    const LATE_TEXT: &str = "history before carol joined";
+    let mut boot = start_three_shells();
+    let (mut alice, mut bob, mut carol) = open_trio(&boot);
+    let mut alice_now = 3_000_000_i64;
+    let mut bob_now = 3_000_000_i64;
+    let mut carol_now = 3_000_000_i64;
+    settle(&mut alice, &mut alice_now);
+    settle(&mut bob, &mut bob_now);
+    settle(&mut carol, &mut carol_now);
+    alice
+        .dispatch(
+            MessengerCommand::CreateRoom {
+                kind: CreateRoomKind::Channel { name: "history".to_string(), topic: None },
+            },
+            alice_now,
+        )
+        .expect("create channel");
+    settle(&mut alice, &mut alice_now);
+    let room_id = wait_membership(&mut alice, &mut alice_now, "join", Some(true));
+    join_room(&mut bob, &mut bob_now, &room_id);
+    let _ = wait_membership(&mut bob, &mut bob_now, "join", Some(true));
+    for _ in 0..4 {
+        settle(&mut alice, &mut alice_now);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    send_text(&mut alice, &mut alice_now, &room_id, LATE_TEXT);
+    wait_text(&mut bob, &mut bob_now, LATE_TEXT);
+
+    // Carol joins only now: the text predates her membership.
+    join_room(&mut carol, &mut carol_now, &room_id);
+    let _ = wait_membership(&mut carol, &mut carol_now, "join", Some(true));
+    let mut saw = false;
+    for _ in 0..30 {
+        settle(&mut alice, &mut alice_now);
+        settle(&mut carol, &mut carol_now);
+        if carol.texts().iter().any(|text| text.body == LATE_TEXT) {
+            saw = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    assert!(saw, "M4: late joiner never decrypted history; {}", describe(&carol));
+    drop(alice);
+    drop(bob);
+    drop(carol);
+    stop_server(&mut boot.server);
 }

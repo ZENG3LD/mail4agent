@@ -925,6 +925,11 @@ pub struct MessengerCore<C: RecordCodec> {
     /// a restart asks again, which is what recovers a share the previous
     /// process acked and then lost.
     key_requests_sent: BTreeSet<(RoomId, String)>,
+    /// M4: standalone `/keys/claim` calls made so a joiner can reach old
+    /// members (id -> devices claimed).
+    history_claims: BTreeMap<RequestId, Vec<StoredDevice>>,
+    /// M4: devices a history claim was already attempted for this process.
+    history_claim_tried: BTreeSet<(UserId, DeviceId)>,
     /// Sessions a peer refused with `m.room_key.withheld`. Stops the retry.
     withheld_sessions: BTreeSet<(RoomId, String)>,
     /// `(requester, device, request_id)` already answered with a share.
@@ -1081,6 +1086,8 @@ impl<C: RecordCodec> MessengerCore<C> {
             account_data_write_keys: BTreeMap::new(),
             pending_decrypt: BTreeMap::new(),
             key_requests_sent: BTreeSet::new(),
+            history_claims: BTreeMap::new(),
+            history_claim_tried: BTreeSet::new(),
             withheld_sessions: BTreeSet::new(),
             key_requests_answered: BTreeSet::new(),
             unknown_sender_retry: VecDeque::new(),
@@ -1809,6 +1816,13 @@ impl<C: RecordCodec> MessengerCore<C> {
             }
             Some(OutgoingRequestKind::KeysUpload) => {
                 self.account.on_keys_upload_response(&mut self.store)?;
+            }
+            Some(OutgoingRequestKind::KeysClaim) if self.history_claims.contains_key(request_id) => {
+                if let Some(devices) = self.history_claims.remove(request_id) {
+                    let refs: Vec<&StoredDevice> = devices.iter().collect();
+                    let _ = OlmSessionManager::on_keys_claim_response(&mut self.store, &self.account, &refs, &response.body);
+                }
+                self.retry_missing_room_keys();
             }
             Some(OutgoingRequestKind::SigningKeysUpload) => {
                 self.xsign_inflight = false;
@@ -2791,6 +2805,9 @@ impl<C: RecordCodec> MessengerCore<C> {
         if !members.contains(&decrypted.sender) {
             return Ok(());
         }
+        if decrypted.sender != self.config.user_id && !self.history_forwarding_allowed(&body.room_id) {
+            return Ok(());
+        }
         if decrypted.sender == self.config.user_id && content.requesting_device_id == self.config.device_id {
             return Ok(());
         }
@@ -2876,6 +2893,30 @@ impl<C: RecordCodec> MessengerCore<C> {
         targets.extend(DeviceTracker::devices_for_user(&self.store, &self.config.user_id)?);
         if targets.is_empty() {
             return Ok(());
+        }
+        // M4: reach devices we share no Olm session with yet (we just joined
+        // and never talked to them) by claiming one-time keys first; the
+        // claim response re-runs this request.
+        let missing: Vec<StoredDevice> = OlmSessionManager::sessions_missing_for(&self.store, &targets)?
+            .into_iter()
+            .filter(|device| {
+                !device.blocked
+                    && !(device.user_id == self.config.user_id && device.device_id == self.config.device_id)
+                    && !self.history_claim_tried.contains(&(device.user_id.clone(), device.device_id.clone()))
+            })
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            let claim_id = self.next_request_id()?;
+            let refs: Vec<&StoredDevice> = missing.iter().collect();
+            if let Some(request) = OlmSessionManager::keys_claim_request(claim_id.clone(), &refs) {
+                for device in &missing {
+                    self.history_claim_tried.insert((device.user_id.clone(), device.device_id.clone()));
+                }
+                self.history_claims.insert(claim_id, missing);
+                self.enqueue_request(request, Lane::Other)?;
+                return Ok(());
+            }
         }
         let request_id = self.next_txn_id()?;
         let body = RoomKeyRequestContent {
@@ -2985,6 +3026,28 @@ impl<C: RecordCodec> MessengerCore<C> {
     /// asked about while still only invited comes back with no devices and
     /// would otherwise stay "up to date" with none after joining, and no later
     /// message would ever be shared with them.
+    /// M4: re-run key requests for every undecryptable (MissingSession) row.
+    fn retry_missing_room_keys(&mut self) {
+        let work: Vec<(RoomId, EventId)> = self
+            .pending_decrypt
+            .iter()
+            .flat_map(|(room, by_event)| by_event.keys().map(move |event| (room.clone(), event.clone())))
+            .collect();
+        for (room_id, event_id) in work {
+            let _ = self.retry_decrypt_one(&room_id, &event_id);
+        }
+    }
+
+    /// M4 policy: forward old room keys only when the room's history is
+    /// shared (our rooms default to `shared`); a `joined`/`invited` room keeps
+    /// pre-join history away from later members.
+    fn history_forwarding_allowed(&self, room_id: &RoomId) -> bool {
+        !matches!(
+            self.rooms.get(room_id).and_then(|room| room.history_visibility.clone()),
+            Some(crate::wire::events::HistoryVisibility::Joined) | Some(crate::wire::events::HistoryVisibility::Invited)
+        )
+    }
+
     /// M3: one step of automatic cross-signing. Keys first, then this
     /// device's self-signature. At most a few attempts per process.
     fn maybe_enqueue_cross_signing(&mut self) -> Result<(), MessengerError> {
