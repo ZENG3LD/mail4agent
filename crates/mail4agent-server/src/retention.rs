@@ -136,6 +136,9 @@ pub fn purge_delivered_events(conn: &mut Connection, now_ms: i64, policy: &Reten
     for id in &ids {
         tx.execute("DELETE FROM relations WHERE event_id = ?1 OR target_id = ?1", params![id])?;
         tx.execute("DELETE FROM receipts WHERE event_id = ?1", params![id])?;
+        tx.execute("DELETE FROM txn_dedup WHERE event_id = ?1", params![id])?;
+        // Legacy table may be absent (dropped when empty).
+        let _ = tx.execute("DELETE FROM legacy_dm_message_map WHERE event_id = ?1", params![id]);
         tx.execute("UPDATE events SET redacts = NULL WHERE redacts = ?1", params![id])?;
         tx.execute("UPDATE events SET redacted_by = NULL WHERE redacted_by = ?1", params![id])?;
         removed += tx.execute("DELETE FROM events WHERE event_id = ?1 AND state_key IS NULL", params![id])?;
@@ -150,6 +153,7 @@ mod tests {
 
     fn db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         crate::store::create_matrix_schema(&conn).unwrap();
         crate::keys::create_matrix_keys_schema(&conn).unwrap();
         create_retention_schema(&conn).unwrap();
@@ -199,6 +203,7 @@ mod tests {
         for i in 1..=3 {
             add_event(&conn, i, 1_000);
         }
+        conn.execute("INSERT INTO txn_dedup (user_id, device_id, txn_id, event_id, created_at) VALUES (1, 'D', 't1', '$e1', 't')", []).unwrap();
         let policy = RetentionPolicy { ttl_ms: 10_000_000, ack_grace_ms: 0, keep_last: 0, stale_device_ms: 10_000_000 };
         let now = 100_000;
         assert_eq!(purge_delivered_events(&mut conn, now, &policy).unwrap(), 0, "nobody acked");
