@@ -407,6 +407,23 @@ pub fn create_matrix_schema(conn: &Connection) -> rusqlite::Result<()> {
         );
         INSERT OR IGNORE INTO stream_counter (id, value) VALUES (1, 0);
 
+        -- Federation F0: this server's signing keys and the verify keys
+        -- cached from remote servers. Secrets live only in the (encrypted) DB.
+        CREATE TABLE IF NOT EXISTS fed_signing_keys (
+            key_id     TEXT PRIMARY KEY,
+            secret     BLOB NOT NULL,
+            created_ms INTEGER NOT NULL,
+            retired_ms INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS fed_remote_keys (
+            server_name    TEXT NOT NULL,
+            key_id         TEXT NOT NULL,
+            public_key     TEXT NOT NULL,
+            valid_until_ms INTEGER NOT NULL,
+            fetched_ms     INTEGER NOT NULL,
+            PRIMARY KEY (server_name, key_id)
+        );
+
         -- user_id -> mxid, filled on first touch by ensure_matrix_user
         -- (plan §2 manager decision: new table, not in the original DDL
         -- text). public_id is immutable, so this mapping never changes.

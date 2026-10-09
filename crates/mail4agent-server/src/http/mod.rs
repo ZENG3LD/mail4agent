@@ -25,6 +25,7 @@ mod account;
 mod compat;
 pub mod edge_auth;
 mod ephemeral;
+mod federation;
 mod keys;
 mod messaging;
 mod register;
@@ -48,6 +49,12 @@ pub struct Homeserver {
     pub public_base_url: std::sync::OnceLock<String>,
     /// `m.server` value for `/.well-known/matrix/server`; unset = federation off.
     pub federation_delegate: std::sync::OnceLock<String>,
+    /// Federation F0 switch: when set, the key and federation routes answer.
+    pub federation_enabled: std::sync::OnceLock<()>,
+    /// Origins allowed to call federation routes; unset = any origin that proves its keys.
+    pub federation_allow: std::sync::OnceLock<Vec<String>>,
+    /// How remote servers' signing keys are fetched; unset = no remote verification.
+    pub key_fetcher: std::sync::OnceLock<Arc<dyn crate::federation::RemoteKeys>>,
 }
 
 impl Homeserver {
@@ -60,6 +67,9 @@ impl Homeserver {
             push: crate::push::PushHub::new(),
             public_base_url: std::sync::OnceLock::new(),
             federation_delegate: std::sync::OnceLock::new(),
+            federation_enabled: std::sync::OnceLock::new(),
+            federation_allow: std::sync::OnceLock::new(),
+            key_fetcher: std::sync::OnceLock::new(),
         }
     }
 }
@@ -135,6 +145,7 @@ pub fn router(state: Arc<Homeserver>) -> Router {
         .merge(sync::routes())
         .merge(push::routes())
         .merge(compat::routes())
+        .merge(federation::routes())
         .fallback(unrecognized)
         .with_state(state)
 }

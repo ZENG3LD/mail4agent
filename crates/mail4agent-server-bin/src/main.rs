@@ -120,6 +120,17 @@ fn run() -> Result<(), String> {
     if let Ok(target) = env::var("M4A_FEDERATION_DELEGATE") {
         let _ = hs.federation_delegate.set(target);
     }
+    if matches!(env::var("M4A_FEDERATION").as_deref(), Ok("1") | Ok("true")) {
+        let _ = hs.federation_enabled.set(());
+        let mut fetcher = mail4agent_server::federation::HttpKeyFetcher::new();
+        if let Ok(spec) = env::var("M4A_FEDERATION_PEER_OVERRIDE") {
+            fetcher = fetcher.with_overrides_from(&spec);
+        }
+        let _ = hs.key_fetcher.set(Arc::new(fetcher));
+        if let Ok(list) = env::var("M4A_FEDERATION_ALLOW") {
+            let _ = hs.federation_allow.set(list.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect());
+        }
+    }
     spawn_retention(Arc::clone(&hs));
     let app = router(hs);
     let app = match edge_secret {

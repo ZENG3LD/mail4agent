@@ -47,6 +47,11 @@ impl MatrixError {
         }
     }
 
+    /// Federation request authentication failure (`M_UNAUTHORIZED`, 401).
+    pub fn unauthorized(msg: impl Into<String>) -> Self {
+        Self::new(401, "M_UNAUTHORIZED", msg)
+    }
+
     pub fn forbidden(msg: impl Into<String>) -> Self {
         Self::new(403, "M_FORBIDDEN", msg)
     }

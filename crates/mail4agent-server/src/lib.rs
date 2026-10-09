@@ -14,6 +14,7 @@ pub mod account;
 pub mod ephemeral;
 pub mod error;
 pub mod events;
+pub mod federation;
 pub mod http;
 pub mod key_ops;
 pub mod keys;
