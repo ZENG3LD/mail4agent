@@ -4104,7 +4104,7 @@ mod tests {
         let mut core = open_fresh_core();
         flush_and_ack(&mut core);
         let room_id = RoomId::parse("!r:example.org").expect("valid room id");
-        for tag in ["m.favourite", "u.mlc.archived"] {
+        for tag in ["m.favourite", "u.example.archived"] {
             core.dispatch(MessengerCommand::SetTag { room_id: room_id.clone(), tag: tag.to_string(), order: None }, 0)
                 .expect("dispatch succeeds");
         }
@@ -4112,7 +4112,7 @@ mod tests {
         // Optimistic: the cache already holds both tags, before any round trip.
         let cached = core.room_account_data(&room_id, "m.tag").expect("m.tag cached");
         assert!(cached["tags"].get("m.favourite").is_some());
-        assert!(cached["tags"].get("u.mlc.archived").is_some());
+        assert!(cached["tags"].get("u.example.archived").is_some());
 
         flush_and_ack(&mut core);
         let first_release = core.releasable_requests(0);
@@ -4120,7 +4120,7 @@ mod tests {
         assert_eq!(first_writes.len(), 1, "the second PUT is not released while the first is in flight");
         let first_body = first_writes[0].body.clone().expect("a body");
         assert!(first_body["tags"].get("m.favourite").is_some());
-        assert!(first_body["tags"].get("u.mlc.archived").is_none(), "the first PUT carries only what existed when it was built");
+        assert!(first_body["tags"].get("u.example.archived").is_none(), "the first PUT carries only what existed when it was built");
 
         core.on_response(first_writes[0].id.clone(), HttpResponseDescriptor { status: 200, body: b"{}".to_vec() }, 0);
         flush_and_ack(&mut core);
@@ -4128,7 +4128,7 @@ mod tests {
         let second = second_release.iter().find(|r| is_account_data_write(r)).expect("the second PUT is released after the first completed");
         let second_body = second.body.clone().expect("a body");
         assert!(second_body["tags"].get("m.favourite").is_some(), "the later PUT still carries the earlier tag");
-        assert!(second_body["tags"].get("u.mlc.archived").is_some());
+        assert!(second_body["tags"].get("u.example.archived").is_some());
     }
 
     #[test]
@@ -4211,7 +4211,7 @@ mod tests {
     fn sync_echo_of_an_older_tag_write_does_not_clobber_a_newer_optimistic_value() {
         let mut core = open_fresh_core();
         let room_id = RoomId::parse("!r:example.org").expect("valid room id");
-        for tag in ["m.favourite", "u.mlc.archived"] {
+        for tag in ["m.favourite", "u.example.archived"] {
             core.dispatch(MessengerCommand::SetTag { room_id: room_id.clone(), tag: tag.to_string(), order: None }, 0)
                 .expect("dispatch succeeds");
         }
@@ -4219,7 +4219,7 @@ mod tests {
         // The server echoes the FIRST write only, while both are outstanding.
         let released = deliver_sync(&mut core, tag_sync_body("!r:example.org", serde_json::json!({ "m.favourite": {} }), "s1"));
         let cached = core.room_account_data(&room_id, "m.tag").expect("m.tag cached");
-        assert!(cached["tags"].get("u.mlc.archived").is_some(), "the older echo must not clobber the newer optimistic value");
+        assert!(cached["tags"].get("u.example.archived").is_some(), "the older echo must not clobber the newer optimistic value");
         assert!(cached["tags"].get("m.favourite").is_some());
         let key = (Some(room_id.clone()), "m.tag".to_string());
         assert_eq!(
@@ -4241,15 +4241,15 @@ mod tests {
         core.on_response(second.id, ok_response(), 0);
         assert!(core.account_data_guard.is_empty());
         let cached = core.room_account_data(&room_id, "m.tag").expect("m.tag cached");
-        assert!(cached["tags"].get("m.favourite").is_some() && cached["tags"].get("u.mlc.archived").is_some());
+        assert!(cached["tags"].get("m.favourite").is_some() && cached["tags"].get("u.example.archived").is_some());
 
         // With nothing outstanding, sync applies normally again.
         deliver_sync(
             &mut core,
-            tag_sync_body("!r:example.org", serde_json::json!({ "m.favourite": {}, "u.mlc.archived": {} }), "s2"),
+            tag_sync_body("!r:example.org", serde_json::json!({ "m.favourite": {}, "u.example.archived": {} }), "s2"),
         );
         let cached = core.room_account_data(&room_id, "m.tag").expect("m.tag cached");
-        assert!(cached["tags"].get("u.mlc.archived").is_some());
+        assert!(cached["tags"].get("u.example.archived").is_some());
     }
 
     #[test]
@@ -4258,9 +4258,9 @@ mod tests {
         let room_id = RoomId::parse("!r:example.org").expect("valid room id");
         deliver_sync(&mut core, tag_sync_body("!r:example.org", serde_json::json!({ "m.favourite": {} }), "s1"));
 
-        core.dispatch(MessengerCommand::SetTag { room_id: room_id.clone(), tag: "u.mlc.archived".to_string(), order: None }, 0)
+        core.dispatch(MessengerCommand::SetTag { room_id: room_id.clone(), tag: "u.example.archived".to_string(), order: None }, 0)
             .expect("dispatch succeeds");
-        assert!(core.room_account_data(&room_id, "m.tag").expect("cached")["tags"].get("u.mlc.archived").is_some());
+        assert!(core.room_account_data(&room_id, "m.tag").expect("cached")["tags"].get("u.example.archived").is_some());
         flush_and_ack(&mut core);
         let write = core
             .releasable_requests(0)
@@ -4274,7 +4274,7 @@ mod tests {
         let events = core.on_response(write.id, forbidden, 0);
         assert!(core.account_data_guard.is_empty());
         let restored = core.room_account_data(&room_id, "m.tag").expect("the server's value is back");
-        assert!(restored["tags"].get("u.mlc.archived").is_none(), "the failed write's optimistic value is gone");
+        assert!(restored["tags"].get("u.example.archived").is_none(), "the failed write's optimistic value is gone");
         assert!(restored["tags"].get("m.favourite").is_some());
         assert!(events.contains(&MessengerEvent::RoomsChanged));
         assert!(core.change_counter() > counter_before, "the UI is told to re-render");
