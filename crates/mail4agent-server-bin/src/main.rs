@@ -177,9 +177,16 @@ fn db_under_tmp(path: &Path) -> Result<PathBuf, String> {
     let canon = parent
         .canonicalize()
         .map_err(|err| format!("db parent: {err}"))?;
-    let tmp = Path::new("/tmp");
-    if canon != tmp && !canon.starts_with(tmp) {
-        return Err("db path must stay under /tmp".into());
+    // Default root is /tmp; a durable deployment sets M4A_DB_ROOT to one absolute
+    // directory (for example the systemd StateDirectory) and the DB must live there.
+    let root = match env::var("M4A_DB_ROOT") {
+        Ok(r) if Path::new(&r).is_absolute() && !r.contains("..") => PathBuf::from(r),
+        Ok(_) => return Err("M4A_DB_ROOT must be an absolute path without ..".into()),
+        Err(_) => PathBuf::from("/tmp"),
+    };
+    let root = root.canonicalize().map_err(|err| format!("db root: {err}"))?;
+    if canon != root && !canon.starts_with(&root) {
+        return Err(format!("db path must stay under {}", root.display()));
     }
     Ok(path.to_path_buf())
 }
