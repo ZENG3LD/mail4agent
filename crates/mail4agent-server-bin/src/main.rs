@@ -45,9 +45,16 @@ fn run() -> Result<(), String> {
     let mut bind_raw = DEFAULT_BIND.to_string();
     let mut db_raw = DEFAULT_DB.to_string();
     let mut server_name = DEFAULT_SERVER_NAME.to_string();
+    let mut role = "standalone".to_string();
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--role" => {
+                role = args.next().ok_or_else(|| "--role needs standalone|core".to_string())?;
+                if role != "standalone" && role != "core" {
+                    return Err("--role must be standalone or core".into());
+                }
+            }
             "--bind" => {
                 bind_raw = args
                     .next()
@@ -75,7 +82,18 @@ fn run() -> Result<(), String> {
         }
     }
 
-    let bind = parse_loopback(&bind_raw)?;
+    // core: the deep server behind an edge. It may bind the private tunnel address
+    // (never a wildcard) and then requires the shared edge secret on every request.
+    let edge_secret = if role == "core" {
+        let secret = env::var("M4A_EDGE_SECRET").map_err(|_| "--role core requires M4A_EDGE_SECRET".to_string())?;
+        if secret.len() < 32 {
+            return Err("M4A_EDGE_SECRET must be at least 32 characters".into());
+        }
+        Some(secret)
+    } else {
+        None
+    };
+    let bind = if role == "core" { parse_core_bind(&bind_raw)? } else { parse_loopback(&bind_raw)? };
     let db_path = db_under_tmp(Path::new(&db_raw))?;
     let key_hex =
         env::var("M4A_DB_KEY_HEX").map_err(|_| "M4A_DB_KEY_HEX is required".to_string())?;
@@ -100,9 +118,13 @@ fn run() -> Result<(), String> {
     }
     spawn_retention(Arc::clone(&hs));
     let app = router(hs);
+    let app = match edge_secret {
+        Some(secret) => mail4agent_server::http::edge_auth::require_edge_secret(app, secret),
+        None => app,
+    };
 
     let runtime = tokio::runtime::Runtime::new().map_err(|err| format!("runtime: {err}"))?;
-    runtime.block_on(serve(bind, app))
+    runtime.block_on(serve(bind, app, role == "core"))
 }
 
 
@@ -130,14 +152,14 @@ fn open_messenger(server_name: &str, db_path: &Path, key_hex: &str) -> Result<Co
     init_messenger_db(path, key_hex).map_err(|err| format!("open db: {err}"))
 }
 
-async fn serve(bind: SocketAddr, app: axum::Router) -> Result<(), String> {
+async fn serve(bind: SocketAddr, app: axum::Router, core: bool) -> Result<(), String> {
     let listener = TcpListener::bind(bind)
         .await
         .map_err(|err| format!("bind {bind}: {err}"))?;
     let local = listener
         .local_addr()
         .map_err(|err| format!("local addr: {err}"))?;
-    if !is_loopback(local) {
+    if !core && !is_loopback(local) {
         return Err(format!("refusing to serve on {local}"));
     }
     println!("listening {local}");
@@ -148,6 +170,15 @@ async fn serve(bind: SocketAddr, app: axum::Router) -> Result<(), String> {
 
 fn is_loopback(addr: SocketAddr) -> bool {
     matches!(addr.ip(), IpAddr::V4(ip) if ip == Ipv4Addr::LOCALHOST)
+}
+
+/// Core bind: any concrete (non-wildcard) address, meant to be the tunnel interface.
+fn parse_core_bind(raw: &str) -> Result<SocketAddr, String> {
+    let addr: SocketAddr = raw.parse().map_err(|_| format!("bind must be ip:port, got {raw}"))?;
+    if addr.ip().is_unspecified() {
+        return Err("refusing a wildcard bind; give the tunnel address".into());
+    }
+    Ok(addr)
 }
 
 fn parse_loopback(raw: &str) -> Result<SocketAddr, String> {

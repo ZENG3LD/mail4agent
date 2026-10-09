@@ -1,0 +1,29 @@
+[package]
+name = "m4a-edge"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Edge role of the mail4agent messenger: terminates client connections behind a TLS proxy, keeps only light rebuildable state, forwards to the core over a private tunnel."
+
+[lib]
+name = "m4a_edge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "m4a-edge"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.8", features = ["json", "ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tokio-tungstenite = "0.29"
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+serde_json = "1"
+
+[dev-dependencies]
+mail4agent-server = { path = "../mail4agent-server", version = "0.1.0" }
+rusqlite = "0.32"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde_json = "1"

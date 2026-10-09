@@ -23,6 +23,7 @@ use crate::typing::TypingRegistry;
 
 mod account;
 mod compat;
+pub mod edge_auth;
 mod ephemeral;
 mod keys;
 mod messaging;

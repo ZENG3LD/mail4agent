@@ -1199,6 +1199,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
+name = "m4a-edge"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "futures-util",
+ "mail4agent-server",
+ "reqwest",
+ "rusqlite",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+]
+
+[[package]]
 name = "mail4agent"
 version = "0.1.4"
 dependencies = [
