@@ -49,6 +49,9 @@ async fn register(
     State(state): State<Arc<Homeserver>>,
     Json(body): Json<RegisterRequest>,
 ) -> Result<Json<RegisterResponse>, MatrixError> {
+    if state.self_register_disabled.get().is_some() {
+        return Err(MatrixError::forbidden("self-registration is disabled on this server"));
+    }
     let state = Arc::clone(&state);
     let response = tokio::task::spawn_blocking(move || {
         let mut conn = state.conn.lock().unwrap_or_else(|err| err.into_inner());
@@ -442,5 +445,18 @@ mod tests {
             )
             .expect("nick");
         assert_eq!(nick, "bob_nick");
+    }
+
+    #[tokio::test]
+    async fn self_registration_can_be_switched_off() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        create_matrix_schema(&conn).unwrap();
+        create_matrix_keys_schema(&conn).unwrap();
+        let hs = Arc::new(Homeserver::new(conn));
+        let _ = hs.self_register_disabled.set(());
+        let req = Request::post("/client/v3/register").header("content-type", "application/json")
+            .body(Body::from(r#"{"public_id":"abcdefgh","nick":"abcdefgh","session_id":"s1"}"#)).unwrap();
+        let resp = crate::http::router(hs).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 }

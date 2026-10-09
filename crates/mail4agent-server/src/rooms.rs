@@ -164,7 +164,7 @@ pub fn bootstrap_member_events(kind: RoomKind, creator: (i64, &str, &str), invit
 
 /// `join_rule`, `history_visibility`, `is_encrypted` for a fresh room.
 /// DM and group are E2E (`shared`). A Channel is PUBLIC PLAINTEXT
-/// (`world_readable`, not encrypted; MLC decision 2026-10-09): its posts live
+/// (`world_readable`, not encrypted; project decision): its posts live
 /// in the separate public store ([`crate::public_channels`]), never in the
 /// closed `events` table and never under [`crate::retention`]. Rooms that
 /// were already created encrypted stay encrypted.
@@ -575,7 +575,7 @@ pub fn apply_membership_power_action(
 
 /// `POST /join`'s write for an already-invited or newly-public-eligible
 /// caller (idempotent-join and ban checks happen in the handler, before the
-/// paid gate — see [`join_room`]). Returns the post-join wake set. The join
+/// policy hook — see [`join_room`]). Returns the post-join wake set. The join
 /// event carries the caller's effective label as `displayname`, resolved by
 /// the caller BEFORE it takes the messenger connection this writes through.
 pub fn apply_join(

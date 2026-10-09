@@ -6,7 +6,8 @@
 //! session. The raw device bearer is returned once in that response and
 //! stored only as a SHA-256 hex. The websession opens the database, calls
 //! [`store::set_matrix_server_name`] once, and serves [`http::Homeserver`].
-//! There is no paid check and no chart identity database.
+//! There is no tariff logic and no product identity database; products plug in through
+//! [`account_source`], [`accounts`] and [`policy`].
 //! [`store::init_messenger_db`] runs `PRAGMA key` and expects a SQLCipher
 //! build of rusqlite (crate feature `sqlcipher`).
 

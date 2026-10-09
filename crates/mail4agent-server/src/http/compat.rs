@@ -2,7 +2,7 @@
 //! logout, push rules / pushers stubs, presence stub, media repo.
 //!
 //! What is deliberately NOT here: password login (this server has no
-//! passwords; sessions come from `POST /register`), OIDC, sliding sync.
+//! passwords; sessions come from `POST /register` unless a product disables it), OIDC, sliding sync.
 //! Push rules and pushers are accepted and not stored because notification
 //! delivery is the metadata-only `/push` WebSocket (push v1).
 

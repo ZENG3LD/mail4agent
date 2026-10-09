@@ -1,5 +1,5 @@
 //! Account data, tags, filters, and public-room listing.
-//! Profile nick lookup and the paid user directory are not in this crate.
+//! Profile nick lookup and any restricted user directory are product concerns, not in this crate.
 
 use rusqlite::Connection;
 
@@ -337,7 +337,7 @@ pub fn list_public_rooms(
 }
 
 /// Match an mxid localpart stored in this database. No nick index and no
-/// paid-user directory: the builder owns both of those.
+/// restricted directory: a product owns both of those.
 pub fn search_users_by_localpart(conn: &Connection, query: &str, limit: usize) -> rusqlite::Result<Vec<String>> {
     let limit = limit.clamp(1, 50) as i64;
     let pattern = format!("%{query}%");

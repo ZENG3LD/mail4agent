@@ -67,6 +67,8 @@ pub struct Homeserver {
     pub identity: std::sync::OnceLock<Arc<identity::Identity>>,
     /// Policy hook; unset = allow everything.
     pub policy: std::sync::OnceLock<Arc<dyn crate::policy::PolicyHook>>,
+    /// Set to turn OFF `POST /client/v3/register` (a product that owns registration does this).
+    pub self_register_disabled: std::sync::OnceLock<()>,
 }
 
 impl Homeserver {
@@ -86,6 +88,7 @@ impl Homeserver {
             fed_notify: tokio::sync::Notify::new(),
             identity: std::sync::OnceLock::new(),
             policy: std::sync::OnceLock::new(),
+            self_register_disabled: std::sync::OnceLock::new(),
         }
     }
 
