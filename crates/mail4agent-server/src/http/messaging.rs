@@ -32,6 +32,7 @@ async fn send_event(
     Json(content): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, MatrixError> {
     let caller = resolve_caller(&state, &headers, None).await?;
+    state.check_policy(&caller, crate::policy::Action::SendEvent, None)?;
     let content_str = content.to_string();
     if content_str.len() > store::MATRIX_EVENT_CONTENT_MAX_BYTES {
         return Err(MatrixError::bad_json("event content too large"));

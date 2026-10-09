@@ -159,6 +159,11 @@ fn device_for_user(
     Ok((device_id, Some(raw)))
 }
 
+/// A fresh random raw bearer (shared with the login door).
+pub(super) fn mint_bearer_pub() -> String {
+    mint_bearer()
+}
+
 fn mint_bearer() -> String {
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);

@@ -133,6 +133,7 @@ fn run() -> Result<(), String> {
             let _ = hs.federation_allow.set(list.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect());
         }
     }
+    configure_identity(&hs)?;
     spawn_retention(Arc::clone(&hs));
     let fed_worker = hs.federation_enabled.get().is_some().then(|| Arc::clone(&hs));
     // Served both bare (behind an edge that strips `/_matrix`) and under `/_matrix` (direct federation peers).
@@ -400,4 +401,33 @@ fn spawn_retention(hs: Arc<Homeserver>) {
             Err(err) => eprintln!("retention: skipped: {err}"),
         }
     });
+}
+
+/// Identity features, all off unless configured: `M4A_ASSERTION_SECRET` (+ `_PREV`,
+/// `M4A_ASSERTION_SOURCE`, `M4A_ASSERTION_SKEW_S`) turns on signed assertions from a trusted proxy;
+/// `M4A_LOGIN_MATRIX_OPENID=1` turns on the Matrix-address login door;
+/// `M4A_NICK_LISTS` (file) and `M4A_NICK_COOLDOWN_DAYS` tune nicks.
+fn configure_identity(hs: &Arc<Homeserver>) -> Result<(), String> {
+    use mail4agent_server::account_source::SignedHeaderSource;
+    use mail4agent_server::external_login::{ExternalLogin, MatrixOpenIdLogin};
+    let signed = SignedHeaderSource::from_env()?.map(Arc::new);
+    let door = matches!(env::var("M4A_LOGIN_MATRIX_OPENID").as_deref(), Ok("1") | Ok("true"));
+    if signed.is_none() && !door {
+        return Ok(());
+    }
+    let mut doors: Vec<Arc<dyn ExternalLogin>> = Vec::new();
+    if door {
+        let mut fetcher = mail4agent_server::federation::HttpKeyFetcher::new();
+        if let Ok(spec) = env::var("M4A_FEDERATION_PEER_OVERRIDE") {
+            fetcher = fetcher.with_overrides_from(&spec);
+        }
+        doors.push(Arc::new(MatrixOpenIdLogin::new(Arc::new(fetcher))));
+    }
+    let identity = mail4agent_server::http::identity::Identity {
+        cfg: mail4agent_server::accounts::AccountsConfig::from_env()?,
+        signed,
+        doors,
+    };
+    let _ = hs.identity.set(Arc::new(identity));
+    Ok(())
 }

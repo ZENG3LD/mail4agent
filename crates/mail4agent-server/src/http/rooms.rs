@@ -139,6 +139,7 @@ async fn create_room(
     let caller = resolve_caller(&state, &headers, None).await?;
     let visibility_public = req.visibility.as_deref() == Some("public");
     let kind = derive_room_kind(req.is_direct, req.invite.len(), visibility_public)?;
+    state.check_policy(&caller, crate::policy::Action::CreateRoom, Some(kind))?;
     validate_power_level_override(kind, &req.power_level_content_override)?;
     let room_type: Option<&'static str> = match req.creation_content.as_ref().and_then(|c| c.get("type")) {
         None => None,
@@ -200,6 +201,7 @@ async fn join_room(
     Path(room_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, MatrixError> {
     let caller = resolve_caller(&state, &headers, None).await?;
+    state.check_policy(&caller, crate::policy::Action::JoinRoom, None)?;
     if state.federation_enabled.get().is_some() && super::fed_net::room_domain_is_remote(&room_id) {
         let ids = super::fed_net::federated_join(&state, &caller, &room_id).await?;
         wake_users(&state, ids);
@@ -241,6 +243,7 @@ async fn invite_member(
     Json(body): Json<crate::rooms::UserIdBody>,
 ) -> Result<Json<serde_json::Value>, MatrixError> {
     let caller = resolve_caller(&state, &headers, None).await?;
+    state.check_policy(&caller, crate::policy::Action::Invite, None)?;
     let federated = state.federation_enabled.get().is_some();
     let wake_ids = with_conn(&state, move |conn| {
         crate::nick::require_nick(conn, caller.user_id, "choose a nick before inviting")?;

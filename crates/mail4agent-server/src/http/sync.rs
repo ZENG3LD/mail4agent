@@ -34,7 +34,7 @@ async fn sync_handler(
     headers: HeaderMap,
     Query(query): Query<SyncQuery>,
 ) -> Result<Json<serde_json::Value>, MatrixError> {
-    let Caller { user_id, mxid, device_id } = super::resolve_caller(&state, &headers, query.access_token.as_deref()).await?;
+    let Caller { user_id, mxid, device_id, .. } = super::resolve_caller(&state, &headers, query.access_token.as_deref()).await?;
     let since = query.since.as_deref().map(crate::sync_token::parse).transpose()?;
     let timeout = Duration::from_millis(query.timeout.unwrap_or(0).min(crate::sync::SYNC_MAX_TIMEOUT_MS));
     let full_state = query.full_state.unwrap_or(false);

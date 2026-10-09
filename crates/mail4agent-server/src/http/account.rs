@@ -263,10 +263,19 @@ async fn profile_response(
 async fn put_displayname(
     State(state): State<Arc<Homeserver>>,
     headers: HeaderMap,
-    Path(_user_id): Path<String>,
-    Json(_body): Json<serde_json::Value>,
+    Path(user_id): Path<String>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, MatrixError> {
-    super::resolve_caller(&state, &headers, None).await?;
+    let caller = super::resolve_caller(&state, &headers, None).await?;
+    // Account-backed callers change their nick through the display name; others keep the refusal.
+    if user_id == caller.mxid {
+        if let Some(name) = body.get("displayname").and_then(|v| v.as_str()) {
+            state.check_policy(&caller, crate::policy::Action::SetNick, None)?;
+            if super::identity::set_display_name(&state, caller.user_id, name.to_string()).await?.is_some() {
+                return Ok(Json(serde_json::json!({})));
+            }
+        }
+    }
     Err(MatrixError::forbidden("displayname follows your nick — change it in account settings, not here"))
 }
 

@@ -162,7 +162,7 @@ fn insert_account(tx: &Transaction<'_>, nick: &str, placeholder: bool, now_ms: i
         "INSERT INTO accounts (id, nick, nick_ci, nick_is_placeholder, localpart, created_ms) VALUES (?1, ?2, ?3, ?4, ?3, ?5)",
         params![id, nick, lower, placeholder as i64, now_ms],
     )?;
-    Ok(account_by_id(tx, id)?.ok_or_else(MatrixError::internal)?)
+    account_by_id(tx, id)?.ok_or_else(MatrixError::internal)
 }
 
 fn link_identity(tx: &Transaction<'_>, source: &str, subject: &str, id: i64, now_ms: i64) -> rusqlite::Result<()> {

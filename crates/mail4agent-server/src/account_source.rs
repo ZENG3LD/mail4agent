@@ -264,6 +264,11 @@ impl AccountSource for SignedHeaderSource {
     }
 }
 
+/// HMAC of a raw event body under the current secret (for tests and proxies).
+pub fn sign_body_for_tests(src: &SignedHeaderSource, body: &[u8]) -> String {
+    sign_with(&src.secrets[0], &[body])
+}
+
 /// Builds a signed assertion for tests and for proxies written in Rust.
 pub fn build_assertion(
     src: &SignedHeaderSource,
