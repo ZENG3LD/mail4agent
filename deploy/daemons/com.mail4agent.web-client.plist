@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- macOS launchd agent.  Install:
+  cp com.mail4agent.web-client.plist ~/Library/LaunchAgents/
+  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.mail4agent.web-client.plist
+  Stop: launchctl bootout gui/$(id -u)/com.mail4agent.web-client
+  Replace __HOME__ with the user's home directory. Settings: ~/.config/mail4agent/web-client.env -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.mail4agent.web-client</string>
+  <key>ProgramArguments</key><array><string>__HOME__/.local/bin/m4a-web-client</string></array>
+  <key>EnvironmentVariables</key><dict>
+    <key>M4A_ENV_FILE</key><string>__HOME__/.config/mail4agent/web-client.env</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>__HOME__/Library/Logs/m4a-web-client.log</string>
+  <key>StandardErrorPath</key><string>__HOME__/Library/Logs/m4a-web-client.log</string>
+</dict></plist>

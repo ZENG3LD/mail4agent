@@ -2193,17 +2193,19 @@ impl MachineClient {
     }
 
     fn serve_sends(&mut self, now_ms: i64, report: &mut TickReport) {
+        let mut cmds: Vec<(crate::ipc::SendStream, crate::CmdRequest)> = Vec::new();
         if let Some(listener) = &self.send_listener {
             loop {
                 match listener.accept() {
-                    Ok(mut stream) => match crate::send::read_request(&mut stream) {
-                        Ok(request) => self.send_queue.push(PendingSend {
+                    Ok(mut stream) => match crate::send::read_incoming(&mut stream) {
+                        Ok(crate::send::Incoming::Send(request)) => self.send_queue.push(PendingSend {
                             stream,
                             request,
                             started: std::time::Instant::now(),
                             room: None,
                             peer: None,
                         }),
+                        Ok(crate::send::Incoming::Cmd(cmd)) => cmds.push((stream, cmd)),
                         Err(err) => {
                             crate::send::write_reply(&mut stream, &crate::SendReply::failed(err))
                         }
@@ -2212,6 +2214,15 @@ impl MachineClient {
                     Err(_) => break,
                 }
             }
+        }
+        for (mut stream, cmd) in cmds {
+            let reply = match self.sessions.iter_mut().find(|store| {
+                store.nick().is_some_and(|n| n.eq_ignore_ascii_case(cmd.as_nick.trim()))
+            }) {
+                Some(store) => store.run_command(&cmd, now_ms),
+                None => crate::CmdReply::failed(format!("{} is not a session on this client", cmd.as_nick)),
+            };
+            crate::send::write_cmd_reply(&mut stream, &reply);
         }
         let queue = std::mem::take(&mut self.send_queue);
         for mut pending in queue {

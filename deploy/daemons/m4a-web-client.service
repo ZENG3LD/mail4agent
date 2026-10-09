@@ -1,0 +1,17 @@
+# Linux: systemd user unit.  Install:
+#   mkdir -p ~/.config/systemd/user && cp m4a-web-client.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now m4a-web-client
+#   loginctl enable-linger $USER      # keep it running without a login session
+# Settings come from ~/.config/mail4agent/web-client.env (no secrets in this file).
+[Unit]
+Description=mail4agent web client (messenger sessions + local socket)
+After=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/m4a-web-client
+Environment=M4A_ENV_FILE=%h/.config/mail4agent/web-client.env
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

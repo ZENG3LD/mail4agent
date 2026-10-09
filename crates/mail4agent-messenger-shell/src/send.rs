@@ -188,6 +188,70 @@ pub fn send_via_socket(
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
 }
 
+/// What one socket line holds.
+pub(crate) enum Incoming {
+    Send(SendRequest),
+    Cmd(crate::CmdRequest),
+}
+
+/// Like [`read_request`], but also accepts a rich command line (`"cmd"`).
+pub(crate) fn read_incoming(stream: &mut SendStream) -> Result<Incoming, String> {
+    stream.set_nonblocking(false).map_err(|err| err.to_string())?;
+    stream.set_read_timeout(Some(Duration::from_secs(3))).map_err(|err| err.to_string())?;
+    let mut buf = Vec::new();
+    let mut limited = stream.take((MAX_SEND_BYTES * 2 + 1024) as u64);
+    let mut reader = BufReader::new(&mut limited);
+    reader.read_until(b'\n', &mut buf).map_err(|err| err.to_string())?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&buf).map_err(|_| "request is not a JSON line".to_string())?;
+    if value.get("cmd").is_some() {
+        let cmd: crate::CmdRequest =
+            serde_json::from_value(value).map_err(|err| format!("bad command: {err}"))?;
+        return Ok(Incoming::Cmd(cmd));
+    }
+    let request: SendRequest =
+        serde_json::from_value(value).map_err(|_| "request is not a send JSON line".to_string())?;
+    if request.text.trim().is_empty() {
+        return Err("text is empty".to_string());
+    }
+    if request.text.len() > MAX_SEND_BYTES {
+        return Err(format!("text is longer than {MAX_SEND_BYTES} bytes"));
+    }
+    Ok(Incoming::Send(request))
+}
+
+/// Sends one rich command over the client's socket and waits for the answer.
+pub fn send_cmd_via_socket(
+    sock: &Path,
+    request: &crate::CmdRequest,
+    wait: Duration,
+) -> std::io::Result<crate::CmdReply> {
+    let mut stream = SendStream::connect(sock)?;
+    stream.set_read_timeout(Some(wait))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let mut line = serde_json::to_vec(request)?;
+    line.push(b'\n');
+    stream.write_all(&line)?;
+    stream.flush()?;
+    let mut reader = BufReader::new(stream);
+    let mut answer = String::new();
+    reader.read_line(&mut answer)?;
+    if answer.trim().is_empty() {
+        return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "client closed the socket without an answer"));
+    }
+    serde_json::from_str(answer.trim()).map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+}
+
+/// Writes one command answer line.
+pub(crate) fn write_cmd_reply(stream: &mut SendStream, reply: &crate::CmdReply) {
+    if let Ok(mut line) = serde_json::to_vec(reply) {
+        line.push(b'\n');
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
+        let _ = stream.write_all(&line);
+        let _ = stream.flush();
+    }
+}
+
 /// Reads one request line from an accepted socket connection.
 pub(crate) fn read_request(stream: &mut SendStream) -> Result<SendRequest, String> {
     stream

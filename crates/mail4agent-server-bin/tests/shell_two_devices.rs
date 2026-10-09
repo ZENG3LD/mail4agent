@@ -1030,3 +1030,46 @@ fn m4_late_joiner_decrypts_history_from_an_existing_member() {
     drop(carol);
     stop_server(&mut boot.server);
 }
+
+#[test]
+fn m5_rich_commands_roundtrip() {
+    use mail4agent_messenger_shell::CmdRequest;
+    let mut boot = start_three_shells();
+    let (mut alice, mut bob, mut carol) = open_trio(&boot);
+    let mut alice_now = 4_000_000_i64;
+    let mut bob_now = 4_000_000_i64;
+    let mut carol_now = 4_000_000_i64;
+    settle(&mut alice, &mut alice_now);
+    settle(&mut bob, &mut bob_now);
+    settle(&mut carol, &mut carol_now);
+    let cmd = |name: &str, args: serde_json::Value| CmdRequest {
+        cmd: name.to_string(),
+        as_nick: "x".to_string(),
+        args,
+    };
+    let made = alice.run_command(&cmd("rooms.create", serde_json::json!({"name": "m5chan", "kind": "channel"})), alice_now);
+    assert!(made.ok, "create: {:?}", made.error);
+    alice_now += 10_000;
+    let room_id = made.data["room"].as_str().unwrap_or_else(|| panic!("room id; {}", describe(&alice))).to_string();
+    let joined = bob.run_command(&cmd("rooms.join", serde_json::json!({"room": room_id})), bob_now);
+    assert!(joined.ok, "join: {:?}", joined.error);
+    bob_now += 10_000;
+    for _ in 0..4 {
+        settle(&mut alice, &mut alice_now);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    let listed = alice.run_command(&cmd("rooms.list", serde_json::json!({})), alice_now);
+    assert!(listed.data["rooms"].as_array().unwrap().iter().any(|r| r["title"] == "m5chan"), "list: {}", listed.data);
+    let sent = alice.run_command(&cmd("rooms.send", serde_json::json!({"room": "#m5chan", "text": "hello @bob"})), alice_now);
+    assert!(sent.ok, "send: {:?}", sent.error);
+    let event = sent.data["event_id"].as_str().expect("event id").to_string();
+    wait_text(&mut bob, &mut bob_now, "hello @bob");
+    let read = bob.run_command(&cmd("rooms.read", serde_json::json!({"room": "#m5chan", "limit": 5})), bob_now);
+    assert!(read.ok, "read: {:?}", read.error);
+    let rows = read.data["messages"].as_array().unwrap();
+    assert!(rows.iter().any(|r| r["body"] == "hello @bob" && r["event_id"] == event.as_str()), "read: {}", read.data);
+    drop(alice);
+    drop(bob);
+    drop(carol);
+    stop_server(&mut boot.server);
+}

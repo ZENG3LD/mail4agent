@@ -64,6 +64,7 @@
 //! built; it is not either of those open paths and it does not read a wake
 //! from the environment.
 
+mod cmd;
 mod grok_listen;
 mod ipc;
 mod machine;
@@ -101,6 +102,8 @@ pub use mail4agent_messenger::{
     CreateRoomKind, DeviceId, MessageKind, MessengerCommand, OutgoingMessage, RoomId, RoomKind,
     UserId,
 };
+pub use cmd::{CmdReply, CmdRequest};
+pub use mail4agent_messenger::EventId;
 pub use grok_listen::{hear, GrokListener, Heard, ListenReport};
 pub use nick::{nick_from_display_name, routine_folder_id};
 pub use node::{NodeClient, NodeTickReport, NODE_DEFAULT_SOCK_NAME};
@@ -114,7 +117,8 @@ pub use provider::{
 };
 pub use push::PushedRoomEvent;
 pub use send::{
-    load_env_file, load_env_file_named, send_sock_path, send_sock_path_named, send_via_socket,
+    load_env_file, load_env_file_named, send_cmd_via_socket, send_sock_path, send_sock_path_named,
+    send_via_socket,
     SendReply, SendRequest, DEFAULT_SOCK_NAME, ENV_FILE_ENV, MAX_SEND_BYTES, SEND_SOCK_ENV,
 };
 

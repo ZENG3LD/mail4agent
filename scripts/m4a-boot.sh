@@ -20,8 +20,8 @@ export OPENSSL_DIR=/usr OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu OPENSSL_INCLUD
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$REPO/target-keys}"
 cd "$REPO"
 cargo build --release -p mail4agent-messenger-shell \
-  --bin m4a-web-client --bin m4a-send --bin m4a-inbox
-for b in m4a-web-client m4a-send m4a-inbox; do
+  --bin m4a-web-client --bin m4a-send --bin m4a-inbox --bin m4a
+for b in m4a-web-client m4a-send m4a-inbox m4a; do
   [ -f "$CARGO_TARGET_DIR/release/$b" ] && $SUDO install -m 0755 "$CARGO_TARGET_DIR/release/$b" "$BIN_DIR/$b"
 done
 
