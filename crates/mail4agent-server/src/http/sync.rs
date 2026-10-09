@@ -62,6 +62,14 @@ async fn sync_handler(
             let filter = filter.clone();
             tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MatrixError> {
                 let conn = state.conn.lock().unwrap_or_else(|poison| poison.into_inner());
+                if let Some(token) = since {
+                    // `since` proves this device holds everything up to it (retention ack).
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+                    let _ = crate::retention::record_device_ack(&conn, user_id, &device_id, token.stream_id, now_ms);
+                }
                 crate::sync::build_sync_response(
                     &conn,
                     &state.typing,

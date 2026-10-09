@@ -21,6 +21,7 @@ pub mod live;
 pub mod messaging;
 pub mod nick;
 mod push;
+pub mod retention;
 pub mod rooms;
 pub mod store;
 pub mod sync;

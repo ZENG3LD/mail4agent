@@ -528,6 +528,7 @@ pub fn init_messenger_db(path: &str, key_hex: &str) -> rusqlite::Result<Connecti
     conn.execute_batch("PRAGMA foreign_keys=ON;")?;
     create_matrix_schema(&conn)?;
     crate::keys::create_matrix_keys_schema(&conn)?;
+    crate::retention::create_retention_schema(&conn)?;
     Ok(conn)
 }
 
