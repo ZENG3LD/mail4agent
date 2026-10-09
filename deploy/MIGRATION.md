@@ -7,7 +7,7 @@ chat, logs or command lines; it is moved host to host through a pipe that nobody
 ## 0. Before the window (no downtime)
 1. CORE: tunnel up, firewall rule for `<edge-wg-ip>`, binary installed (`deploy/core/install.sh`), env file WITHOUT starting
    the service yet. Verify `ping <core-wg-ip>` from the edge and that the core port is closed from anywhere else.
-2. Build artifacts: core binary (`mail4agent-server-bin`) and `m4a-edge`, both jammy-built (see `deploy/hub/build-jammy.md`).
+2. Binaries: clone the repo and build `mail4agent-server-bin` and `m4a-edge` yourself per `deploy/hub/build-jammy.md` (GitHub only).
 3. Rehearsal (optional, recommended): online copy of the DB (`sqlite3`/`sqlcipher` `.backup` with the key read from the env file
    inside the same shell, never echoed) to the core staging dir, start the core on a scratch port, check it opens. Delete the
    rehearsal copy afterwards.
