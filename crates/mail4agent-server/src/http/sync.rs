@@ -62,6 +62,12 @@ async fn sync_handler(
             let filter = filter.clone();
             tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MatrixError> {
                 let conn = state.conn.lock().unwrap_or_else(|poison| poison.into_inner());
+                // A `since` above the server's own stream counter cannot come from this
+                // store (fresh instance, restored backup): answer with an initial sync.
+                let since = match since {
+                    Some(t) if t.stream_id > crate::store::max_stream_id(&conn)? => None,
+                    other => other,
+                };
                 if let Some(token) = since {
                     // `since` proves this device holds everything up to it (retention ack).
                     let now_ms = std::time::SystemTime::now()
@@ -130,5 +136,35 @@ mod tests {
         let body = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
         let value: serde_json::Value = serde_json::from_slice(&body).expect("json");
         assert!(value.get("next_batch").and_then(|v| v.as_str()).is_some(), "missing next_batch: {value}");
+    }
+
+    #[tokio::test]
+    async fn since_above_the_stream_counter_gives_an_initial_sync() {
+        let conn = Connection::open_in_memory().expect("db");
+        crate::store::create_matrix_schema(&conn).unwrap();
+        crate::keys::create_matrix_keys_schema(&conn).unwrap();
+        crate::store::ensure_matrix_user(&conn, 1, "alice00000000000000000000000001", NOW).unwrap();
+        crate::keys::create_device(&conn, 1, crate::keys::CredentialKind::Bearer, &crate::http::hash_token("t"), NOW).unwrap();
+        crate::nick::set_nick(&conn, 1, "alice").unwrap();
+        let app = crate::http::router(std::sync::Arc::new(crate::http::Homeserver::new(conn)));
+        let go = |method: &str, uri: String, body: &str| {
+            let app = app.clone();
+            let req = Request::builder().method(method).uri(uri).header("authorization", "Bearer t").header("content-type", "application/json").body(Body::from(body.to_string())).unwrap();
+            async move {
+                let r = app.oneshot(req).await.unwrap();
+                serde_json::from_slice::<serde_json::Value>(&to_bytes(r.into_body(), usize::MAX).await.unwrap()).unwrap()
+            }
+        };
+        let room = go("POST", "/client/v3/createRoom".into(), r#"{"name":"r","visibility":"public"}"#).await;
+        let room_id = room["room_id"].as_str().unwrap().to_string();
+        let first = go("GET", "/client/v3/sync?timeout=0".into(), "").await;
+        let next = first["next_batch"].as_str().unwrap().to_string();
+        assert!(first["rooms"]["join"].get(&room_id).is_some());
+        let stream: i64 = next.trim_start_matches('s').split('_').next().unwrap().parse().unwrap();
+        let again = go("GET", format!("/client/v3/sync?timeout=0&since={next}"), "").await;
+        assert!(again["rooms"]["join"].get(&room_id).is_none(), "incremental at the counter is empty: {again}");
+        let above = go("GET", format!("/client/v3/sync?timeout=0&since=s{}_0", stream + 1000), "").await;
+        assert!(above["rooms"]["join"].get(&room_id).is_some(), "initial sync expected: {above}");
+        assert_eq!(above["next_batch"], first["next_batch"]);
     }
 }

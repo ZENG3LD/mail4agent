@@ -405,23 +405,24 @@ fn spawn_retention(hs: Arc<Homeserver>) {
 
 /// Identity features, all off unless configured: `M4A_ASSERTION_SECRET` (+ `_PREV`,
 /// `M4A_ASSERTION_SOURCE`, `M4A_ASSERTION_SKEW_S`) turns on signed assertions from a trusted proxy;
-/// `M4A_LOGIN_MATRIX_OPENID=1` turns on the Matrix-address login door;
-/// `M4A_NICK_LISTS` (file) and `M4A_NICK_COOLDOWN_DAYS` tune nicks.
+/// `M4A_NICK_LISTS` (file) and `M4A_NICK_COOLDOWN_DAYS` tune nicks. Login doors are product layer;
+/// the reference Matrix-address door needs the cargo feature `matrix-openid-door` and `M4A_LOGIN_MATRIX_OPENID=1`.
 fn configure_identity(hs: &Arc<Homeserver>) -> Result<(), String> {
     use mail4agent_server::account_source::SignedHeaderSource;
-    use mail4agent_server::external_login::{ExternalLogin, MatrixOpenIdLogin};
+    use mail4agent_server::external_login::ExternalLogin;
     let signed = SignedHeaderSource::from_env()?.map(Arc::new);
-    let door = matches!(env::var("M4A_LOGIN_MATRIX_OPENID").as_deref(), Ok("1") | Ok("true"));
-    if signed.is_none() && !door {
-        return Ok(());
-    }
+    #[allow(unused_mut)]
     let mut doors: Vec<Arc<dyn ExternalLogin>> = Vec::new();
-    if door {
+    #[cfg(feature = "matrix-openid-door")]
+    if matches!(env::var("M4A_LOGIN_MATRIX_OPENID").as_deref(), Ok("1") | Ok("true")) {
         let mut fetcher = mail4agent_server::federation::HttpKeyFetcher::new();
         if let Ok(spec) = env::var("M4A_FEDERATION_PEER_OVERRIDE") {
             fetcher = fetcher.with_overrides_from(&spec);
         }
-        doors.push(Arc::new(MatrixOpenIdLogin::new(Arc::new(fetcher))));
+        doors.push(Arc::new(mail4agent_server::external_login::MatrixOpenIdLogin::new(Arc::new(fetcher))));
+    }
+    if signed.is_none() && doors.is_empty() {
+        return Ok(());
     }
     let identity = mail4agent_server::http::identity::Identity {
         cfg: mail4agent_server::accounts::AccountsConfig::from_env()?,

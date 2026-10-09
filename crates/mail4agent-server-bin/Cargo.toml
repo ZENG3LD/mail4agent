@@ -6,6 +6,10 @@ license = "MIT"
 publish = false
 description = "Loopback process for the mail4agent messenger homeserver. Listens on 127.0.0.1 only."
 
+[features]
+# Reference Matrix-address login door (product layer, off by default).
+matrix-openid-door = ["mail4agent-server/matrix-openid-door"]
+
 [[bin]]
 name = "mail4agent-server-bin"
 path = "src/main.rs"

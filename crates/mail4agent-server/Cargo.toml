@@ -16,6 +16,8 @@ default = []
 # build of the mailbox daemon does not link OpenSSL. The builder enables
 # this on the binary that opens `init_messenger_db`.
 sqlcipher = ["rusqlite/bundled-sqlcipher"]
+# Reference Matrix-address login door (OpenID userinfo). Login doors are product layer; off by default.
+matrix-openid-door = []
 
 [dependencies]
 rusqlite = { version = "0.32", features = ["bundled", "backup"] }

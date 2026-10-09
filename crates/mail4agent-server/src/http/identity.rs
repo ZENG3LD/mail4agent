@@ -98,6 +98,9 @@ pub(super) async fn assertion_layer(State(state): State<Arc<Homeserver>>, mut re
 /// `POST /client/v3/login` for `m4a.login.<door>` types.
 pub(super) async fn door_login(state: &Arc<Homeserver>, body: Value) -> Result<Value, MatrixError> {
     let identity = state.identity.get().ok_or_else(|| MatrixError::forbidden("login is not enabled: this server has no passwords; sessions are created by register"))?;
+    if identity.doors.is_empty() {
+        return Err(MatrixError::forbidden("login is closed: this server only serves its own accounts"));
+    }
     let kind = body.get("type").and_then(Value::as_str).unwrap_or("");
     let door = identity
         .doors
@@ -205,17 +208,24 @@ async fn lifecycle_event(State(state): State<Arc<Homeserver>>, headers: HeaderMa
 mod tests {
     use super::*;
     use crate::account_source::{build_assertion, ASSERTION_HEADER, ASSERTION_SIG_HEADER};
-    use crate::external_login::{MatrixOpenIdLogin, OpenIdUserinfo, UserinfoFuture};
-    use crate::federation::FedError;
+    use crate::external_login::{ExternalLogin, VerifyFuture};
     use axum::body::Body;
     use axum::http::{Request as Req, StatusCode};
     use tower::ServiceExt;
 
+    /// Test-only door: proof `{"access_token":"good","subject":"s"}`.
     struct Fake;
-    impl OpenIdUserinfo for Fake {
-        fn userinfo<'a>(&'a self, server: &'a str, tok: &'a str) -> UserinfoFuture<'a> {
+    impl ExternalLogin for Fake {
+        fn id(&self) -> &str {
+            "fake"
+        }
+        fn verify<'a>(&'a self, proof: &'a Value) -> VerifyFuture<'a> {
             Box::pin(async move {
-                if tok == "good" { Ok(json!({"sub": format!("@zed:{server}")})) } else { Err(FedError::Network("no".into())) }
+                if proof["access_token"] == "good" {
+                    Ok(("fake".to_string(), proof["subject"].as_str().unwrap_or("subj").to_string()))
+                } else {
+                    Err(MatrixError::unauthorized("bad proof"))
+                }
             })
         }
     }
@@ -229,7 +239,7 @@ mod tests {
         let _ = hs.identity.set(Arc::new(Identity {
             cfg: AccountsConfig::default(),
             signed: Some(signed),
-            doors: vec![Arc::new(MatrixOpenIdLogin::new(Arc::new(Fake)))],
+            doors: vec![Arc::new(Fake)],
         }));
         hs
     }
@@ -283,7 +293,7 @@ mod tests {
     async fn door_login_mints_separate_account_and_honours_nick_before_contact() {
         let hs = state();
         let login = |tok: &str, nick: Option<&str>| {
-            let mut b = json!({"type":"m4a.login.matrix","matrix_server_name":"other.example","access_token":tok});
+            let mut b = json!({"type":"m4a.login.fake","subject":"x@other.example","access_token":tok});
             if let Some(n) = nick { b["nick"] = json!(n); }
             Req::builder().method("POST").uri("/client/v3/login").header("content-type", "application/json").body(Body::from(b.to_string())).unwrap()
         };
@@ -304,7 +314,7 @@ mod tests {
         let n: i64 = c.query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 1);
         let sub: String = c.query_row("SELECT subject FROM external_identities", [], |r| r.get(0)).unwrap();
-        assert_eq!(sub, "@zed:other.example");
+        assert_eq!(sub, "x@other.example");
     }
 
     #[tokio::test]
@@ -335,7 +345,7 @@ mod tests {
     async fn displayname_put_changes_nick_not_localpart_and_restamps() {
         let hs = state();
         let b = {
-            let b = json!({"type":"m4a.login.matrix","matrix_server_name":"other.example","access_token":"good"});
+            let b = json!({"type":"m4a.login.fake","subject":"x@other.example","access_token":"good"});
             let r = Req::builder().method("POST").uri("/client/v3/login").header("content-type", "application/json").body(Body::from(b.to_string())).unwrap();
             call(&hs, r).await.1
         };
@@ -384,5 +394,23 @@ mod tests {
         for a in [Action::CreateRoom, Action::JoinRoom, Action::Invite, Action::SendEvent, Action::UploadMedia, Action::SetNick] {
             assert!(seen.contains(&a), "{a:?} not consulted: {seen:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn login_is_closed_when_no_door_is_configured() {
+        let hs = state_without_doors();
+        let r = Req::builder().method("POST").uri("/client/v3/login").header("content-type", "application/json").body(Body::from("{\"type\":\"m4a.login.matrix\"}")).unwrap();
+        assert_eq!(call(&hs, r).await.0, StatusCode::FORBIDDEN);
+        let (_, flows) = call(&hs, Req::builder().uri("/client/v3/login").body(Body::empty()).unwrap()).await;
+        assert_eq!(flows["flows"], json!([]));
+    }
+
+    fn state_without_doors() -> Arc<Homeserver> {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::create_matrix_schema(&c).unwrap();
+        crate::keys::create_matrix_keys_schema(&c).unwrap();
+        let hs = Arc::new(Homeserver::new(c));
+        let _ = hs.identity.set(Arc::new(Identity { cfg: AccountsConfig::default(), signed: None, doors: vec![] }));
+        hs
     }
 }
