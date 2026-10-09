@@ -2,7 +2,7 @@
 //! Caddy sits in front), forwards to the core over the private tunnel.
 //!
 //! Flags: `--bind 127.0.0.1:18741`, `--core-url http://<core-wg-ip>:8741`.
-//! Env: `M4A_EDGE_SECRET` (shared with the core, at least 32 characters).
+//! Env: `M4A_EDGE_SECRET` (shared with the core, at least 32 characters), `M4A_CORE_URL`, `M4A_EDGE_BIND` (loopback only).
 
 use std::net::SocketAddr;
 
@@ -14,7 +14,7 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let mut bind = "127.0.0.1:18741".to_string();
+    let mut bind = std::env::var("M4A_EDGE_BIND").unwrap_or_else(|_| "127.0.0.1:18741".to_string());
     let mut core_url = std::env::var("M4A_CORE_URL").unwrap_or_default();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {

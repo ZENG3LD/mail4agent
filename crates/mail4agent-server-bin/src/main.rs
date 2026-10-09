@@ -42,10 +42,14 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let mut bind_raw = DEFAULT_BIND.to_string();
-    let mut db_raw = DEFAULT_DB.to_string();
-    let mut server_name = DEFAULT_SERVER_NAME.to_string();
-    let mut role = "standalone".to_string();
+    // Every flag has an environment variable (flags win): M4A_BIND, M4A_DB, M4A_SERVER_NAME, M4A_ROLE.
+    let mut bind_raw = env::var("M4A_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
+    let mut db_raw = env::var("M4A_DB").unwrap_or_else(|_| DEFAULT_DB.to_string());
+    let mut server_name = env::var("M4A_SERVER_NAME").unwrap_or_else(|_| DEFAULT_SERVER_NAME.to_string());
+    let mut role = env::var("M4A_ROLE").unwrap_or_else(|_| "standalone".to_string());
+    if role != "standalone" && role != "core" {
+        return Err("M4A_ROLE must be standalone or core".into());
+    }
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -72,7 +76,7 @@ fn run() -> Result<(), String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "usage: mail4agent-server-bin [--bind 127.0.0.1:8741] [--db /tmp/mail4agent-server-bin.db] [--server-name localhost]\n\
+                    "usage: mail4agent-server-bin [--role standalone|core] [--bind 127.0.0.1:8741] [--db /tmp/mail4agent-server-bin.db] [--server-name localhost]\n\
                      required env: M4A_DB_KEY_HEX (even-length hex, not printed)\n\
                      optional bootstrap, all three or none: M4A_BOOTSTRAP_PUBLIC_ID M4A_BOOTSTRAP_NICK M4A_BOOTSTRAP_TOKEN"
                 );
