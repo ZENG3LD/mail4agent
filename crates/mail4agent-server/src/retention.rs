@@ -9,6 +9,9 @@
 //!   owner decides when to switch it on (it changes what `/rooms/{id}/messages`
 //!   can return, see the design doc).
 //!
+//! Only non-state events of CLOSED rooms are ever touched: plaintext public
+//! channels live in `pub_events` ([`crate::public_channels`]) and are excluded
+//! here by construction and by predicate.
 //! Only non-state events are ever touched. State, keys, membership and
 //! to-device queues are untouched here.
 
@@ -76,7 +79,7 @@ pub struct RetentionReport {
 fn eligible_ids(conn: &Connection, now_ms: i64, policy: &RetentionPolicy) -> rusqlite::Result<Vec<String>> {
     let mut out = Vec::new();
     let rooms: Vec<String> = conn
-        .prepare("SELECT DISTINCT room_id FROM events WHERE state_key IS NULL")?
+        .prepare("SELECT DISTINCT room_id FROM events WHERE state_key IS NULL AND room_id NOT IN (SELECT id FROM rooms WHERE kind = 'channel' AND is_encrypted = 0)")?
         .query_map([], |r| r.get(0))?
         .collect::<Result<_, _>>()?;
     for room in rooms {
@@ -142,6 +145,13 @@ pub fn purge_delivered_events(conn: &mut Connection, now_ms: i64, policy: &Reten
         tx.execute("UPDATE events SET redacts = NULL WHERE redacts = ?1", params![id])?;
         tx.execute("UPDATE events SET redacted_by = NULL WHERE redacted_by = ?1", params![id])?;
         removed += tx.execute("DELETE FROM events WHERE event_id = ?1 AND state_key IS NULL", params![id])?;
+    }
+    // Idempotency records only matter inside the ring window.
+    let cutoff = chrono::DateTime::from_timestamp_millis(now_ms - policy.ttl_ms)
+        .map(|d| d.to_rfc3339())
+        .unwrap_or_default();
+    if !cutoff.is_empty() {
+        tx.execute("DELETE FROM txn_dedup WHERE created_at < ?1", params![cutoff])?;
     }
     tx.commit()?;
     Ok(removed)

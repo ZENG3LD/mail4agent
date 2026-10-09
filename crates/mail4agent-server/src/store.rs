@@ -66,6 +66,28 @@ pub fn set_matrix_server_name(name: impl Into<String>) -> Result<(), &'static st
     SERVER_NAME_CELL.set(name).map_err(|_| "server name already set")
 }
 
+static LOCAL_ALIASES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// The three local DNS names of the one OSS core. They are a server-name
+/// CHECK only: an mxid addressed to one of them (once enabled with
+/// [`set_local_aliases`]) resolves to the same local account. No second
+/// homeserver is created and ids are always minted with
+/// [`matrix_server_name()`]. Not enabled by default.
+pub const KNOWN_LOCAL_NAMES: [&str; 3] = ["chat.example", "m4a.example.net", "m4a.example.org"];
+
+/// Accept `names` (hostnames) as local aliases of [`matrix_server_name()`] when
+/// parsing mxids. Call once at boot (the server reads `M4A_LOCAL_NAMES`,
+/// comma-separated). Empty or repeated calls are ignored.
+pub fn set_local_aliases(names: impl IntoIterator<Item = String>) {
+    let list: Vec<String> = names.into_iter().map(|n| n.trim().to_ascii_lowercase()).filter(|n| !n.is_empty() && !n.contains(':') && !n.contains('/')).collect();
+    let _ = LOCAL_ALIASES.set(list);
+}
+
+/// Whether `name` is the minted server name or an enabled local alias.
+pub fn is_local_server_name(name: &str) -> bool {
+    name == matrix_server_name() || LOCAL_ALIASES.get().is_some_and(|aliases| aliases.iter().any(|a| a.eq_ignore_ascii_case(name)))
+}
+
 /// Homeserver name used when minting and parsing local ids.
 pub fn matrix_server_name() -> &'static str {
     SERVER_NAME_CELL.get_or_init(|| "example.org".to_string()).as_str()
@@ -132,7 +154,7 @@ pub fn mxid_for_public_id(public_id: &str) -> String {
 pub fn public_id_from_mxid(mxid: &str) -> Result<&str, MatrixIdError> {
     let rest = mxid.strip_prefix('@').ok_or(MatrixIdError::MissingSigil)?;
     let (localpart, server_name) = rest.split_once(':').ok_or(MatrixIdError::MissingServerName)?;
-    if server_name != matrix_server_name() {
+    if !is_local_server_name(server_name) {
         return Err(MatrixIdError::ForeignServerName);
     }
     Ok(localpart)
@@ -511,7 +533,10 @@ pub fn create_matrix_schema(conn: &Connection) -> rusqlite::Result<()> {
 
         -- legacy_dm_message_map removed (M2); drop_legacy_dm_scaffold_if_empty cleans old DBs
         "#,
-    )
+    )?;
+    // Public plaintext store: own tables, created beside (never inside) the closed set.
+    crate::public_channels::create_public_schema(conn)?;
+    crate::public_forum::create_forum_schema(conn)
 }
 
 /// Open (creating if absent) the SQLCipher-encrypted `messenger.db` at
@@ -529,6 +554,7 @@ pub fn init_messenger_db(path: &str, key_hex: &str) -> rusqlite::Result<Connecti
     create_matrix_schema(&conn)?;
     crate::keys::create_matrix_keys_schema(&conn)?;
     crate::retention::create_retention_schema(&conn)?;
+    crate::public_channels::create_public_schema(&conn)?;
     Ok(conn)
 }
 
@@ -1454,8 +1480,18 @@ pub fn stripped_invite_state(conn: &Connection, room_id: &str, inviter_user_id: 
 }
 
 pub fn get_event(conn: &Connection, event_id: &str) -> rusqlite::Result<Option<MatrixEvent>> {
-    conn.query_row(&format!("SELECT {EVENT_SELECT_COLUMNS} FROM events WHERE event_id = ?1"), params![event_id], event_from_row)
-        .optional()
+    let closed = conn
+        .query_row(&format!("SELECT {EVENT_SELECT_COLUMNS} FROM events WHERE event_id = ?1"), params![event_id], event_from_row)
+        .optional()?;
+    if closed.is_some() {
+        return Ok(closed);
+    }
+    // Public plaintext store (own tables); absent table on a pre-cut DB is "not found".
+    match crate::public_channels::get_event(conn, event_id) {
+        Ok(found) => Ok(found),
+        Err(rusqlite::Error::SqliteFailure(_, Some(msg))) if msg.contains("no such table") => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 pub fn current_state_event(conn: &Connection, room_id: &str, event_type: &str, state_key: &str) -> rusqlite::Result<Option<MatrixEvent>> {
@@ -1550,7 +1586,13 @@ pub fn events_in_room_after(conn: &Connection, room_id: &str, since_stream: i64,
         "SELECT {EVENT_SELECT_COLUMNS} FROM events WHERE room_id = ?1 AND stream_id > ?2 ORDER BY stream_id ASC LIMIT ?3"
     ))?;
     let mut rows = stmt.query(params![room_id, since_stream, limit])?;
-    collect_events(&mut rows)
+    let mut out = collect_events(&mut rows)?;
+    if crate::public_channels::is_public_room(conn, room_id)? {
+        out.extend(crate::public_channels::events_after(conn, room_id, since_stream, limit)?);
+        out.sort_by_key(|e| e.stream_id);
+        out.truncate(limit.max(0) as usize);
+    }
+    Ok(out)
 }
 
 /// The newest-first page strictly before `before_stream`, capped at
@@ -1561,7 +1603,13 @@ pub fn events_in_room_before(conn: &Connection, room_id: &str, before_stream: i6
         "SELECT {EVENT_SELECT_COLUMNS} FROM events WHERE room_id = ?1 AND stream_id < ?2 ORDER BY stream_id DESC LIMIT ?3"
     ))?;
     let mut rows = stmt.query(params![room_id, before_stream, limit])?;
-    collect_events(&mut rows)
+    let mut out = collect_events(&mut rows)?;
+    if crate::public_channels::is_public_room(conn, room_id)? {
+        out.extend(crate::public_channels::events_before(conn, room_id, before_stream, limit)?);
+        out.sort_by_key(|e| std::cmp::Reverse(e.stream_id));
+        out.truncate(limit.max(0) as usize);
+    }
+    Ok(out)
 }
 
 // ============================================================================
@@ -2385,7 +2433,17 @@ fn upsert_receipt_in_tx(
             Ok((row.get(0)?, row.get(1)?))
         })
         .optional()?;
-    let (target_position, target_room) = target.ok_or_else(|| MatrixStoreError::UnknownEventId(event_id.to_string()))?;
+    let Some((target_position, target_room)) = target else {
+        // A read receipt on a public-store post is accepted and not stored:
+        // the public store keeps no per-user read state.
+        if let Some(public) = crate::public_channels::get_event(tx, event_id)? {
+            if public.room_id != room_id {
+                return Err(MatrixStoreError::WrongRoom(event_id.to_string()));
+            }
+            return Ok(public.stream_id);
+        }
+        return Err(MatrixStoreError::UnknownEventId(event_id.to_string()));
+    };
     if target_room != room_id {
         return Err(MatrixStoreError::WrongRoom(event_id.to_string()));
     }
@@ -2449,6 +2507,9 @@ const NOTIFICATION_MESSAGE_TYPES_SQL: &str = "('m.room.message', 'm.room.encrypt
 /// constant the `/sync` response builder (P10) sets directly, not a second
 /// query here.
 pub fn notification_count(conn: &Connection, room: &Room, user_id: i64) -> Result<i64, MatrixStoreError> {
+    if room.kind == RoomKind::Channel && !room.is_encrypted {
+        return Ok(0); // public store: no server-side unread state
+    }
     let upper_bound = match visible_upper_bound(conn, room, user_id)? {
         HistoryWindow::Nothing => return Ok(0),
         HistoryWindow::All => i64::MAX,
@@ -3545,6 +3606,13 @@ mod tests {
     fn mxid_parse_refuses_foreign_server() {
         assert_eq!(public_id_from_mxid("@abc123:example.org"), Ok("abc123"));
         assert_eq!(public_id_from_mxid("@abc123:otherserver.example"), Err(MatrixIdError::ForeignServerName));
+        // Local aliases: server-name check only (enabled once per process).
+        set_local_aliases(KNOWN_LOCAL_NAMES.iter().map(|s| s.to_string()));
+        for name in KNOWN_LOCAL_NAMES {
+            assert_eq!(public_id_from_mxid(&format!("@abc123:{name}")), Ok("abc123"));
+        }
+        assert_eq!(public_id_from_mxid("@abc123:evil.example"), Err(MatrixIdError::ForeignServerName));
+        assert_eq!(mxid_for_public_id("abc123"), format!("@abc123:{}", matrix_server_name()), "minting never uses an alias");
         assert_eq!(public_id_from_mxid("abc123:example.org"), Err(MatrixIdError::MissingSigil));
         assert_eq!(public_id_from_mxid("@abc123"), Err(MatrixIdError::MissingServerName));
     }

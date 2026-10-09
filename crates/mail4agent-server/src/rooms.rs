@@ -160,16 +160,17 @@ pub fn bootstrap_member_events(kind: RoomKind, creator: (i64, &str, &str), invit
 
 
 /// `join_rule`, `history_visibility`, `is_encrypted` for a fresh room.
-/// Public vs private differs only in join rights: every kind is E2E
-/// encrypted with `history_visibility: shared`. (Older plan §5 left
-/// channels plaintext/`world_readable`; that contradicted the product
-/// model — server must never see content.)
+/// DM and group are E2E (`shared`). A Channel is PUBLIC PLAINTEXT
+/// (`world_readable`, not encrypted; MLC decision 2026-10-09): its posts live
+/// in the separate public store ([`crate::public_channels`]), never in the
+/// closed `events` table and never under [`crate::retention`]. Rooms that
+/// were already created encrypted stay encrypted.
 /// `pub(crate)` — also the P12 legacy-DM migration's bootstrap builder.
 pub fn room_kind_settings(kind: RoomKind) -> (JoinRule, HistoryVisibility, bool) {
     match kind {
         RoomKind::Dm => (JoinRule::Invite, HistoryVisibility::Shared, true),
         RoomKind::Group => (JoinRule::Invite, HistoryVisibility::Shared, true),
-        RoomKind::Channel => (JoinRule::Public, HistoryVisibility::Shared, true),
+        RoomKind::Channel => (JoinRule::Public, HistoryVisibility::WorldReadable, false),
     }
 }
 
@@ -856,7 +857,8 @@ pub fn migrate_plaintext_rooms_to_encrypted(
 ) -> Result<usize, MatrixError> {
     let plaintext: Vec<(String, i64, String)> = {
         let mut stmt = conn
-            .prepare("SELECT id, creator_user_id, history_visibility FROM rooms WHERE is_encrypted = 0")
+            // Public plaintext channels are intentionally not encrypted; leave them.
+            .prepare("SELECT id, creator_user_id, history_visibility FROM rooms WHERE is_encrypted = 0 AND kind != 'channel'")
             .map_err(|e| MatrixError::unknown(e.to_string()))?;
         let rows = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
@@ -952,7 +954,7 @@ mod messenger_model_tests {
     }
 
     #[test]
-    fn every_room_kind_is_encrypted_public_differs_only_in_join_rule() {
+    fn dm_and_group_are_encrypted_channel_is_public_plaintext() {
         let (jr, hv, enc) = room_kind_settings(RoomKind::Dm);
         assert_eq!(jr, JoinRule::Invite);
         assert_eq!(hv, HistoryVisibility::Shared);
@@ -965,8 +967,8 @@ mod messenger_model_tests {
 
         let (jr, hv, enc) = room_kind_settings(RoomKind::Channel);
         assert_eq!(jr, JoinRule::Public);
-        assert_eq!(hv, HistoryVisibility::Shared);
-        assert!(enc, "public channels are E2E; join_rule alone marks them public");
+        assert_eq!(hv, HistoryVisibility::WorldReadable);
+        assert!(!enc, "public channels are plaintext in the public store");
     }
 
     #[test]
@@ -1003,31 +1005,21 @@ mod messenger_model_tests {
     }
 
     #[test]
-    fn migrate_plaintext_public_channel_sets_encryption_and_shared_hv() {
+    fn migration_encrypts_plaintext_group_but_leaves_public_channel_alone() {
         let mut conn = test_conn();
         store::ensure_matrix_user(&conn, 1, "alice000000000000000000000000001", T0).expect("alice");
         let channel = "!oldchan:example.org";
-        store::create_room(
-            &conn,
-            channel,
-            RoomKind::Channel,
-            1,
-            T0,
-            false,
-            JoinRule::Public,
-            HistoryVisibility::WorldReadable,
-            None,
-            None,
-        )
-        .expect("legacy channel");
+        store::create_room(&conn, channel, RoomKind::Channel, 1, T0, false, JoinRule::Public, HistoryVisibility::WorldReadable, None, None).expect("channel");
+        let group = "!oldgrp:example.org";
+        store::create_room(&conn, group, RoomKind::Group, 1, T0, false, JoinRule::Invite, HistoryVisibility::Shared, None, None).expect("group");
         let n = migrate_plaintext_rooms_to_encrypted(&mut conn, T0, 1_000).expect("migrate");
-        assert_eq!(n, 1);
-        let room = store::get_room(&conn, channel).expect("get").expect("exists");
+        assert_eq!(n, 1, "only the group is rewritten");
+        let room = store::get_room(&conn, group).expect("get").expect("exists");
         assert!(room.is_encrypted);
-        assert_eq!(room.history_visibility, HistoryVisibility::Shared);
-        assert!(store::current_state_event(&conn, channel, "m.room.encryption", "")
-            .expect("state")
-            .is_some());
+        let chan = store::get_room(&conn, channel).expect("get").expect("exists");
+        assert!(!chan.is_encrypted, "public channel stays plaintext");
+        assert_eq!(chan.history_visibility, HistoryVisibility::WorldReadable);
+        assert!(store::current_state_event(&conn, channel, "m.room.encryption", "").expect("state").is_none());
         let n2 = migrate_plaintext_rooms_to_encrypted(&mut conn, T0, 2_000).expect("idempotent");
         assert_eq!(n2, 0);
     }

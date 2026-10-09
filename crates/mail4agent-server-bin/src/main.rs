@@ -83,6 +83,9 @@ fn run() -> Result<(), String> {
     let bootstrap = read_bootstrap()?;
 
     let mut conn = open_messenger(&server_name, &db_path, &key_hex)?;
+    if let Ok(names) = env::var("M4A_LOCAL_NAMES") {
+        mail4agent_server::store::set_local_aliases(names.split(',').map(str::to_string));
+    }
     run_boot_migrations(&mut conn)?;
     if let Some(boot) = &bootstrap {
         seed_user(&conn, boot)?;

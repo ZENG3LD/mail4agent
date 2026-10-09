@@ -22,6 +22,8 @@ pub mod messaging;
 pub mod nick;
 mod push;
 pub mod retention;
+pub mod public_channels;
+pub mod public_forum;
 pub mod rooms;
 pub mod store;
 pub mod sync;

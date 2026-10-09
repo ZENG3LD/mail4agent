@@ -331,6 +331,10 @@ pub fn apply_send(
         return Ok(SendOutcome { event, is_new: false, wake_ids: HashSet::new() });
     }
 
+    if let Some(existing) = crate::public_channels::seen_txn(conn, caller_user_id, device_id, txn_id).map_err(|_| MatrixError::internal())? {
+        return Ok(SendOutcome { event: existing, is_new: false, wake_ids: HashSet::new() });
+    }
+
     let caller_membership = crate::store::room_member(conn, &room.id, caller_user_id)?.map(|m| m.membership);
     require_member(caller_membership)?;
     check_send_event_type_allowed(event_type, room.is_encrypted)?;
@@ -344,6 +348,19 @@ pub fn apply_send(
 
     let content: serde_json::Value = serde_json::from_str(content_str)?;
     check_replace_target_sender(conn, &content, caller_user_id)?;
+
+    if crate::public_channels::is_public_room(conn, &room.id)? {
+        // Plaintext channel: the post goes to the public store, never to `events`.
+        return match crate::public_channels::insert_event_deduped(conn, device_id, txn_id, event_id, &room.id, caller_user_id, event_type, content_str, origin_ts)
+            .map_err(|_| MatrixError::internal())?
+        {
+            crate::public_channels::PublicWrite::New(event) => {
+                let wake_ids = crate::rooms::member_and_invited_ids(conn, &room.id)?;
+                Ok(SendOutcome { event, is_new: true, wake_ids })
+            }
+            crate::public_channels::PublicWrite::Existing(event) => Ok(SendOutcome { event, is_new: false, wake_ids: HashSet::new() }),
+        };
+    }
 
     match crate::store::insert_timeline_event_deduped(conn, device_id, txn_id, event_id, &room.id, caller_user_id, event_type, content_str, origin_ts, now)? {
         crate::store::DedupedWrite::New(event) => {
@@ -404,6 +421,18 @@ pub fn apply_redact(
     if target.sender_user_id != caller_user_id {
         let power_levels = power_levels_of(conn, room_id)?;
         require_power(&power_levels, caller_mxid, PowerAction::Redact)?;
+    }
+
+    if crate::public_channels::get_event(conn, target_event_id).map_err(|_| MatrixError::internal())?.is_some() {
+        return match crate::public_channels::redact_deduped(conn, device_id, txn_id, room_id, target_event_id, redaction_event_id, caller_user_id, reason, origin_ts)
+            .map_err(|_| MatrixError::internal())?
+        {
+            crate::public_channels::PublicWrite::New(event) => {
+                let wake_ids = crate::rooms::member_and_invited_ids(conn, room_id)?;
+                Ok(RedactOutcome { event, is_new: true, wake_ids })
+            }
+            crate::public_channels::PublicWrite::Existing(event) => Ok(RedactOutcome { event, is_new: false, wake_ids: HashSet::new() }),
+        };
     }
 
     match crate::store::redact_event_deduped(conn, device_id, txn_id, room_id, target_event_id, redaction_event_id, caller_user_id, reason, origin_ts, now)? {
