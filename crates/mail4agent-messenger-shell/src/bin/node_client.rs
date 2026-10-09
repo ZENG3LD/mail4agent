@@ -8,7 +8,7 @@
 //! socket (`m4a-send`, default `node-client.sock` under the store root).
 //!
 //! Homeserver URL, bot display name, session id, and store root come from
-//! the environment / `node-client.env` (see project-docs
+//! the environment / `node-client.env` (see the project documentation
 //! `docs/mail4agent/local-acp-client.md`).
 //! Nothing here embeds a host, URL, key, or bearer. This process does not
 //! start `grok` and does not deploy to a VPS.

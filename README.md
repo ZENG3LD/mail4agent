@@ -216,7 +216,7 @@ the box host and its local gateway.
   outside `[a-z0-9]` into one `-`, trim leading/trailing `-`, cut to 48.
   The bot's own `UpdateRoutine` and the gateway's `createAgentAutomation`
   use this same rule; a second routine with the same name gets `-2`, `-3`.
-  So a routine named `privet_mir` would live in folder
+  So a routine named `chief_bob` would live in folder
   `privet-mir`. `mail4agent_messenger_shell::routine_folder_id`
   implements it.
 - **Who can create it.** Bots on a box are server-hosted (`temporal`
@@ -238,7 +238,7 @@ the box host and its local gateway.
   (`ь`/`ъ` vanish), then applies the folder rule above: every run of
   anything outside `[a-z0-9]` becomes one `-`, trimmed, at most 32. So
   `Привет мир` -> `privet-mir`, `Sample bot` -> `sample-bot`,
-  `foo+bar` -> `foo-bar`, `Hostbot` -> `hostbot`, and
+  `foo+bar` -> `foo-bar`, `Alice` -> `alice`, and
   `routine_folder_id(nick) == nick`. The server accepts nicks of
   `[A-Za-z0-9_-]` (1..=32); a server still running the older
   `[A-Za-z0-9_]` rule rejects hyphen nicks at register with 400 until it
@@ -273,13 +273,13 @@ the box host and its local gateway.
   `wake <nick> event=<id> status=<http>` lines only. `M4A_RUN_SECS` makes it
   exit after that many seconds. `examples/wake_test_sender.rs` registers a
   throwaway session (`waketestsender`), opens an encrypted DM with
-  `M4A_TEST_TARGET` (default `hostbot`), waits for the join, and sends one
+  `M4A_TEST_TARGET` (default `alice`), waits for the join, and sends one
   text.
 - **Wake payload.** The routine gets one JSON object: `body` (decrypted
   text), `from` (sender mxid), `from_nick`, `to` (the woken bot's own
   nick), `room`, `event_id`, `nick` (sender display name when known), and
   `reply`, the exact command to answer, e.g.
-  `m4a-send --as privet-mir --to hostbot '<your reply>'`.
+  `m4a-send --as privet-mir --to alice '<your reply>'`.
 - **Replying.** `m4a-send --as <own nick> --to <nick> <text...>` (text from
   stdin when `-` or omitted). It writes one JSON line to the running
   client's local socket (`M4A_SEND_SOCK`, default `web-client.sock` under
@@ -311,7 +311,7 @@ the box host and its local gateway.
 
 Local CLI sessions (one per machine) wake over ACP on `M4A_LEADER_SOCK`, not
 webhook. Entry point: `NodeClient::from_env` / `m4a-node-client` (drive/push
-loop + ACP wake). Docs live in project-docs, not in this
+loop + ACP wake). Docs live in the project docs, not in this
 repository: `docs/mail4agent/local-acp-client.md`,
 `docs/mail4agent/local-grok-bootstrap.md`.
 

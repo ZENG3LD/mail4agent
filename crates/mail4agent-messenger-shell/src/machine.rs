@@ -87,9 +87,18 @@ pub const SESSIONS_DIR_ENV: &str = "M4A_SESSIONS_DIR";
 /// prefers this over [`SESSIONS_DIR_ENV`] when the directory exists.
 pub const AGENTS_DIR_ENV: &str = "M4A_AGENTS_DIR";
 
-/// Default agents directory on the box. Used when [`AGENTS_DIR_ENV`] is
-/// unset and this path is a directory.
-pub const DEFAULT_AGENTS_DIR: &str = "/srv/agent-data/agents";
+/// Default agents directory, relative to the user's home (`$HOME` or
+/// `%USERPROFILE%`). Used when [`AGENTS_DIR_ENV`] is unset and the resolved path
+/// is a directory.
+pub const DEFAULT_AGENTS_DIR: &str = "agent-data/agents";
+
+/// `<home>/<rel>`, with the home taken from the environment; a bare relative path when none is set.
+pub(crate) fn under_home(rel: &str) -> PathBuf {
+    match std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+        Ok(h) if !h.is_empty() => PathBuf::from(h).join(rel),
+        _ => PathBuf::from(rel),
+    }
+}
 
 /// Optional rescan period in seconds for [`MachineClient::poll_agent_directory`].
 /// Unset or `0` means the caller decides when to poll; open still scans once.
@@ -100,7 +109,7 @@ pub const AGENT_RESCAN_SECS_ENV: &str = "M4A_AGENT_RESCAN_SECS";
 /// `routine_url` and `routine_bearer` are optional and stay in memory.
 /// They are not part of a session record on disk.
 pub struct HostSession {
-    /// Display name the host already shows (`Hostbot`, `Привет мир`).
+    /// Display name the host already shows (`Alice`, `Привет мир`).
     pub bot_name: String,
     /// Session id the host already assigned. This is the mail session, not
     /// the Grok Bot agent id.
@@ -285,7 +294,7 @@ fn resolve_agents_dir(mut get: impl FnMut(&str) -> Option<String>) -> Option<Pat
         }
         return None;
     }
-    let default = PathBuf::from(DEFAULT_AGENTS_DIR);
+    let default = under_home(DEFAULT_AGENTS_DIR);
     if default.is_dir() {
         Some(default)
     } else {
@@ -643,7 +652,7 @@ fn ensure_profile_note(
 
 /// Gateway file the host already runs. [`GATEWAY_FILE_ENV`] overrides it.
 /// The listener is loopback; the `host` field in the file is not used.
-const DEFAULT_GATEWAY_FILE: &str = "/srv/agent-data/gateway.json";
+const DEFAULT_GATEWAY_FILE: &str = "agent-data/gateway.json";
 
 /// Path of the gateway file. Unset on [`MachineClient::from_env`] uses
 /// [`DEFAULT_GATEWAY_FILE`].
@@ -714,7 +723,7 @@ struct StoredWake {
 }
 
 /// The bot's nick ([`crate::nick_from_display_name`] of the display name,
-/// so `Hostbot` -> `hostbot`, `Привет мир` -> `privet-mir`).
+/// so `Alice` -> `alice`, `Привет мир` -> `privet-mir`).
 /// The routine name and folder are the same string.
 /// `None` when no nick derives.
 fn routine_name_for(session: &HostSession) -> Option<String> {
@@ -1499,7 +1508,7 @@ impl MachineClient {
                 return std::env::var(GATEWAY_FILE_ENV)
                     .ok()
                     .filter(|value| !value.is_empty())
-                    .or_else(|| Some(DEFAULT_GATEWAY_FILE.to_string()));
+                    .or_else(|| Some(under_home(DEFAULT_GATEWAY_FILE).to_string_lossy().into_owned()));
             }
             std::env::var(key).ok().filter(|value| !value.is_empty())
         };
@@ -1619,7 +1628,7 @@ impl MachineClient {
         let gateway = self
             .gateway_file
             .clone()
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_GATEWAY_FILE));
+            .unwrap_or_else(|| under_home(DEFAULT_GATEWAY_FILE));
         let Some(gate) = open_gateway(&gateway, self.gateway_token.as_deref())? else {
             return Ok(Vec::new());
         };
@@ -2613,13 +2622,13 @@ mod tests {
             session
         };
         let found = vec![
-            agent("hostbot", "a-hatch"),
+            agent("alice", "a-hatch"),
             agent("m4a-proba2", "a-proba2"),
             agent("skipme", "a-skip"),
             agent("aliased", "a-alias"),
         ];
         let held = vec![
-            (crate::session_store_dir(root, "a-hatch"), Some("hostbot".to_string())),
+            (crate::session_store_dir(root, "a-hatch"), Some("alice".to_string())),
             (crate::session_store_dir(root, "old-alias"), None),
         ];
         let fresh = unopened_agent_sessions(
@@ -2646,8 +2655,8 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("dir");
         std::fs::write(
-            dir.join("hostbot.json"),
-            r#"{"bot_name":"Hostbot","session_id":"web-hostbot"}"#,
+            dir.join("alice.json"),
+            r#"{"bot_name":"Alice","session_id":"web-alice"}"#,
         )
         .expect("write");
         std::fs::write(
@@ -2657,13 +2666,13 @@ mod tests {
         .expect("write");
         let loaded = load_session_records(&dir).expect("records");
         assert_eq!(loaded.len(), 2);
-        assert_eq!(loaded[0].bot_name, "Привет мир");
-        assert_eq!(loaded[1].bot_name, "Hostbot");
-        assert!(loaded[0].agent_id.is_none());
+        assert_eq!(loaded[1].bot_name, "Привет мир");
+        assert_eq!(loaded[0].bot_name, "Alice");
         assert!(loaded[1].agent_id.is_none());
-        assert!(loaded[0].routine_url.is_none());
-        assert!(loaded[0].routine_bearer.is_none());
-        assert!(loaded[0].device_token.is_none());
+        assert!(loaded[0].agent_id.is_none());
+        assert!(loaded[1].routine_url.is_none());
+        assert!(loaded[1].routine_bearer.is_none());
+        assert!(loaded[1].device_token.is_none());
 
         std::fs::write(
             dir.join("leaked.json"),
@@ -2688,8 +2697,8 @@ mod tests {
                 .as_millis()
         ));
         std::fs::create_dir_all(&dir).expect("dir");
-        let record = dir.join("hostbot.json");
-        let body = r#"{"bot_name":"Hostbot","session_id":"web-hostbot"}"#;
+        let record = dir.join("alice.json");
+        let body = r#"{"bot_name":"Alice","session_id":"web-alice"}"#;
         std::fs::write(&record, body).expect("write");
         let routine = "http://127.0.0.1:9/routine";
         let bearer = "host-injected-bearer";
@@ -2847,7 +2856,7 @@ mod tests {
         let state = Arc::new(Mutex::new(Gateway::default()));
         {
             let mut gate = state.lock().expect("gate");
-            gate.backend.insert(("agent-h".into(), "hostbot".into()));
+            gate.backend.insert(("agent-h".into(), "alice".into()));
             gate.clash.insert("agent-x".into());
             gate.cards.push(Card {
                 agent: "agent-k".into(),
@@ -2970,7 +2979,7 @@ mod tests {
             }
         };
         for (id, name) in [
-            ("agent-h", "Hostbot"),
+            ("agent-h", "Alice"),
             ("agent-c", "Привет мир"),
             ("agent-s", "Свой браузер"),
             ("agent-x", "Clash Bot"),
@@ -3032,7 +3041,7 @@ mod tests {
         assert!(!shown.contains("automations/webhook"));
         {
             let gate = state.lock().expect("gate");
-            // hostbot, privet-mir, clash-bot. Not the skipped bot,
+            // alice, privet-mir, clash-bot. Not the skipped bot,
             // not the folder that already holds a cron routine.
             assert_eq!(gate.creates, 3);
             assert_eq!(gate.deletes, 1);
@@ -3052,7 +3061,7 @@ mod tests {
                 .expect("mirror");
             assert_eq!(
                 (mirror.id.as_str(), mirror.name.as_str()),
-                ("hostbot", "hostbot")
+                ("alice", "alice")
             );
             let chief_mirror = gate
                 .cards
@@ -3065,16 +3074,16 @@ mod tests {
             assert!(!mirror.enabled);
         }
         // Keychain: only the ready bot, mode 0600, its folder recorded.
-        let hostbot_file = keychain_path(&store_root, "agent-h");
+        let alice_file = keychain_path(&store_root, "agent-h");
         let stored: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&hostbot_file).expect("keychain"))
+            serde_json::from_slice(&std::fs::read(&alice_file).expect("keychain"))
                 .expect("keychain json");
-        assert_eq!(stored["folder_id"], "hostbot");
-        assert_eq!(stored["key"], "key-agent-h-hostbot");
+        assert_eq!(stored["folder_id"], "alice");
+        assert_eq!(stored["key"], "key-agent-h-alice");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&hostbot_file)
+            let mode = std::fs::metadata(&alice_file)
                 .expect("meta")
                 .permissions()
                 .mode();
@@ -3138,22 +3147,22 @@ mod tests {
         })
         .expect("web agents");
         assert_eq!(sessions.len(), 4);
-        let hostbot = sessions
+        let alice = sessions
             .iter()
             .find(|s| s.session_id == "agent-h")
             .expect("h");
-        assert!(hostbot
+        assert!(alice
             .routine_url
             .as_deref()
             .unwrap_or("")
             .starts_with("https://"));
-        assert!(hostbot.routine_bearer.is_some());
-        assert!(!format!("{hostbot:?}").contains("key-"));
+        assert!(alice.routine_bearer.is_some());
+        assert!(!format!("{alice:?}").contains("key-"));
 
         // No gateway file: the keychain answers, but only for the same folder.
-        let mut offline = vec![HostSession::new("Hostbot", "agent-h")];
+        let mut offline = vec![HostSession::new("Alice", "agent-h")];
         offline[0].agent_id = Some("agent-h".to_string());
-        let mut renamed = HostSession::new("Hostbot Two", "agent-h");
+        let mut renamed = HostSession::new("Alice Two", "agent-h");
         renamed.agent_id = Some("agent-h".to_string());
         offline.push(renamed);
         attach_webhook_routines(
@@ -3165,10 +3174,10 @@ mod tests {
         .expect("offline");
         assert_eq!(
             offline[0].routine_bearer.as_deref(),
-            Some("key-agent-h-hostbot")
+            Some("key-agent-h-alice")
         );
         assert!(offline[1].routine_url.is_none());
-        let mut bare = vec![HostSession::new("Hostbot", "agent-h")];
+        let mut bare = vec![HostSession::new("Alice", "agent-h")];
         attach_webhook_routines(&mut bare, &dir.join("absent.json"), None, None).expect("bare");
         assert!(bare[0].routine_url.is_none());
 
@@ -3179,15 +3188,15 @@ mod tests {
 
     #[test]
     fn wake_note_is_appended_once_and_replaced_in_place() {
-        let first = with_wake_note("Runs the hostbot.", "hostbot").expect("added");
-        assert!(first.starts_with("Runs the hostbot.\n\n<!-- mail4agent:wake -->"));
+        let first = with_wake_note("Runs the alice.", "alice").expect("added");
+        assert!(first.starts_with("Runs the alice.\n\n<!-- mail4agent:wake -->"));
         assert!(first.ends_with("<!-- /mail4agent:wake -->"));
-        assert!(with_wake_note(&first, "hostbot").is_none());
-        let renamed = with_wake_note(&first, "hostbot-two").expect("replaced");
+        assert!(with_wake_note(&first, "alice").is_none());
+        let renamed = with_wake_note(&first, "alice-two").expect("replaced");
         assert_eq!(renamed.matches("<!-- mail4agent:wake -->").count(), 1);
-        assert!(renamed.contains("\"hostbot-two\""));
-        assert!(!renamed.contains("\"hostbot\""));
-        assert!(renamed.starts_with("Runs the hostbot."));
+        assert!(renamed.contains("\"alice-two\""));
+        assert!(!renamed.contains("\"alice\""));
+        assert!(renamed.starts_with("Runs the alice."));
         assert_eq!(with_wake_note("", "carol").expect("empty"), wake_note("carol"));
     }
 
@@ -3201,13 +3210,13 @@ mod tests {
                 .expect("clock")
                 .as_millis()
         ));
-        let hostbot = dir.join("agent-hostbot");
+        let alice = dir.join("agent-alice");
         let chief = dir.join("agent-chief");
-        std::fs::create_dir_all(&hostbot).expect("dir");
+        std::fs::create_dir_all(&alice).expect("dir");
         std::fs::create_dir_all(&chief).expect("dir");
         std::fs::write(
-            hostbot.join("profile.json"),
-            r#"{"name":"Hostbot","description":"x"}"#,
+            alice.join("profile.json"),
+            r#"{"name":"Alice","description":"x"}"#,
         )
         .expect("profile");
         std::fs::write(
@@ -3222,19 +3231,19 @@ mod tests {
         std::fs::write(dir.join("active-agent.json"), "{}").expect("skip file");
         let loaded = load_agents_dir(&dir).expect("agents");
         assert_eq!(loaded.len(), 2);
-        assert_eq!(loaded[0].session_id, "agent-chief");
-        assert_eq!(loaded[0].agent_id.as_deref(), Some("agent-chief"));
-        assert_eq!(loaded[0].bot_name, "Привет мир");
+        assert_eq!(loaded[1].session_id, "agent-chief");
+        assert_eq!(loaded[1].agent_id.as_deref(), Some("agent-chief"));
+        assert_eq!(loaded[1].bot_name, "Привет мир");
         assert_eq!(
-            routine_name_for(&loaded[0]).as_deref(),
+            routine_name_for(&loaded[1]).as_deref(),
             Some("privet-mir")
         );
         assert_ne!(
-            routine_name_for(&loaded[0]).as_deref(),
-            Some(loaded[0].session_id.as_str())
+            routine_name_for(&loaded[1]).as_deref(),
+            Some(loaded[1].session_id.as_str())
         );
-        assert_eq!(loaded[1].bot_name, "Hostbot");
-        assert_eq!(routine_name_for(&loaded[1]).as_deref(), Some("hostbot"));
+        assert_eq!(loaded[0].bot_name, "Alice");
+        assert_eq!(routine_name_for(&loaded[0]).as_deref(), Some("alice"));
         assert!(loaded.iter().all(|session| session.routine_url.is_none()));
         let _ = std::fs::remove_dir_all(&dir);
     }

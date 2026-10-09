@@ -329,7 +329,7 @@ pub struct SessionConfig {
 }
 
 impl SessionConfig {
-    /// `bot_name` is the display name (`Hostbot`, `Привет мир`), not a nick.
+    /// `bot_name` is the display name (`Alice`, `Привет мир`), not a nick.
     pub fn new(
         homeserver_url: impl Into<String>,
         bot_name: &str,
@@ -531,7 +531,7 @@ pub fn reply_hint(to: &str, from_nick: &str) -> String {
     format!("{SEND_COMMAND} --as {to} --to {from_nick} '<your reply>'")
 }
 
-/// Localpart of a Matrix user id (`@hostbot:server` -> `hostbot`).
+/// Localpart of a Matrix user id (`@alice:server` -> `alice`).
 pub fn mxid_localpart(mxid: &str) -> &str {
     let rest = mxid.strip_prefix('@').unwrap_or(mxid);
     rest.split_once(':').map(|(local, _)| local).unwrap_or(rest)
@@ -2575,23 +2575,23 @@ mod tests {
             config.store_dir(),
             session_store_dir(Path::new("/tmp/m4a-root"), "web-session-1")
         );
-        let hostbot = SessionConfig::from_lookup(
+        let alice = SessionConfig::from_lookup(
             |key| match key {
                 HOMESERVER_URL_ENV => Some("http://127.0.0.1:9".to_string()),
-                BOT_NAME_ENV => Some("Hostbot".to_string()),
-                SESSION_ID_ENV => Some("web-hostbot".to_string()),
+                BOT_NAME_ENV => Some("Alice".to_string()),
+                SESSION_ID_ENV => Some("web-alice".to_string()),
                 STORE_ROOT_ENV => Some("/tmp/m4a-root".to_string()),
                 _ => None,
             },
             Some("homeserver_url = \"http://127.0.0.1:1\"\n"),
         )
-        .expect("hostbot");
-        assert_eq!(hostbot.nick(), "hostbot");
-        assert!(hostbot.homeserver_url.contains("127.0.0.1:9"));
+        .expect("alice");
+        assert_eq!(alice.nick(), "alice");
+        assert!(alice.homeserver_url.contains("127.0.0.1:9"));
         let from_toml = SessionConfig::from_lookup(
             |key| match key {
-                BOT_NAME_ENV => Some("Hostbot".to_string()),
-                SESSION_ID_ENV => Some("web-hostbot".to_string()),
+                BOT_NAME_ENV => Some("Alice".to_string()),
+                SESSION_ID_ENV => Some("web-alice".to_string()),
                 STORE_ROOT_ENV => Some("/tmp/m4a-root".to_string()),
                 _ => None,
             },
@@ -3419,7 +3419,7 @@ mod tests {
 
     #[test]
     fn inbound_room_text_posts_the_sender_nick_the_shell_already_has() {
-        let (base, home_done, home) = spawn_homeserver_nick("wake-named", Some("Hostbot"));
+        let (base, home_done, home) = spawn_homeserver_nick("wake-named", Some("Alice"));
         let (routine, hits, routine_done, routine_thread) = spawn_routine();
         let dir = temp_dir("wake-nick");
         let mut store = open_against(&base, &dir.0, "session-a");
@@ -3450,7 +3450,7 @@ mod tests {
             "wake-named",
             "@bob:localhost",
             "$m1:localhost",
-            Some("Hostbot"),
+            Some("Alice"),
         );
     }
 

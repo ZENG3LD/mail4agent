@@ -1,6 +1,6 @@
 //! Nick derived from a Grok Bot web session's display name.
 //!
-//! The host passes the name it already shows (`Hostbot`, `Привет мир`).
+//! The host passes the name it already shows (`Alice`, `Привет мир`).
 //! This module turns that into the session nick. It is not a slug a person
 //! types, and it does not read `M4A_NICK`. Local grok CLI sessions are not
 //! named here.
@@ -17,7 +17,7 @@ use crate::ShellError;
 /// characters (the server's nick limit) and trimmed again, so
 /// [`routine_folder_id`] of the nick is the nick itself.
 /// `Привет мир` -> `privet-mir`, `foo+bar` ->
-/// `foo-bar`, `Hostbot` -> `hostbot`.
+/// `foo-bar`, `Alice` -> `alice`.
 pub fn nick_from_display_name(display_name: &str) -> Result<String, ShellError> {
     let mut out = String::new();
     let mut pending_dash = false;
@@ -48,7 +48,7 @@ pub fn nick_from_display_name(display_name: &str) -> Result<String, ShellError> 
 /// `UpdateRoutine` and by the gateway's `createAgentAutomation`: lowercase,
 /// every run of characters outside `[a-z0-9]` becomes one `-`, leading and
 /// trailing `-` are trimmed, then the result is cut to 48 characters. So a
-/// routine named `privet_mir` would live in folder `privet-mir`;
+/// routine named `chief_bob` would live in folder `chief-bob`;
 /// wake routines avoid the mismatch by using the hyphen nick as the name.
 /// The host falls back to a timestamped name when the slug is empty; that
 /// is not reproducible, so this returns `None` instead.
@@ -196,8 +196,8 @@ mod tests {
 
     #[test]
     fn display_names_become_nicks() {
-        assert_eq!(nick_from_display_name("Hostbot").unwrap(), "hostbot");
-        assert_eq!(nick_from_display_name("  Hostbot  ").unwrap(), "hostbot");
+        assert_eq!(nick_from_display_name("Alice").unwrap(), "alice");
+        assert_eq!(nick_from_display_name("  Alice  ").unwrap(), "alice");
         assert_eq!(
             nick_from_display_name("Привет мир").unwrap(),
             "privet-mir"
@@ -231,17 +231,17 @@ mod tests {
         );
         assert!(nick_from_display_name("...").is_err());
         assert_eq!(lookup_nick("Привет мир").unwrap(), "privet-mir");
-        assert_eq!(lookup_nick("privet_mir").unwrap(), "privet_mir");
-        assert_eq!(lookup_nick("Hostbot").unwrap(), "Hostbot");
+        assert_eq!(lookup_nick("chief_bob").unwrap(), "chief_bob");
+        assert_eq!(lookup_nick("Alice").unwrap(), "Alice");
     }
 
     #[test]
     fn routine_folder_matches_the_host_slug() {
         // nick -> folder, the way UpdateRoutine and createAgentAutomation name it.
-        assert_eq!(routine_folder_id("hostbot").as_deref(), Some("hostbot"));
+        assert_eq!(routine_folder_id("alice").as_deref(), Some("alice"));
         assert_eq!(
-            routine_folder_id("privet_mir").as_deref(),
-            Some("privet-mir")
+            routine_folder_id("chief_bob").as_deref(),
+            Some("chief-bob")
         );
         assert_eq!(
             routine_folder_id("sample_bot").as_deref(),
@@ -255,7 +255,7 @@ mod tests {
             routine_folder_id("foo+bar").as_deref(),
             Some("foo-bar")
         );
-        assert_eq!(routine_folder_id("Hostbot").as_deref(), Some("hostbot"));
+        assert_eq!(routine_folder_id("Alice").as_deref(), Some("alice"));
         assert_eq!(routine_folder_id("__a__b__").as_deref(), Some("a-b"));
         assert_eq!(routine_folder_id("Привет"), None);
         assert_eq!(routine_folder_id("___"), None);
@@ -270,7 +270,7 @@ mod tests {
         // Display name -> nick -> folder: the folder is the nick itself.
         let chain = |name: &str| routine_folder_id(&nick_from_display_name(name).unwrap());
         for name in [
-            "Hostbot",
+            "Alice",
             "Привет мир",
             "foo+bar",
             "Sample Bot",

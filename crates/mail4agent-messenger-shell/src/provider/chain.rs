@@ -103,7 +103,7 @@ impl HostEnv {
     ///
     /// Order: [`SURFACE_ENV`] / [`WEB_VENDOR_ENV`] overrides, then vendor
     /// markers: `CLAUDE_CODE_REMOTE=true` (Claude web container),
-    /// `/srv/agent-data` (Grok Bot box). Anything else is local.
+    /// `<home>/agent-data` (Grok Bot box). Anything else is local.
     pub fn detect_from(
         get: impl Fn(&str) -> Option<String>,
         exists: impl Fn(&Path) -> bool,
@@ -117,7 +117,11 @@ impl HostEnv {
                     .filter(|value| value.eq_ignore_ascii_case("true") || value == "1")
                     .map(|_| WebVendor::ClaudeWeb)
             })
-            .or_else(|| exists(Path::new("/srv/agent-data")).then_some(WebVendor::GrokBot));
+            .or_else(|| {
+                let home = get("HOME").filter(|h| !h.is_empty());
+                let marker = home.map(|h| Path::new(&h).join("agent-data")).unwrap_or_else(|| Path::new("agent-data").to_path_buf());
+                exists(&marker).then_some(WebVendor::GrokBot)
+            });
         let surface = match set(SURFACE_ENV)
             .as_deref()
             .map(str::to_ascii_lowercase)
@@ -446,7 +450,7 @@ mod tests {
             (claude.surface, claude.vendor),
             (Surface::Web, Some(WebVendor::ClaudeWeb))
         );
-        let bot = HostEnv::detect_from(env(&[]), |p: &Path| p == Path::new("/srv/agent-data"));
+        let bot = HostEnv::detect_from(env(&[]), |p: &Path| p.ends_with("agent-data"));
         assert_eq!(bot.vendor, Some(WebVendor::GrokBot));
         let forced = HostEnv::detect_from(env(&[(SURFACE_ENV, "local")]), |_: &Path| true);
         assert_eq!((forced.surface, forced.vendor), (Surface::Local, None));

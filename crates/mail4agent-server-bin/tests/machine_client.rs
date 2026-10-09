@@ -371,10 +371,10 @@ fn one_client_local_dm_skips_homeserver_remote_session_uses_it() {
     std::fs::create_dir_all(&root).expect("store root");
     std::fs::create_dir_all(&sessions_dir).expect("sessions");
     std::fs::write(
-        sessions_dir.join("hostbot.json"),
-        r#"{"bot_name":"Hostbot","session_id":"web-hostbot"}"#,
+        sessions_dir.join("alice.json"),
+        r#"{"bot_name":"Alice","session_id":"web-alice"}"#,
     )
-    .expect("hostbot record");
+    .expect("alice record");
     std::fs::write(
         sessions_dir.join("chief.json"),
         "{\"bot_name\":\"Привет мир\",\"session_id\":\"web-chief\"}",
@@ -385,26 +385,26 @@ fn one_client_local_dm_skips_homeserver_remote_session_uses_it() {
     assert_eq!(sessions.len(), 2);
     let routine_bearer = "mem-only-routine-bearer";
     for session in &mut sessions {
-        if session.bot_name == "Hostbot" {
+        if session.bot_name == "Alice" {
             session.routine_bearer = Some(routine_bearer.to_string());
         }
     }
     assert!(sessions.iter().all(|session| session.routine_url.is_none()));
 
     let mut client = MachineClient::open(&base, &root, sessions).expect("one client");
-    assert!(client.holds("Hostbot"));
+    assert!(client.holds("Alice"));
     assert!(client.holds("privet-mir"));
     assert!(!client.holds("courier"));
-    let hostbot_dir = client.store_dir("hostbot").expect("hostbot dir");
+    let alice_dir = client.store_dir("alice").expect("alice dir");
     let chief_dir = client.store_dir("Привет мир").expect("chief dir");
-    assert_eq!(hostbot_dir, session_store_dir(&root, "web-hostbot"));
+    assert_eq!(alice_dir, session_store_dir(&root, "web-alice"));
     assert_eq!(chief_dir, session_store_dir(&root, "web-chief"));
-    assert_ne!(hostbot_dir, chief_dir);
-    assert_ne!(sealed_bytes(&hostbot_dir), sealed_bytes(&chief_dir));
+    assert_ne!(alice_dir, chief_dir);
+    assert_ne!(sealed_bytes(&alice_dir), sealed_bytes(&chief_dir));
 
-    let hostbot_bearer = client
-        .session_mut("hostbot")
-        .expect("hostbot")
+    let alice_bearer = client
+        .session_mut("alice")
+        .expect("alice")
         .device_bearer()
         .to_string();
     let chief_bearer = client
@@ -412,11 +412,11 @@ fn one_client_local_dm_skips_homeserver_remote_session_uses_it() {
         .expect("chief")
         .device_bearer()
         .to_string();
-    assert!(bearer_is_absent(&hostbot_dir, &hostbot_bearer));
+    assert!(bearer_is_absent(&alice_dir, &alice_bearer));
     assert!(bearer_is_absent(&chief_dir, &chief_bearer));
     assert!(bearer_is_absent(&root, routine_bearer));
     assert!(bearer_is_absent(&sessions_dir, routine_bearer));
-    drop(hostbot_bearer);
+    drop(alice_bearer);
     drop(chief_bearer);
 
     let hits_before_local = client.homeserver_hits();
@@ -427,7 +427,7 @@ fn one_client_local_dm_skips_homeserver_remote_session_uses_it() {
     client.set_local_delivery(true);
     let local_event = exchange_local(
         &mut client,
-        "hostbot",
+        "alice",
         "privet-mir",
         "local-dm-plaintext",
     );
@@ -446,7 +446,7 @@ fn one_client_local_dm_skips_homeserver_remote_session_uses_it() {
     assert_eq!(courier.nick(), Some("courier"));
     assert_ne!(
         courier.store_dir(),
-        hostbot_dir.as_path(),
+        alice_dir.as_path(),
         "courier store collided"
     );
     let courier_nick = courier.nick().unwrap().to_string();
@@ -456,7 +456,7 @@ fn one_client_local_dm_skips_homeserver_remote_session_uses_it() {
         "a request from the local exchange reached the homeserver after it"
     );
     let remote_event = {
-        let sender = client.session_mut("hostbot").expect("hostbot");
+        let sender = client.session_mut("alice").expect("alice");
         exchange_remote(sender, &mut courier, &courier_nick, "remote-dm-plaintext")
     };
     let hits_after_remote = client.homeserver_hits();
@@ -556,12 +556,12 @@ fn one_socket_pushes_session_b_and_not_session_a() {
     let root = temp.dir.join("stores");
     std::fs::create_dir_all(&root).expect("store root");
     let sessions = vec![
-        mail4agent_messenger_shell::HostSession::new("Hostbot", "web-hostbot"),
+        mail4agent_messenger_shell::HostSession::new("Alice", "web-alice"),
         mail4agent_messenger_shell::HostSession::new("Привет мир", "web-chief"),
     ];
     let mut client =
         MachineClient::open(&base, &root, sessions).expect("one client opens one socket");
-    assert!(client.holds("hostbot"));
+    assert!(client.holds("alice"));
     assert!(client.holds("privet-mir"));
 
     let mut courier = OpenedStore::connect(
@@ -636,7 +636,7 @@ fn one_socket_pushes_session_b_and_not_session_a() {
 
     let hits = stable_hits(&client);
     let trace_a = client
-        .session_mut("hostbot")
+        .session_mut("alice")
         .expect("a")
         .http_trace()
         .len();
@@ -700,7 +700,7 @@ fn one_socket_pushes_session_b_and_not_session_a() {
         .pushed_room_events()
         .to_vec();
     let pushed_a: Vec<_> = client
-        .session_mut("hostbot")
+        .session_mut("alice")
         .expect("a")
         .pushed_room_events()
         .to_vec();
@@ -735,7 +735,7 @@ fn one_socket_pushes_session_b_and_not_session_a() {
     );
     assert_eq!(
         client
-            .session_mut("hostbot")
+            .session_mut("alice")
             .expect("a")
             .http_trace()
             .len(),

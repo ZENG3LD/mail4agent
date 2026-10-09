@@ -27,7 +27,7 @@
 //! | Kimi web, Grok web | none documented ([`NoInboundAdapter`]) | - | - |
 //!
 //! Core four: Grok, Kimi Code, Claude Code, Codex. Cursor CLI is optional.
-//! Design: `project-docs/docs/mail4agent/client-architecture.md`.
+//! Design: the project documentation.
 //! Only [`spawn::ResumeSpawnAdapter`] starts a provider process, and only
 //! for a headless session. No adapter answers a permission modal or logs
 //! the plaintext or a credential.
@@ -693,7 +693,7 @@ pub(crate) mod tests {
         ProviderSession {
             kind,
             session_id: "s-1".into(),
-            nick: "hostbot".into(),
+            nick: "alice".into(),
             cwd: Some(PathBuf::from("/tmp")),
             headless: false,
         }
@@ -765,7 +765,7 @@ pub(crate) mod tests {
             &session(SessionKind::local(ProviderKind::Codex)),
             &letter("ping"),
         );
-        assert!(text.contains("m4a-send --as hostbot --to carol"));
+        assert!(text.contains("m4a-send --as alice --to carol"));
         assert!(text.ends_with("ping"));
     }
 

@@ -152,83 +152,83 @@ fn two_web_sessions_register_and_one_finds_the_other_by_nick() {
 
     let root = temp.dir.join("stores");
     std::fs::create_dir_all(&root).expect("store root");
-    let hostbot_cfg = SessionConfig::new(&base, "Hostbot", "web-hostbot", &root, None)
-        .expect("hostbot config");
+    let alice_cfg = SessionConfig::new(&base, "Alice", "web-alice", &root, None)
+        .expect("alice config");
     let chief_cfg = SessionConfig::new(&base, "Привет мир", "web-chief", &root, None)
         .expect("chief config");
-    assert_eq!(hostbot_cfg.nick(), "hostbot");
+    assert_eq!(alice_cfg.nick(), "alice");
     assert_eq!(chief_cfg.nick(), "privet-mir");
     assert_ne!(chief_cfg.nick(), "nachshtab");
-    let hostbot_dir = hostbot_cfg.store_dir();
+    let alice_dir = alice_cfg.store_dir();
     let chief_dir = chief_cfg.store_dir();
-    assert_eq!(hostbot_dir, session_store_dir(&root, "web-hostbot"));
+    assert_eq!(alice_dir, session_store_dir(&root, "web-alice"));
     assert_eq!(chief_dir, session_store_dir(&root, "web-chief"));
-    assert_ne!(hostbot_dir, chief_dir);
+    assert_ne!(alice_dir, chief_dir);
 
-    let mut hostbot = connect_web(&base, "Hostbot", "web-hostbot", &root);
+    let mut alice = connect_web(&base, "Alice", "web-alice", &root);
     let mut chief = connect_web(&base, "Привет мир", "web-chief", &root);
-    assert_eq!(hostbot.nick(), Some("hostbot"));
+    assert_eq!(alice.nick(), Some("alice"));
     assert_eq!(chief.nick(), Some("privet-mir"));
     assert!(
-        bearer_is_absent(&hostbot_dir, hostbot.device_bearer()),
-        "hostbot bearer was written under the store"
+        bearer_is_absent(&alice_dir, alice.device_bearer()),
+        "alice bearer was written under the store"
     );
     assert!(
         bearer_is_absent(&chief_dir, chief.device_bearer()),
         "chief bearer was written under the store"
     );
 
-    let found = hostbot
+    let found = alice
         .find_nick("Привет мир", 3_000)
-        .expect("hostbot finds the chief by display name");
+        .expect("alice finds the chief by display name");
     assert_eq!(found.nick, "privet-mir");
     assert_eq!(found.user_id, "@privet-mir:localhost");
     let found = chief
-        .find_nick("hostbot", 4_000)
-        .expect("chief finds hostbot by nick");
-    assert_eq!(found.nick, "hostbot");
-    assert_eq!(found.user_id, "@hostbot:localhost");
+        .find_nick("alice", 4_000)
+        .expect("chief finds alice by nick");
+    assert_eq!(found.nick, "alice");
+    assert_eq!(found.user_id, "@alice:localhost");
 
     let chief_nick = chief.nick().unwrap().to_string();
     let event_id = exchange_encrypted_dm(
-        &mut hostbot,
+        &mut alice,
         &mut chief,
         &chief_nick,
         "web-session-dm-plaintext",
     );
     println!(
         "local_sender_user={} local_sender_nick={} local_peer_user={} local_peer_nick={} local_event_id={}",
-        hostbot.user_id(),
-        hostbot.nick().unwrap_or(""),
+        alice.user_id(),
+        alice.nick().unwrap_or(""),
         chief.user_id(),
         chief_nick,
         event_id
     );
 
-    let hostbot_bearer = hostbot.device_bearer().to_string();
-    drop(hostbot);
+    let alice_bearer = alice.device_bearer().to_string();
+    drop(alice);
     drop(chief);
     assert!(
-        OpenedStore::connect(&hostbot_cfg).is_err(),
+        OpenedStore::connect(&alice_cfg).is_err(),
         "reopen without the keychain bearer must fail"
     );
-    let mut hostbot = OpenedStore::connect(
+    let mut alice = OpenedStore::connect(
         &SessionConfig::new(
             &base,
-            "Hostbot",
-            "web-hostbot",
+            "Alice",
+            "web-alice",
             &root,
-            Some(hostbot_bearer),
+            Some(alice_bearer),
         )
         .expect("reopen config"),
     )
     .expect("same session reopens");
-    assert_eq!(hostbot.nick(), Some("hostbot"));
-    let found = hostbot
+    assert_eq!(alice.nick(), Some("alice"));
+    let found = alice
         .find_nick("privet-mir", 5_000)
         .expect("reopened session still finds the chief by nick");
     assert_eq!(found.user_id, "@privet-mir:localhost");
-    assert!(bearer_is_absent(&hostbot_dir, hostbot.device_bearer()));
+    assert!(bearer_is_absent(&alice_dir, alice.device_bearer()));
 
     if let Some(child) = server.0.as_mut() {
         let _ = child.kill();
@@ -425,29 +425,29 @@ fn two_web_sessions_dm_against_existing_homeserver() {
     std::fs::create_dir_all(&temp.dir).expect("tmpdir");
     let root = temp.dir.join("stores");
     std::fs::create_dir_all(&root).expect("store root");
-    let hostbot_name = format!("Hostbot {stamp}");
+    let alice_name = format!("Alice {stamp}");
     let chief_name = format!("Проба {stamp}");
-    let hostbot_session = format!("proof-h-{stamp}");
+    let alice_session = format!("proof-h-{stamp}");
     let chief_session = format!("proof-c-{stamp}");
-    let mut hostbot = connect_web(&base, &hostbot_name, &hostbot_session, &root);
+    let mut alice = connect_web(&base, &alice_name, &alice_session, &root);
     let mut chief = connect_web(&base, &chief_name, &chief_session, &root);
     let chief_nick = chief.nick().unwrap().to_string();
     assert_ne!(chief_nick, "nachshtab");
-    assert_ne!(hostbot.nick(), Some("hostbot"));
+    assert_ne!(alice.nick(), Some("alice"));
     assert_ne!(
-        session_store_dir(&root, &hostbot_session),
+        session_store_dir(&root, &alice_session),
         session_store_dir(&root, &chief_session)
     );
     let event_id = exchange_encrypted_dm(
-        &mut hostbot,
+        &mut alice,
         &mut chief,
         &chief_nick,
         "production-web-session-dm-plaintext",
     );
     println!(
         "prod_sender_user={} prod_sender_nick={} prod_peer_user={} prod_peer_nick={} prod_event_id={}",
-        hostbot.user_id(),
-        hostbot.nick().unwrap_or(""),
+        alice.user_id(),
+        alice.nick().unwrap_or(""),
         chief.user_id(),
         chief_nick,
         event_id

@@ -322,7 +322,7 @@ mod tests {
         assert!(notes[0]["params"]["content"]
             .as_str()
             .unwrap()
-            .contains("m4a-send --as hostbot --to carol"));
+            .contains("m4a-send --as alice --to carol"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

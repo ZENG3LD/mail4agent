@@ -7,7 +7,7 @@
 //! sends one text. Prints room id and event id only.
 //!
 //! `M4A_HOMESERVER_URL` is required; `M4A_TEST_TARGET` defaults to
-//! `hostbot`; `M4A_TEST_WAIT_SECS` (default 90) bounds the wait for the join.
+//! `alice`; `M4A_TEST_WAIT_SECS` (default 90) bounds the wait for the join.
 //!
 //! cargo run -p mail4agent-messenger-shell --example wake_test_sender
 
@@ -29,7 +29,7 @@ fn fail(step: &str, err: impl std::fmt::Display) -> ! {
 fn main() {
     let homeserver = std::env::var("M4A_HOMESERVER_URL")
         .unwrap_or_else(|_| fail("env", "M4A_HOMESERVER_URL is not set"));
-    let target = std::env::var("M4A_TEST_TARGET").unwrap_or_else(|_| "hostbot".to_string());
+    let target = std::env::var("M4A_TEST_TARGET").unwrap_or_else(|_| "alice".to_string());
     let wait_secs: u64 = std::env::var("M4A_TEST_WAIT_SECS")
         .ok()
         .and_then(|value| value.parse().ok())

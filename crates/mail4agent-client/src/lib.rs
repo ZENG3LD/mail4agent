@@ -12,7 +12,7 @@
 //! that credential plus kernel session attestation on the TCP peer. See
 //! `mail4agent` README / CLAUDE.md ("The rule that defines this service").
 //!
-//! Hostbot (HQ) consumes this crate as a dependency — the harness holds no
+//! A host application consumes this crate as a dependency — the harness holds no
 //! mailbox of its own (extraction plan
 //! `mailbox-service-extraction-and-signed-session-identity-2026-09-16.md`).
 
@@ -167,7 +167,7 @@ impl MailClient {
     }
 
     /// Same as [`Self::new`] but skips the loopback check (tests / explicit
-    /// remote dial only). Prefer [`Self::new`] for hostbot HQ local dial.
+    /// remote dial only). Prefer [`Self::new`] for host-local dial.
     pub fn new_unchecked(base_url: impl AsRef<str>, bearer: impl Into<String>) -> Result<Self, ClientError> {
         MailClientBuilder::new(base_url)?
             .bearer(bearer)
@@ -465,7 +465,7 @@ async fn decode_response<R: for<'de> Deserialize<'de>>(
     Err(ClientError::UnexpectedStatus { status, body })
 }
 
-/// Re-export common wire types so hostbot can `use mail4agent_client::*`.
+/// Re-export common wire types so hosts can `use mail4agent_client::*`.
 pub use mail4agent_api::{
     AckRequest as MailAckRequest, Address as MailAddress, Directory as MailDirectory,
     InboxRequest as MailInboxRequest, MessageId as MailMessageId, ParticipantId as MailParticipantId,

@@ -68,13 +68,11 @@ pub fn set_matrix_server_name(name: impl Into<String>) -> Result<(), &'static st
 
 static LOCAL_ALIASES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 
-/// The three local DNS names of the one OSS core. They are a server-name
-/// CHECK only: an mxid addressed to one of them (once enabled with
-/// [`set_local_aliases`]) resolves to the same local account. No second
-/// homeserver is created and ids are always minted with
-/// [`matrix_server_name()`]. Not enabled by default.
-pub const KNOWN_LOCAL_NAMES: [&str; 3] = ["chat.example", "m4a.example.net", "m4a.example.org"];
 
+/// Local DNS aliases of the one homeserver are a server-name CHECK only: an mxid addressed to an enabled
+/// alias resolves to the same local account. No second homeserver exists and ids are always minted
+/// with [`matrix_server_name()`]. Off by default.
+///
 /// Accept `names` (hostnames) as local aliases of [`matrix_server_name()`] when
 /// parsing mxids. Call once at boot (the server reads `M4A_LOCAL_NAMES`,
 /// comma-separated). Empty or repeated calls are ignored.
@@ -3608,8 +3606,9 @@ mod tests {
         assert_eq!(public_id_from_mxid("@abc123:example.org"), Ok("abc123"));
         assert_eq!(public_id_from_mxid("@abc123:otherserver.example"), Err(MatrixIdError::ForeignServerName));
         // Local aliases: server-name check only (enabled once per process).
-        set_local_aliases(KNOWN_LOCAL_NAMES.iter().map(|s| s.to_string()));
-        for name in KNOWN_LOCAL_NAMES {
+        let aliases = ["chat.example", "m4a.example.net", "m4a.example.org"];
+        set_local_aliases(aliases.iter().map(|s| s.to_string()));
+        for name in aliases {
             assert_eq!(public_id_from_mxid(&format!("@abc123:{name}")), Ok("abc123"));
         }
         assert_eq!(public_id_from_mxid("@abc123:evil.example"), Err(MatrixIdError::ForeignServerName));

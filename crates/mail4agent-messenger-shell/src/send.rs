@@ -335,12 +335,12 @@ mod tests {
     #[test]
     fn request_uses_as_on_the_wire() {
         let request = SendRequest {
-            as_nick: "hostbot".to_string(),
+            as_nick: "alice".to_string(),
             to: "privet-mir".to_string(),
             text: "hi".to_string(),
         };
         let json = serde_json::to_value(&request).expect("json");
-        assert_eq!(json["as"], "hostbot");
+        assert_eq!(json["as"], "alice");
         assert_eq!(json["to"], "privet-mir");
     }
 }

@@ -161,7 +161,7 @@ fn send_socket_dm_wakes_the_recipient_with_a_reply_hint() {
     let (routine_url, routine_rx) = routine_mock();
     let root = temp.dir.join("stores");
     let sessions = vec![
-        HostSession::new("Hostbot", "web-hostbot"),
+        HostSession::new("Alice", "web-alice"),
         HostSession::new("Привет мир", "web-chief")
             .with_routine(routine_url, Some("test-routine-key".to_string())),
     ];
@@ -170,15 +170,15 @@ fn send_socket_dm_wakes_the_recipient_with_a_reply_hint() {
     assert!(MachineClient::open(
         &base,
         &root,
-        vec![HostSession::new("Hostbot", "web-hostbot")]
+        vec![HostSession::new("Alice", "web-alice")]
     )
     .is_err());
     let sock = temp.dir.join("web-client.sock");
     client.listen_for_sends(&sock).expect("listen");
 
-    let text = "Hostbot -> privet-mir: test reply path";
+    let text = "Alice -> privet-mir: test reply path";
     let request = SendRequest {
-        as_nick: "hostbot".to_string(),
+        as_nick: "alice".to_string(),
         to: "privet-mir".to_string(),
         text: text.to_string(),
     };
@@ -204,7 +204,7 @@ fn send_socket_dm_wakes_the_recipient_with_a_reply_hint() {
     let (from, to, reply) = served.expect("the client answered the send");
     assert_eq!(
         (from.as_str(), to.as_str()),
-        ("hostbot", "privet-mir")
+        ("alice", "privet-mir")
     );
     assert!(reply.ok, "send failed: {:?}", reply.error);
     let answer = sender
@@ -220,15 +220,15 @@ fn send_socket_dm_wakes_the_recipient_with_a_reply_hint() {
     assert_eq!(wake["body"], text);
     assert_eq!(wake["event_id"], event_id.as_str());
     assert_eq!(wake["room"], answer.room.clone().expect("room").as_str());
-    assert_eq!(wake["from_nick"], "hostbot");
+    assert_eq!(wake["from_nick"], "alice");
     assert_eq!(wake["to"], "privet-mir");
     assert!(wake["from"]
         .as_str()
         .expect("from")
-        .starts_with("@hostbot:"));
+        .starts_with("@alice:"));
     assert_eq!(
         wake["reply"],
-        "m4a-send --as privet-mir --to hostbot '<your reply>'"
+        "m4a-send --as privet-mir --to alice '<your reply>'"
     );
     let raw = wake.to_string();
     assert!(!raw.contains("test-routine-key"));
