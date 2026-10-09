@@ -1,10 +1,21 @@
-//! Neutral policy hook. The server asks the hook before an account-initiated
-//! action; the default allows everything. No tariff, tier or price is
-//! defined here: a deployment plugs its own [`PolicyHook`] and decides what
-//! `authenticated` and `paid` mean.
+//! Neutral policy hook. The server asks the hook before an action; the
+//! default allows everything. The server defines no tariff or tier: the
+//! product's assertion carries opaque claims (see [`claims_from`]) and the
+//! hook decides what they mean.
 
-use crate::account_source::AccountFacts;
+use std::collections::BTreeMap;
+
 use crate::store::RoomKind;
+
+/// Opaque product claims for one caller.
+pub type Claims = BTreeMap<String, String>;
+
+/// Claims for a caller admitted by a signed assertion: `flag` ("0"/"1", opaque).
+pub fn claims_from(paid_flag: u8) -> Claims {
+    let mut c = Claims::new();
+    c.insert("flag".into(), paid_flag.to_string());
+    c
+}
 
 /// Things the server asks about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -14,14 +25,13 @@ pub enum Action {
     JoinRoom,
     SendEvent,
     UploadMedia,
-    SetNick,
 }
 
 #[derive(Debug, Clone)]
 pub struct PolicyContext<'a> {
-    pub facts: &'a AccountFacts,
+    pub claims: &'a Claims,
     pub action: Action,
-    /// Known when the action concerns an existing or requested room.
+    /// Known when the action concerns a room kind.
     pub room_kind: Option<RoomKind>,
 }
 
@@ -46,8 +56,8 @@ impl PolicyHook for AllowAll {
 }
 
 /// Run the hook and turn a denial into the API error.
-pub fn enforce(hook: &dyn PolicyHook, facts: &AccountFacts, action: Action, room_kind: Option<RoomKind>) -> Result<(), crate::error::MatrixError> {
-    match hook.decide(&PolicyContext { facts, action, room_kind }) {
+pub fn enforce(hook: &dyn PolicyHook, claims: &Claims, action: Action, room_kind: Option<RoomKind>) -> Result<(), crate::error::MatrixError> {
+    match hook.decide(&PolicyContext { claims, action, room_kind }) {
         Decision::Allow => Ok(()),
         Decision::Deny(why) => Err(crate::error::MatrixError::policy_denied(why)),
     }
@@ -57,10 +67,10 @@ pub fn enforce(hook: &dyn PolicyHook, facts: &AccountFacts, action: Action, room
 mod tests {
     use super::*;
 
-    struct DenyUnpaidChannels;
-    impl PolicyHook for DenyUnpaidChannels {
+    struct DenyFlaglessChannels;
+    impl PolicyHook for DenyFlaglessChannels {
         fn decide(&self, c: &PolicyContext<'_>) -> Decision {
-            if c.action == Action::CreateRoom && c.room_kind == Some(RoomKind::Channel) && !c.facts.paid {
+            if c.action == Action::CreateRoom && c.room_kind == Some(RoomKind::Channel) && c.claims.get("flag").map(String::as_str) != Some("1") {
                 Decision::Deny("not available".into())
             } else {
                 Decision::Allow
@@ -70,10 +80,11 @@ mod tests {
 
     #[test]
     fn default_allows_and_custom_hook_denies_with_policy_error() {
-        let f = AccountFacts::local();
-        assert!(enforce(&AllowAll, &f, Action::CreateRoom, Some(RoomKind::Channel)).is_ok());
-        let e = enforce(&DenyUnpaidChannels, &f, Action::CreateRoom, Some(RoomKind::Channel)).unwrap_err();
+        let c0 = claims_from(0);
+        assert!(enforce(&AllowAll, &c0, Action::CreateRoom, Some(RoomKind::Channel)).is_ok());
+        let e = enforce(&DenyFlaglessChannels, &c0, Action::CreateRoom, Some(RoomKind::Channel)).unwrap_err();
         assert_eq!((e.status, e.errcode), (403, "M4A_POLICY_DENIED"));
-        assert!(enforce(&DenyUnpaidChannels, &f, Action::CreateRoom, Some(RoomKind::Dm)).is_ok());
+        assert!(enforce(&DenyFlaglessChannels, &c0, Action::CreateRoom, Some(RoomKind::Dm)).is_ok());
+        assert!(enforce(&DenyFlaglessChannels, &claims_from(1), Action::CreateRoom, Some(RoomKind::Channel)).is_ok());
     }
 }

@@ -1204,12 +1204,25 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "futures-util",
+ "m4a-seam",
  "mail4agent-server",
  "reqwest",
  "rusqlite",
  "serde_json",
  "tokio",
  "tokio-tungstenite",
+]
+
+[[package]]
+name = "m4a-seam"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "hex",
+ "hmac",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -1352,6 +1365,8 @@ dependencies = [
  "ed25519-dalek",
  "futures-util",
  "hex",
+ "hmac",
+ "m4a-seam",
  "rand 0.8.8",
  "reqwest",
  "rusqlite",

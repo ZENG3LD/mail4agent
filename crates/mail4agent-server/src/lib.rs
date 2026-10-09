@@ -7,15 +7,12 @@
 //! stored only as a SHA-256 hex. The websession opens the database, calls
 //! [`store::set_matrix_server_name`] once, and serves [`http::Homeserver`].
 //! There is no tariff logic and no product identity database; products plug in through
-//! [`account_source`], [`accounts`] and [`policy`].
+//! [`identities`] (signed assertions from `m4a-seam`) and [`policy`].
 //! [`store::init_messenger_db`] runs `PRAGMA key` and expects a SQLCipher
 //! build of rusqlite (crate feature `sqlcipher`).
 
 pub mod account;
-pub mod account_source;
-pub mod accounts;
-pub mod external_login;
-pub mod nick_policy;
+pub mod identities;
 pub mod policy;
 pub mod ephemeral;
 pub mod error;

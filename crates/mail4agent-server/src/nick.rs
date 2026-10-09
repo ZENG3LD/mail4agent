@@ -157,7 +157,7 @@ pub fn user_nick(conn: &Connection, user_id: i64) -> rusqlite::Result<Option<Str
     if let Some(n) = nick.filter(|n| !n.is_empty()) {
         return Ok(Some(n));
     }
-    crate::accounts::nick_of_user(conn, user_id)
+    crate::identities::nick_of_user(conn, user_id)
 }
 
 /// Earliest session nick when one is set, otherwise the mxid localpart.

@@ -40,7 +40,7 @@ pub struct Caller {
     pub mxid: String,
     pub device_id: String,
     /// What the policy hook may know (`local` for device-bearer callers).
-    pub facts: crate::account_source::AccountFacts,
+    pub claims: crate::policy::Claims,
 }
 
 pub struct Homeserver {
@@ -64,7 +64,7 @@ pub struct Homeserver {
     /// Wakes the outbox worker when new federation work exists.
     pub fed_notify: tokio::sync::Notify,
     /// Accounts, doors and issuer assertions; unset = legacy device-bearer behaviour only.
-    pub identity: std::sync::OnceLock<Arc<identity::Identity>>,
+    pub seam: std::sync::OnceLock<Arc<identity::Seam>>,
     /// Policy hook; unset = allow everything.
     pub policy: std::sync::OnceLock<Arc<dyn crate::policy::PolicyHook>>,
     /// Set to turn OFF `POST /client/v3/register` (a product that owns registration does this).
@@ -86,7 +86,7 @@ impl Homeserver {
             key_fetcher: std::sync::OnceLock::new(),
             fed_transport: std::sync::OnceLock::new(),
             fed_notify: tokio::sync::Notify::new(),
-            identity: std::sync::OnceLock::new(),
+            seam: std::sync::OnceLock::new(),
             policy: std::sync::OnceLock::new(),
             self_register_disabled: std::sync::OnceLock::new(),
         }
@@ -95,7 +95,7 @@ impl Homeserver {
     /// Ask the policy hook (default: allow) about an action by `caller`.
     pub fn check_policy(&self, caller: &Caller, action: crate::policy::Action, room_kind: Option<crate::store::RoomKind>) -> Result<(), MatrixError> {
         match self.policy.get() {
-            Some(h) => crate::policy::enforce(h.as_ref(), &caller.facts, action, room_kind),
+            Some(h) => crate::policy::enforce(h.as_ref(), &caller.claims, action, room_kind),
             None => Ok(()),
         }
     }
@@ -124,12 +124,12 @@ pub async fn resolve_caller(
     headers: &HeaderMap,
     query_token: Option<&str>,
 ) -> Result<Caller, MatrixError> {
-    if let Some((user_id, device_id, facts)) = identity::read_resolved(headers) {
+    if let Some((user_id, device_id, claims)) = identity::read_resolved(headers) {
         let state = Arc::clone(state);
         return tokio::task::spawn_blocking(move || -> Result<Caller, MatrixError> {
             let conn = state.conn.lock().unwrap_or_else(|e| e.into_inner());
             let mxid = crate::store::mxid_of(&conn, user_id)?.ok_or_else(MatrixError::unknown_token)?;
-            Ok(Caller { user_id, mxid, device_id, facts })
+            Ok(Caller { user_id, mxid, device_id, claims })
         })
         .await
         .map_err(|_| MatrixError::internal())?;
@@ -144,7 +144,7 @@ pub async fn resolve_caller(
         let device = crate::keys::device_for_credential(&conn, CredentialKind::Bearer, &hash)?
             .ok_or_else(MatrixError::unknown_token)?;
         let mxid = crate::store::mxid_of(&conn, device.user_id)?.ok_or_else(MatrixError::unknown_token)?;
-        Ok(Caller { user_id: device.user_id, mxid, device_id: device.device_id, facts: crate::account_source::AccountFacts::local() })
+        Ok(Caller { user_id: device.user_id, mxid, device_id: device.device_id, claims: crate::policy::Claims::new() })
     })
     .await
     .map_err(|_| MatrixError::internal())?

@@ -64,19 +64,13 @@ async fn well_known_server(State(state): State<Arc<Homeserver>>) -> Result<Json<
     Ok(Json(json!({ "m.server": target })))
 }
 
-async fn login_flows(State(state): State<Arc<Homeserver>>) -> Json<Value> {
-    // Sessions are minted by POST /register; with an identity config the external-login doors are listed.
-    let flows: Vec<Value> = state
-        .identity
-        .get()
-        .map(|i| i.doors.iter().map(|d| json!({ "type": format!("m4a.login.{}", d.id()) })).collect())
-        .unwrap_or_default();
-    Json(json!({ "flows": flows }))
+/// Login is the product server's; this server lists no flows and mints no sessions.
+async fn login_flows() -> Json<Value> {
+    Json(json!({ "flows": [] }))
 }
 
-async fn login(State(state): State<Arc<Homeserver>>, body: Bytes) -> Result<Json<Value>, MatrixError> {
-    let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-    super::identity::door_login(&state, body).await.map(Json)
+async fn login() -> Result<Json<Value>, MatrixError> {
+    Err(MatrixError::forbidden("login is not offered by the messenger server; sign in at the product server"))
 }
 
 async fn logout(State(state): State<Arc<Homeserver>>, headers: HeaderMap) -> Result<Json<Value>, MatrixError> {

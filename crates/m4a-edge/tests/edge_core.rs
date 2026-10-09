@@ -91,32 +91,30 @@ async fn edge_rate_limits_register_per_client_and_reports_core_down() {
 }
 
 #[tokio::test]
-async fn edge_passes_account_assertion_headers_and_the_signed_path_is_the_core_path() {
-    use mail4agent_server::account_source::{build_assertion, SignedHeaderSource, ASSERTION_HEADER, ASSERTION_SIG_HEADER};
-    use mail4agent_server::http::identity::Identity;
-    let src = Arc::new(SignedHeaderSource::new("issuer:test", vec![b"0123456789abcdef0123".to_vec()], 30_000));
+async fn edge_passes_the_assertion_header_and_the_signed_path_is_the_core_path() {
+    use m4a_seam::{sign_assertion, Assertion, DEFAULT_ASSERTION_HEADER};
+    let secret = b"0123456789abcdef0123".to_vec();
     let conn = Connection::open_in_memory().unwrap();
     mail4agent_server::store::create_matrix_schema(&conn).unwrap();
     mail4agent_server::keys::create_matrix_keys_schema(&conn).unwrap();
     let hs = Arc::new(Homeserver::new(conn));
-    let _ = hs.identity.set(Arc::new(Identity { cfg: Default::default(), signed: Some(src.clone()), doors: vec![] }));
+    let _ = hs.seam.set(Arc::new(mail4agent_server::http::identity::Seam::new(vec![secret.clone()], 30, None, None)));
     let core_addr = serve(require_edge_secret(router(hs), SECRET.to_string())).await;
     let edge_addr = serve(m4a_edge::edge_router(m4a_edge::EdgeConfig { core_url: format!("http://{core_addr}"), secret: SECRET.into() })).await;
     let c = reqwest::Client::new();
     let now = chrono_now();
-    let claims = json!({"v":1,"nick":"nora","placeholder":false,"authenticated":true,"paid":false,"cred_ref":"c1","iat":now,"exp":now+60,"nonce":"n-edge"});
-    // The proxy that signs sees the client path `/_matrix/...`; the core sees it without the prefix.
-    // The signature must be made over the core-side path (prefix stripped, query kept).
+    let a = |nonce: &str| Assertion { nick: "nora".into(), cred_ref: "c1".into(), authenticated: 1, paid: 0, iat: now, exp: now + 60, nonce: nonce.into() };
+    // The product signs over the core-side path (no `/_matrix` prefix, query kept).
     let core_path = "/client/v3/capabilities?x=1";
-    let (v, sig) = build_assertion(&src, "GET", core_path, &claims);
-    let ok = c.get(format!("http://{edge_addr}/_matrix{core_path}")).header(ASSERTION_HEADER, &v).header(ASSERTION_SIG_HEADER, &sig).send().await.unwrap();
+    let v = sign_assertion(&secret, "GET", core_path, &a("n-edge"));
+    let ok = c.get(format!("http://{edge_addr}/_matrix{core_path}")).header(DEFAULT_ASSERTION_HEADER, &v).send().await.unwrap();
     assert_eq!(ok.status(), 200, "{}", ok.text().await.unwrap());
     // Signed over the prefixed path does not match what the core sees.
-    let (v2, sig2) = build_assertion(&src, "GET", &format!("/_matrix{core_path}"), &json!({"v":1,"nick":"nora","placeholder":false,"authenticated":true,"paid":false,"cred_ref":"c1","iat":now,"exp":now+60,"nonce":"n-edge2"}));
-    let bad = c.get(format!("http://{edge_addr}/_matrix{core_path}")).header(ASSERTION_HEADER, &v2).header(ASSERTION_SIG_HEADER, &sig2).send().await.unwrap();
+    let v2 = sign_assertion(&secret, "GET", &format!("/_matrix{core_path}"), &a("n-edge2"));
+    let bad = c.get(format!("http://{edge_addr}/_matrix{core_path}")).header(DEFAULT_ASSERTION_HEADER, &v2).send().await.unwrap();
     assert_eq!(bad.status(), 401);
     // A client cannot inject the internal hand-over header through the edge.
-    let forged = c.get(format!("http://{edge_addr}/_matrix/client/v3/capabilities")).header("x-m4a-resolved", "1|dev|1|1|local").send().await.unwrap();
+    let forged = c.get(format!("http://{edge_addr}/_matrix/client/v3/capabilities")).header("x-m4a-resolved", "1|dev|1").send().await.unwrap();
     assert_eq!(forged.status(), 401);
 }
 

@@ -267,16 +267,8 @@ async fn put_displayname(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, MatrixError> {
     let caller = super::resolve_caller(&state, &headers, None).await?;
-    // Account-backed callers change their nick through the display name; others keep the refusal.
-    if user_id == caller.mxid {
-        if let Some(name) = body.get("displayname").and_then(|v| v.as_str()) {
-            state.check_policy(&caller, crate::policy::Action::SetNick, None)?;
-            if super::identity::set_display_name(&state, caller.user_id, name.to_string()).await?.is_some() {
-                return Ok(Json(serde_json::json!({})));
-            }
-        }
-    }
-    Err(MatrixError::forbidden("displayname follows your nick — change it in account settings, not here"))
+    let _ = (caller, user_id, body);
+    Err(MatrixError::forbidden("displayname follows your nick; the product server owns nick changes"))
 }
 
 async fn user_directory_search(
