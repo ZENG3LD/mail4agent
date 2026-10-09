@@ -88,7 +88,9 @@ fn run() -> Result<(), String> {
         seed_user(&conn, boot)?;
         eprintln!("bootstrapped one local user");
     }
-    let app = router(Arc::new(Homeserver::new(conn)));
+    let hs = Arc::new(Homeserver::new(conn));
+    spawn_retention(Arc::clone(&hs));
+    let app = router(hs);
 
     let runtime = tokio::runtime::Runtime::new().map_err(|err| format!("runtime: {err}"))?;
     runtime.block_on(serve(bind, app))
@@ -300,4 +302,30 @@ mod tests {
         assert!(body.contains("HTTP/1.1 200"), "{body}");
         assert!(body.contains("\"next_batch\""), "{body}");
     }
+}
+
+
+/// Delivery-window retention: delete events every live device acked, TTL as a
+/// safety net. `M4A_RETENTION=off` disables; `M4A_EVENT_TTL_DAYS` (default 14).
+fn spawn_retention(hs: Arc<Homeserver>) {
+    use mail4agent_server::retention::{purge_delivered_events, RetentionPolicy};
+    if env::var("M4A_RETENTION").map(|v| v.eq_ignore_ascii_case("off")).unwrap_or(false) {
+        eprintln!("retention: disabled");
+        return;
+    }
+    let mut policy = RetentionPolicy::default();
+    if let Some(days) = env::var("M4A_EVENT_TTL_DAYS").ok().and_then(|v| v.parse::<i64>().ok()).filter(|d| *d > 0) {
+        policy.ttl_ms = days * 86_400_000;
+    }
+    eprintln!("retention: on, ttl {} days", policy.ttl_ms / 86_400_000);
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(600));
+        let now_ms = Utc::now().timestamp_millis();
+        let mut conn = hs.conn.lock().unwrap_or_else(|e| e.into_inner());
+        match purge_delivered_events(&mut conn, now_ms, &policy) {
+            Ok(0) => {}
+            Ok(n) => eprintln!("retention: removed {n} delivered event(s)"),
+            Err(err) => eprintln!("retention: skipped: {err}"),
+        }
+    });
 }

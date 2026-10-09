@@ -14,6 +14,9 @@
 
 use rusqlite::{params, Connection};
 
+/// Most events one purge pass removes (keeps the DB lock short).
+pub const PURGE_BATCH: usize = 1000;
+
 /// `device_acks` DDL. Called from `init_messenger_db`.
 pub fn create_retention_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
@@ -57,7 +60,7 @@ pub struct RetentionPolicy {
 
 impl Default for RetentionPolicy {
     fn default() -> Self {
-        Self { ttl_ms: 14 * 86_400_000, ack_grace_ms: 3_600_000, keep_last: 20, stale_device_ms: 30 * 86_400_000 }
+        Self { ttl_ms: 14 * 86_400_000, ack_grace_ms: 300_000, keep_last: 0, stale_device_ms: 30 * 86_400_000 }
     }
 }
 
@@ -126,7 +129,8 @@ pub fn retention_report(conn: &Connection, now_ms: i64, policy: &RetentionPolicy
 /// Deletes eligible message events (and rows pointing at them). Returns how
 /// many events were removed.
 pub fn purge_delivered_events(conn: &mut Connection, now_ms: i64, policy: &RetentionPolicy) -> rusqlite::Result<usize> {
-    let ids = eligible_ids(conn, now_ms, policy)?;
+    let mut ids = eligible_ids(conn, now_ms, policy)?;
+    ids.truncate(PURGE_BATCH);
     let tx = conn.transaction()?;
     let mut removed = 0;
     for id in &ids {
@@ -183,6 +187,27 @@ mod tests {
         assert_eq!(purge_delivered_events(&mut conn, now, &policy).unwrap(), 10);
         let left: i64 = conn.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0)).unwrap();
         assert_eq!(left, 20);
+    }
+
+    #[test]
+    fn deleted_only_after_every_live_device_acked() {
+        let mut conn = db();
+        for u in [1, 2] {
+            conn.execute("INSERT INTO room_members (room_id, user_id, membership, updated_at) VALUES ('!r:x', ?1, 'join', 't')", params![u]).unwrap();
+            conn.execute("INSERT INTO devices (user_id, device_id, credential_kind, credential_ref, created_at, last_seen_at) VALUES (?1, 'D', 'Bearer', ?2, 't', 't')", params![u, format!("c{u}")]).unwrap();
+        }
+        for i in 1..=3 {
+            add_event(&conn, i, 1_000);
+        }
+        let policy = RetentionPolicy { ttl_ms: 10_000_000, ack_grace_ms: 0, keep_last: 0, stale_device_ms: 10_000_000 };
+        let now = 100_000;
+        assert_eq!(purge_delivered_events(&mut conn, now, &policy).unwrap(), 0, "nobody acked");
+        record_device_ack(&conn, 1, "D", 3, now).unwrap();
+        assert_eq!(purge_delivered_events(&mut conn, now, &policy).unwrap(), 0, "one device still behind");
+        record_device_ack(&conn, 2, "D", 2, now).unwrap();
+        assert_eq!(purge_delivered_events(&mut conn, now, &policy).unwrap(), 2, "events 1,2 acked by all");
+        let left: i64 = conn.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0)).unwrap();
+        assert_eq!(left, 1);
     }
 
     #[test]
