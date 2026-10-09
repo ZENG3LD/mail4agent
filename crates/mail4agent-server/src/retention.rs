@@ -153,6 +153,8 @@ pub fn purge_delivered_events(conn: &mut Connection, now_ms: i64, policy: &Reten
     if !cutoff.is_empty() {
         tx.execute("DELETE FROM txn_dedup WHERE created_at < ?1", params![cutoff])?;
     }
+    // Media blobs are ciphertext attachments: same pump rule, same TTL.
+    tx.execute("DELETE FROM media WHERE created_ms < ?1", params![now_ms - policy.ttl_ms])?;
     tx.commit()?;
     Ok(removed)
 }

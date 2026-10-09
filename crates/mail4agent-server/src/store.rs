@@ -536,7 +536,8 @@ pub fn create_matrix_schema(conn: &Connection) -> rusqlite::Result<()> {
     )?;
     // Public plaintext store: own tables, created beside (never inside) the closed set.
     crate::public_channels::create_public_schema(conn)?;
-    crate::public_forum::create_forum_schema(conn)
+    crate::public_forum::create_forum_schema(conn)?;
+    crate::media::create_media_schema(conn)
 }
 
 /// Open (creating if absent) the SQLCipher-encrypted `messenger.db` at

@@ -92,6 +92,12 @@ fn run() -> Result<(), String> {
         eprintln!("bootstrapped one local user");
     }
     let hs = Arc::new(Homeserver::new(conn));
+    if let Ok(url) = env::var("M4A_PUBLIC_BASE_URL") {
+        let _ = hs.public_base_url.set(url.trim_end_matches('/').to_string());
+    }
+    if let Ok(target) = env::var("M4A_FEDERATION_DELEGATE") {
+        let _ = hs.federation_delegate.set(target);
+    }
     spawn_retention(Arc::clone(&hs));
     let app = router(hs);
 

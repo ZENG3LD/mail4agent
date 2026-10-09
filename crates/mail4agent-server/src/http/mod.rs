@@ -22,6 +22,7 @@ use crate::live::{ClaimRateLimiter, LiveRegistry};
 use crate::typing::TypingRegistry;
 
 mod account;
+mod compat;
 mod ephemeral;
 mod keys;
 mod messaging;
@@ -42,6 +43,10 @@ pub struct Homeserver {
     pub typing: TypingRegistry,
     pub claim_rate: ClaimRateLimiter,
     pub push: crate::push::PushHub,
+    /// Public client base URL for `/.well-known/matrix/client` (config, never hard-coded).
+    pub public_base_url: std::sync::OnceLock<String>,
+    /// `m.server` value for `/.well-known/matrix/server`; unset = federation off.
+    pub federation_delegate: std::sync::OnceLock<String>,
 }
 
 impl Homeserver {
@@ -52,6 +57,8 @@ impl Homeserver {
             typing: TypingRegistry::new(),
             claim_rate: ClaimRateLimiter::new(),
             push: crate::push::PushHub::new(),
+            public_base_url: std::sync::OnceLock::new(),
+            federation_delegate: std::sync::OnceLock::new(),
         }
     }
 }
@@ -95,6 +102,21 @@ pub async fn resolve_caller(
     .map_err(|_| MatrixError::internal())?
 }
 
+/// Runs blocking DB work under the connection lock (shared by route modules).
+pub(crate) async fn with_conn_pub<T, F>(state: &Arc<Homeserver>, work: F) -> Result<T, MatrixError>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut Connection) -> Result<T, MatrixError> + Send + 'static,
+{
+    let state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        let mut conn = state.conn.lock().unwrap_or_else(|e| e.into_inner());
+        work(&mut conn)
+    })
+    .await
+    .map_err(|_| MatrixError::internal())?
+}
+
 pub fn wake_users(state: &Homeserver, ids: impl IntoIterator<Item = i64>) {
     state.live.wake_many(ids.into_iter().map(|id| format!("user:{id}")));
 }
@@ -111,6 +133,7 @@ pub fn router(state: Arc<Homeserver>) -> Router {
         .merge(keys::routes())
         .merge(sync::routes())
         .merge(push::routes())
+        .merge(compat::routes())
         .fallback(unrecognized)
         .with_state(state)
 }

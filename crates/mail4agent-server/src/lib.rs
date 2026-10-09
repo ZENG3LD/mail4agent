@@ -24,6 +24,7 @@ mod push;
 pub mod retention;
 pub mod public_channels;
 pub mod spaces;
+pub mod media;
 pub mod public_forum;
 pub mod rooms;
 pub mod store;
