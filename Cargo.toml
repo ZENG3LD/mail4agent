@@ -83,4 +83,5 @@ members = [
     "crates/mail4agent-server",
     "crates/mail4agent-server-bin",
     "crates/m4a-edge",
+    "crates/m4a-seam",
 ]

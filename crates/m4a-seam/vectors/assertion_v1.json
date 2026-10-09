@@ -1,0 +1,20 @@
+{
+  "secret": "vector-secret-0123456789",
+  "secret_prev": "vector-previous-9876543210",
+  "now_ms": 1800000010000,
+  "skew_ms": 30000,
+  "cases": [
+    {"name":"valid","method":"GET","path":"/client/v3/sync?timeout=0","assertion":{"nick":"carol","cred_ref":"c1","authenticated":1,"paid":0,"iat":1800000000,"exp":1800000060,"nonce":"00000000000000000000000000000001"},"expected_value":"v1.eyJuaWNrIjoiY2Fyb2wiLCJjcmVkX3JlZiI6ImMxIiwiYXV0aGVudGljYXRlZCI6MSwicGFpZCI6MCwiaWF0IjoxODAwMDAwMDAwLCJleHAiOjE4MDAwMDAwNjAsIm5vbmNlIjoiMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDEifQ.0edfec299dd38427747bdeeab635e27c0d29e6a74d6a8a904906d36bac4c9567","expect":"ok"},
+    {"name":"valid paid flag","method":"POST","path":"/client/v3/createRoom","assertion":{"nick":"carol","cred_ref":"c1","authenticated":1,"paid":1,"iat":1800000000,"exp":1800000060,"nonce":"00000000000000000000000000000002"},"expect":"ok"},
+    {"name":"previous secret accepted during rotation","method":"GET","path":"/p","signed_with":"prev","accept_prev":true,"assertion":{"nick":"carol","cred_ref":"c1","authenticated":1,"paid":0,"iat":1800000000,"exp":1800000060,"nonce":"00000000000000000000000000000003"},"expect":"ok"},
+    {"name":"previous secret refused when not accepted","method":"GET","path":"/p","signed_with":"prev","assertion":{"nick":"carol","cred_ref":"c1","authenticated":1,"paid":0,"iat":1800000000,"exp":1800000060,"nonce":"00000000000000000000000000000004"},"expect":"bad_signature"},
+    {"name":"signed for another path","method":"GET","path":"/a","sign_path":"/b","assertion":{"nick":"carol","cred_ref":"c1","authenticated":1,"paid":0,"iat":1800000000,"exp":1800000060,"nonce":"00000000000000000000000000000005"},"expect":"bad_signature"},
+    {"name":"signed for another method","method":"GET","path":"/a","sign_method":"POST","assertion":{"nick":"carol","cred_ref":"c1","authenticated":1,"paid":0,"iat":1800000000,"exp":1800000060,"nonce":"00000000000000000000000000000006"},"expect":"bad_signature"},
+    {"name":"tampered nick","method":"GET","path":"/a","tamper_nick_to":"admin","assertion":{"nick":"carol","cred_ref":"c1","authenticated":1,"paid":0,"iat":1800000000,"exp":1800000060,"nonce":"00000000000000000000000000000007"},"expect":"bad_signature"},
+    {"name":"expired beyond skew","method":"GET","path":"/a","assertion":{"nick":"carol","cred_ref":"c1","authenticated":1,"paid":0,"iat":1799999900,"exp":1799999960,"nonce":"00000000000000000000000000000008"},"expect":"expired"},
+    {"name":"issued in the future beyond skew","method":"GET","path":"/a","assertion":{"nick":"carol","cred_ref":"c1","authenticated":1,"paid":0,"iat":1800000100,"exp":1800000160,"nonce":"00000000000000000000000000000009"},"expect":"expired"},
+    {"name":"unauthenticated is never asserted","method":"GET","path":"/a","assertion":{"nick":"carol","cred_ref":"c1","authenticated":0,"paid":0,"iat":1800000000,"exp":1800000060,"nonce":"0000000000000000000000000000000a"},"expect":"malformed"},
+    {"name":"empty cred_ref","method":"GET","path":"/a","assertion":{"nick":"carol","cred_ref":"","authenticated":1,"paid":0,"iat":1800000000,"exp":1800000060,"nonce":"0000000000000000000000000000000b"},"expect":"malformed"},
+    {"name":"paid flag out of range","method":"GET","path":"/a","assertion":{"nick":"carol","cred_ref":"c1","authenticated":1,"paid":2,"iat":1800000000,"exp":1800000060,"nonce":"0000000000000000000000000000000c"},"expect":"malformed"}
+  ]
+}
