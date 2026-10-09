@@ -1,0 +1,28 @@
+# EDGE Caddyfile (the only place TLS terminates). Names come from env at render time; example names are placeholders.
+# Same upstream address the old single-host m4a used, so cutover does not touch this file.
+{
+	email <acme-email>
+}
+
+<entry-host-1>, <entry-host-2> {
+	# DNS-01 for names not yet publicly delegated (needs the Cloudflare DNS module build of Caddy):
+	# tls { dns cloudflare {env.CF_API_TOKEN} }
+	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+	}
+	# /edge/healthz is NOT proxied publicly; only these prefixes reach the edge process.
+	@api path /_matrix/* /.well-known/matrix/*
+	handle @api {
+		header /.well-known/matrix/* Access-Control-Allow-Origin "*"
+		reverse_proxy 127.0.0.1:18741 {
+			flush_interval -1
+		}
+	}
+	handle {
+		respond "not found" 404
+	}
+}
+
+# Federation port later (phase F): <entry-host-1>:8448 with the same reverse_proxy.
