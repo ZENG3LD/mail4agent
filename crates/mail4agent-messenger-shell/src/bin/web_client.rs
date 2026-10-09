@@ -53,6 +53,9 @@ fn main() {
         for (nick, event_id) in &report.pushed {
             println!("push {nick} event={event_id}");
         }
+        for (nick, text) in &report.alerts {
+            println!("alert {nick}: {text}");
+        }
         for (nick, room) in &report.joined {
             println!("joined {nick} room={room}");
         }

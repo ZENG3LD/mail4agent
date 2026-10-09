@@ -590,7 +590,7 @@ fn post_routine_bytes(url: &str, bytes: Vec<u8>, bearer: Option<&str>) -> Result
         ShellError::RoutineTransport(redact_wake(public_reqwest(&err), url, token))
     })?;
     let status = response.status().as_u16();
-    if status != 200 {
+    if !(200..300).contains(&status) {
         return Err(ShellError::RoutineStatus(status));
     }
     Ok(())
@@ -735,6 +735,8 @@ pub struct OpenedStore {
     leader_sent: HashSet<String>,
     /// Last wake failure, clipped. No bearer and no message body.
     wake_note: Option<String>,
+    /// Peer device key changes seen on `/keys/query` (M3). Plain words, no crypto jargon.
+    security_alerts: Vec<String>,
     wake_log: Vec<WakeAttempt>,
     /// Provider wake chain for a session that has no leader socket
     /// (Codex, Kimi, Claude, Cursor; Claude web / Codex cloud). Uses the
@@ -872,6 +874,7 @@ impl OpenedStore {
             wake_chain: None,
             wake_route: None,
             wake_note: None,
+            security_alerts: Vec::new(),
             wake_log: Vec::new(),
             bus: None,
             local_peers: Vec::new(),
@@ -1627,11 +1630,29 @@ impl OpenedStore {
         Ok(released)
     }
 
+    fn note_security_events(&mut self, events: &[mail4agent_messenger::MessengerEvent]) {
+        for event in events {
+            if let mail4agent_messenger::MessengerEvent::DeviceKeyChanged { user_id, device_id } = event {
+                self.security_alerts.push(format!(
+                    "{} reset its keys (device {}); trust cleared, room keys re-shared",
+                    user_id.as_str(),
+                    device_id.as_str()
+                ));
+            }
+        }
+    }
+
+    /// Drains peer key-change alerts (M3).
+    pub fn take_security_alerts(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.security_alerts)
+    }
+
     fn roundtrip(&mut self, request: &OutgoingRequest, now_ms: i64) -> Result<(), ShellError> {
         match self.fulfill(request) {
             Ok(response) => {
                 self.http_trace.push((request.kind, response.status));
-                self.core.on_response(request.id.clone(), response, now_ms);
+                let events = self.core.on_response(request.id.clone(), response, now_ms);
+                self.note_security_events(&events);
                 Ok(())
             }
             Err(err) => {
@@ -1758,7 +1779,8 @@ impl OpenedStore {
             Ok(response) => {
                 self.http_trace
                     .push((OutgoingRequestKind::Sync, response.status));
-                self.core.on_response(flight.id, response, now_ms);
+                let events = self.core.on_response(flight.id, response, now_ms);
+                self.note_security_events(&events);
             }
             Err(err) => {
                 self.core.on_transport_error(&flight.id, now_ms);

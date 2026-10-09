@@ -1281,6 +1281,8 @@ pub struct TickReport {
     pub errors: Vec<(String, String)>,
     /// (from nick, to nick, answer) for each `m4a-send` request finished.
     pub sent: Vec<(String, String, crate::SendReply)>,
+    /// `(nick, text)` peer key-change alerts (M3).
+    pub alerts: Vec<(String, String)>,
 }
 
 /// An open session still waiting for its bot's own routine.
@@ -2030,7 +2032,11 @@ impl MachineClient {
             }
             let store = &mut self.sessions[index];
             let nick = store.nick().unwrap_or("").to_string();
-            if let Err(err) = store.drive(now_ms, pushed) {
+            let drove = store.drive(now_ms, pushed);
+            for text in store.take_security_alerts() {
+                report.alerts.push((nick.clone(), text));
+            }
+            if let Err(err) = drove {
                 report.errors.push((nick.clone(), err.to_string()));
                 continue;
             }

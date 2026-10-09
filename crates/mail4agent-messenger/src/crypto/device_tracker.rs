@@ -75,9 +75,9 @@ pub struct StoredDevice {
     pub algorithms: Vec<String>,
     /// The device's self-reported display name, if any.
     pub display_name: Option<String>,
-    /// Whether the local user has verified this device. Never set `true`
-    /// by this module -- verification (SAS, cross-signing) is a later
-    /// piece.
+    /// Whether the local user trusts this device. Set `true` on first
+    /// sight (TOFU) or when a cross-signing signature checks out; cleared
+    /// on a same-device-id key change.
     pub verified: bool,
     /// Whether the local user has blocked this device. Never set `true` by
     /// this module.
@@ -286,8 +286,12 @@ impl DeviceTracker {
                             });
                         }
                         None => {
+                            // TOFU: first time we see this device id, trust it.
                             outcome.accepted_devices.push((user_id.clone(), device_id.clone()));
-                            merged.push(candidate);
+                            merged.push(StoredDevice {
+                                verified: true,
+                                ..candidate
+                            });
                         }
                     },
                     Err(reason) => {
@@ -504,6 +508,7 @@ mod tests {
         DeviceTracker::on_keys_query_response(&mut store, &first_body).expect("first query applies");
         let original =
             DeviceTracker::devices_for_user(&store, &bob).expect("no error").into_iter().next().expect("stored");
+        assert!(original.verified, "TOFU trusts the first-seen device");
 
         let reset_account = Account::new();
         let second_body =
@@ -517,5 +522,23 @@ mod tests {
         assert_ne!(stored.curve25519, original.curve25519, "new identity keys are applied");
         assert_eq!(stored.curve25519, reset_account.identity_keys().curve25519);
         assert!(!stored.verified, "verification is cleared on a key reset");
+    }
+
+    #[test]
+    fn first_seen_device_is_trusted_once() {
+        let mut store = new_store();
+        let bob = user("bob");
+        let dev1 = device("DEV1");
+        let account = Account::new();
+        let body = keys_query_body(&[(&bob, &dev1, signed_device_keys(&account, &bob, &dev1))]);
+        let outcome = DeviceTracker::on_keys_query_response(&mut store, &body).expect("query");
+        assert_eq!(outcome.accepted_devices, vec![(bob.clone(), dev1.clone())]);
+        let stored = DeviceTracker::devices_for_user(&store, &bob).expect("no error").into_iter().next().expect("stored");
+        assert!(stored.verified, "TOFU marks first sight verified");
+        // Re-publish same keys keeps verified.
+        let again = DeviceTracker::on_keys_query_response(&mut store, &body).expect("again");
+        assert!(again.key_changes.is_empty());
+        let stored = DeviceTracker::devices_for_user(&store, &bob).expect("no error").into_iter().next().expect("stored");
+        assert!(stored.verified, "unchanged re-publish keeps TOFU trust");
     }
 }

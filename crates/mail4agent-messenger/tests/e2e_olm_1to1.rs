@@ -81,7 +81,7 @@ impl TestClient {
             ed25519: identity.ed25519,
             algorithms: vec!["m.olm.v1.curve25519-aes-sha2".to_string(), "m.megolm.v1.aes-sha2".to_string()],
             display_name: None,
-            verified: false,
+            verified: true,
             blocked: false,
         }
     }

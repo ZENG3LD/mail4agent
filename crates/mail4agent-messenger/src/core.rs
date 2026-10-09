@@ -104,6 +104,7 @@
 //! [`MessengerCommand::RetryDecryption`].
 
 use crate::crypto::account::OlmAccountState;
+use crate::crypto::cross_signing::CrossSigningState;
 use crate::crypto::device_tracker::{DeviceTracker, StoredDevice};
 use crate::crypto::group_sessions::{GroupDecryptError, GroupSessionManager, RoomEventPlaintext};
 use crate::crypto::olm_sessions::{DecryptedToDevice, OlmDecryptError, OlmSessionManager};
@@ -881,6 +882,10 @@ pub struct MessengerCore<C: RecordCodec> {
     config: CoreConfig,
     store: Store<C>,
     account: OlmAccountState,
+    /// Automatic cross-signing state (M3), loaded lazily on the first sync.
+    xsign: Option<CrossSigningState>,
+    xsign_inflight: bool,
+    xsign_attempts: u8,
     outgoing: OutgoingQueue,
     counters: Counters,
     jitter: Box<dyn Jitter>,
@@ -1092,6 +1097,9 @@ impl<C: RecordCodec> MessengerCore<C> {
             events: Vec::new(),
             change_counter: 0,
             ingest_error: None,
+            xsign: None,
+            xsign_inflight: false,
+            xsign_attempts: 0,
         };
         core.rebuild_account_data_guard(&pending_requests);
         Ok(core)
@@ -1751,6 +1759,13 @@ impl<C: RecordCodec> MessengerCore<C> {
             }
         }
 
+        if is_terminal
+            && terminal_response.is_none()
+            && matches!(kind, Some(OutgoingRequestKind::SigningKeysUpload) | Some(OutgoingRequestKind::SignaturesUpload))
+        {
+            self.xsign_inflight = false;
+        }
+
         if let Some(txn_id) = send_owner {
             if let Some(response) = &terminal_response {
                 self.advance_send_on_success(&txn_id, &request_id, kind, response, now_ms);
@@ -1794,6 +1809,29 @@ impl<C: RecordCodec> MessengerCore<C> {
             }
             Some(OutgoingRequestKind::KeysUpload) => {
                 self.account.on_keys_upload_response(&mut self.store)?;
+            }
+            Some(OutgoingRequestKind::SigningKeysUpload) => {
+                self.xsign_inflight = false;
+                if let Some(state) = self.xsign.as_mut() {
+                    state.uploaded = true;
+                    let snapshot = state.clone();
+                    snapshot.save(&mut self.store)?;
+                }
+                self.maybe_enqueue_cross_signing()?;
+            }
+            Some(OutgoingRequestKind::SignaturesUpload) => {
+                self.xsign_inflight = false;
+                let failures_empty = serde_json::from_slice::<serde_json::Value>(&response.body)
+                    .ok()
+                    .and_then(|v| v.get("failures").and_then(|f| f.as_object()).map(|f| f.is_empty()))
+                    .unwrap_or(true);
+                if failures_empty {
+                    if let Some(state) = self.xsign.as_mut() {
+                        state.device_signed = true;
+                        let snapshot = state.clone();
+                        snapshot.save(&mut self.store)?;
+                    }
+                }
             }
             Some(OutgoingRequestKind::KeysQuery) => {
                 let outcome = DeviceTracker::on_keys_query_response(&mut self.store, &response.body)?;
@@ -2562,6 +2600,7 @@ impl<C: RecordCodec> MessengerCore<C> {
         {
             self.enqueue_request(request, Lane::Other)?;
         }
+        self.maybe_enqueue_cross_signing()?;
 
         // 4. any outdated tracked user -> one keys/query.
         let outdated_before_rooms = self.outdated_tracked_users()?;
@@ -2946,6 +2985,34 @@ impl<C: RecordCodec> MessengerCore<C> {
     /// asked about while still only invited comes back with no devices and
     /// would otherwise stay "up to date" with none after joining, and no later
     /// message would ever be shared with them.
+    /// M3: one step of automatic cross-signing. Keys first, then this
+    /// device's self-signature. At most a few attempts per process.
+    fn maybe_enqueue_cross_signing(&mut self) -> Result<(), MessengerError> {
+        if self.xsign_inflight || self.xsign_attempts >= 4 {
+            return Ok(());
+        }
+        if self.xsign.is_none() {
+            self.xsign = Some(CrossSigningState::load_or_create(&mut self.store)?);
+        }
+        let Some(state) = self.xsign.clone() else { return Ok(()) };
+        let user_id = self.config.user_id.clone();
+        let request_id;
+        let request = if !state.uploaded {
+            request_id = self.next_request_id()?;
+            OutgoingRequest::signing_keys_upload(request_id, state.upload_body(&user_id)?)
+        } else if !state.device_signed {
+            let device_id = self.config.device_id.clone();
+            let device_keys = self.account.device_keys_json(&user_id, &device_id)?;
+            request_id = self.next_request_id()?;
+            OutgoingRequest::signatures_upload(request_id, state.device_signature_body(&user_id, &device_id, device_keys)?)
+        } else {
+            return Ok(());
+        };
+        self.xsign_attempts += 1;
+        self.xsign_inflight = true;
+        self.enqueue_request(request, Lane::Other)
+    }
+
     fn track_joined_members<'a>(&mut self, room_id: &RoomId, events: impl Iterator<Item = &'a RawEvent>) -> Result<(), MessengerError> {
         if self.rooms.get(room_id).is_none_or(|room| room.encryption.is_none()) {
             return Ok(());

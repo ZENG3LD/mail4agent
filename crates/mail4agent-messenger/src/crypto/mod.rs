@@ -29,6 +29,7 @@
 //! together) are later pieces and are not present in this crate yet.
 
 pub mod account;
+pub mod cross_signing;
 pub mod device_tracker;
 pub mod group_sessions;
 pub mod olm_sessions;

@@ -468,6 +468,11 @@ fn two_shells_exchange_one_text_over_loopback() {
         !hits[0].0.to_ascii_lowercase().contains("authorization"),
         "routine post added a bearer"
     );
+    let trace = format!("{} || ALICE {}", describe(&bob), describe(&alice));
+    assert!(
+        trace.contains("SigningKeysUpload 200") && trace.contains("SignaturesUpload 200"),
+        "M3: automatic cross-signing did not upload keys and the device signature; {trace}"
+    );
     assert!(!hits[0].0.contains("/mail/send"));
     drop(hits);
     let ids = wake_event_ids(&routine, TEXT, "@alicepub:localhost");
@@ -884,7 +889,7 @@ fn three_local_shells_exchange_one_text_in_an_encrypted_group() {
 }
 
 #[test]
-fn three_local_shells_exchange_one_text_in_an_unencrypted_channel() {
+fn three_local_shells_exchange_one_text_in_an_encrypted_channel() {
     let mut boot = start_three_shells();
     let routine = start_routine();
     let (mut alice, mut bob, mut carol) = open_trio(&boot);
@@ -915,11 +920,11 @@ fn three_local_shells_exchange_one_text_in_an_unencrypted_channel() {
         )
         .expect("create channel");
     settle(&mut alice, &mut alice_now);
-    let room_id = wait_membership(&mut alice, &mut alice_now, "join", Some(false));
+    let room_id = wait_membership(&mut alice, &mut alice_now, "join", Some(true));
     join_room(&mut bob, &mut bob_now, &room_id);
     join_room(&mut carol, &mut carol_now, &room_id);
-    let _ = wait_membership(&mut bob, &mut bob_now, "join", Some(false));
-    let _ = wait_membership(&mut carol, &mut carol_now, "join", Some(false));
+    let _ = wait_membership(&mut bob, &mut bob_now, "join", Some(true));
+    let _ = wait_membership(&mut carol, &mut carol_now, "join", Some(true));
 
     let room = alice
         .rooms()
@@ -927,10 +932,15 @@ fn three_local_shells_exchange_one_text_in_an_unencrypted_channel() {
         .find(|room| room.room_id == room_id)
         .expect("alice room");
     assert!(
-        !room.encrypted,
-        "channel was encrypted; {}",
+        room.encrypted,
+        "channel must be end-to-end encrypted; {}",
         describe(&alice)
     );
+    // Alice must see both joins (and query their devices) before she encrypts.
+    for _ in 0..4 {
+        settle(&mut alice, &mut alice_now);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
     send_text(&mut alice, &mut alice_now, &room_id, CHANNEL_TEXT);
     wait_text(&mut bob, &mut bob_now, CHANNEL_TEXT);
     wait_text(&mut carol, &mut carol_now, CHANNEL_TEXT);
@@ -951,9 +961,9 @@ fn three_local_shells_exchange_one_text_in_an_unencrypted_channel() {
     let events = timeline_messages(&boot.temp.dir.join("messenger.db"), &boot.key_hex, &room_id);
     assert!(
         events.iter().any(|(event_id, event_type, content)| {
-            event_id == &ids[0] && event_type == "m.room.message" && content.contains(CHANNEL_TEXT)
+            event_id == &ids[0] && event_type == "m.room.encrypted" && !content.contains(CHANNEL_TEXT)
         }),
-        "channel timeline was not a plaintext m.room.message: {:?}",
+        "channel timeline was not m.room.encrypted: {:?}",
         events
             .iter()
             .map(|(id, kind, _)| format!("{id} {kind}"))
@@ -962,7 +972,7 @@ fn three_local_shells_exchange_one_text_in_an_unencrypted_channel() {
     assert!(
         events
             .iter()
-            .all(|(_, event_type, _)| event_type != "m.room.encrypted"),
-        "unencrypted channel stored m.room.encrypted"
+            .all(|(_, event_type, _)| event_type != "m.room.message"),
+        "encrypted channel stored a plaintext m.room.message"
     );
 }
