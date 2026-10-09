@@ -2092,7 +2092,7 @@ pub fn rooms_changed_in_window(
     // `events` and `receipts` are not scoped to `caller_user_id` at all
     // (any member's write counts), so both need the `room_id IN (...)`
     // restriction to the caller's own joined-room set.
-    for table in ["events", "receipts"] {
+    for table in ["events", "receipts", "pub_events"] {
         let sql = format!("SELECT DISTINCT room_id FROM {table} WHERE stream_id > ? AND stream_id <= ? AND room_id IN ({placeholders})");
         let mut stmt = conn.prepare(&sql)?;
         let mut bound: Vec<&dyn rusqlite::ToSql> = vec![&since_exclusive, &upto_inclusive];

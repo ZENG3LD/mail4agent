@@ -893,7 +893,7 @@ fn three_local_shells_exchange_one_text_in_an_encrypted_group() {
 }
 
 #[test]
-fn three_local_shells_exchange_one_text_in_an_encrypted_channel() {
+fn three_local_shells_exchange_one_text_in_a_public_plaintext_channel() {
     let mut boot = start_three_shells();
     let routine = start_routine();
     let (mut alice, mut bob, mut carol) = open_trio(&boot);
@@ -924,11 +924,11 @@ fn three_local_shells_exchange_one_text_in_an_encrypted_channel() {
         )
         .expect("create channel");
     settle(&mut alice, &mut alice_now);
-    let room_id = wait_membership(&mut alice, &mut alice_now, "join", Some(true));
+    let room_id = wait_membership(&mut alice, &mut alice_now, "join", Some(false));
     join_room(&mut bob, &mut bob_now, &room_id);
     join_room(&mut carol, &mut carol_now, &room_id);
-    let _ = wait_membership(&mut bob, &mut bob_now, "join", Some(true));
-    let _ = wait_membership(&mut carol, &mut carol_now, "join", Some(true));
+    let _ = wait_membership(&mut bob, &mut bob_now, "join", Some(false));
+    let _ = wait_membership(&mut carol, &mut carol_now, "join", Some(false));
 
     let room = alice
         .rooms()
@@ -936,8 +936,8 @@ fn three_local_shells_exchange_one_text_in_an_encrypted_channel() {
         .find(|room| room.room_id == room_id)
         .expect("alice room");
     assert!(
-        room.encrypted,
-        "channel must be end-to-end encrypted; {}",
+        !room.encrypted,
+        "channel is public plaintext; {}",
         describe(&alice)
     );
     // Alice must see both joins (and query their devices) before she encrypts.
@@ -962,23 +962,17 @@ fn three_local_shells_exchange_one_text_in_an_encrypted_channel() {
     drop(bob);
     drop(carol);
     stop_server(&mut boot.server);
-    let events = timeline_messages(&boot.temp.dir.join("messenger.db"), &boot.key_hex, &room_id);
+    // Public plaintext store: the post lives in pub_events, never in the closed events table.
+    let closed = timeline_messages(&boot.temp.dir.join("messenger.db"), &boot.key_hex, &room_id);
     assert!(
-        events.iter().any(|(event_id, event_type, content)| {
-            event_id == &ids[0] && event_type == "m.room.encrypted" && !content.contains(CHANNEL_TEXT)
-        }),
-        "channel timeline was not m.room.encrypted: {:?}",
-        events
-            .iter()
-            .map(|(id, kind, _)| format!("{id} {kind}"))
-            .collect::<Vec<_>>()
+        closed.iter().all(|(_, event_type, _)| event_type != "m.room.message" && event_type != "m.room.encrypted"),
+        "public channel post leaked into the closed events table: {closed:?}"
     );
-    assert!(
-        events
-            .iter()
-            .all(|(_, event_type, _)| event_type != "m.room.message"),
-        "encrypted channel stored a plaintext m.room.message"
-    );
+    let conn = init_messenger_db(boot.temp.dir.join("messenger.db").to_str().expect("utf-8"), &boot.key_hex).expect("reopen db");
+    let public: i64 = conn
+        .query_row("SELECT COUNT(*) FROM pub_events WHERE room_id = ?1 AND content LIKE ?2", rusqlite::params![room_id, format!("%{CHANNEL_TEXT}%")], |r| r.get(0))
+        .expect("pub_events");
+    assert_eq!(public, 1, "public post must live in pub_events");
 }
 
 #[test]
@@ -995,7 +989,11 @@ fn m4_late_joiner_decrypts_history_from_an_existing_member() {
     alice
         .dispatch(
             MessengerCommand::CreateRoom {
-                kind: CreateRoomKind::Channel { name: "history".to_string(), topic: None },
+                kind: CreateRoomKind::Group {
+                    name: "history".to_string(),
+                    invite: vec![mail4agent_messenger_shell::UserId::parse("@bobpub:localhost").expect("bob")],
+                    members_can_invite: true,
+                },
             },
             alice_now,
         )
@@ -1011,7 +1009,17 @@ fn m4_late_joiner_decrypts_history_from_an_existing_member() {
     send_text(&mut alice, &mut alice_now, &room_id, LATE_TEXT);
     wait_text(&mut bob, &mut bob_now, LATE_TEXT);
 
-    // Carol joins only now: the text predates her membership.
+    // Carol is invited and joins only now: the text predates her membership.
+    alice
+        .dispatch(
+            MessengerCommand::Invite {
+                room_id: RoomId::parse(&room_id).expect("room id"),
+                user_id: mail4agent_messenger_shell::UserId::parse("@carolpub:localhost").expect("carol"),
+            },
+            alice_now,
+        )
+        .expect("invite carol");
+    settle(&mut alice, &mut alice_now);
     join_room(&mut carol, &mut carol_now, &room_id);
     let _ = wait_membership(&mut carol, &mut carol_now, "join", Some(true));
     let mut saw = false;
@@ -1047,7 +1055,7 @@ fn m5_rich_commands_roundtrip() {
         as_nick: "x".to_string(),
         args,
     };
-    let made = alice.run_command(&cmd("rooms.create", serde_json::json!({"name": "m5chan", "kind": "channel"})), alice_now);
+    let made = alice.run_command(&cmd("rooms.create", serde_json::json!({"name": "m5chan", "kind": "group", "invite": ["@bobpub:localhost"]})), alice_now);
     assert!(made.ok, "create: {:?}", made.error);
     alice_now += 10_000;
     let room_id = made.data["room"].as_str().unwrap_or_else(|| panic!("room id; {}", describe(&alice))).to_string();
