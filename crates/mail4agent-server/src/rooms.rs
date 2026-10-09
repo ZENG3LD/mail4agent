@@ -33,6 +33,9 @@ pub struct CreateRoomRequest {
     /// never believes an alias was actually set.
     #[serde(default)]
     pub room_alias_name: Option<String>,
+    /// Only `type: "m.space"` is honored; any other `type` is refused.
+    #[serde(default)]
+    pub creation_content: Option<serde_json::Value>,
     // `preset`/`initial_state` are intentionally NOT fields here: every
     // bootstrap state event is server-derived from `kind` (§5), never
     // client-declared, and serde ignores unrecognized JSON keys by default
@@ -263,6 +266,10 @@ pub fn check_encryption_state_change(event_type: &str, join_rule: JoinRule, alre
 pub fn check_state_event_type_allowed(event_type: &str, state_key: &str, caller_mxid: &str, content_str: &str) -> Result<(), MatrixError> {
     if event_type == "m.room.create" {
         return Err(MatrixError::forbidden("m.room.create cannot be modified"));
+    }
+    if event_type == "m.space.child" || event_type == "m.space.parent" {
+        let value: serde_json::Value = serde_json::from_str(content_str)?;
+        crate::spaces::validate_space_state(event_type, &value)?;
     }
     if event_type == "m.room.member" {
         let membership: Option<String> = serde_json::from_str::<serde_json::Value>(content_str)
@@ -647,6 +654,8 @@ pub struct RoomCreate<'a> {
     pub power_level_content_override: Option<serde_json::Value>,
     pub name: Option<&'a str>,
     pub topic: Option<&'a str>,
+    /// `creation_content.type`; only `m.space` is accepted (a domain).
+    pub room_type: Option<&'a str>,
 }
 
 pub enum RoomCreation {
@@ -687,7 +696,10 @@ pub fn apply_create_room(
         "m.room.create",
         "",
         req.creator_user_id,
-        serde_json::json!({ "room_version": crate::store::MATRIX_ROOM_VERSION }),
+        match req.room_type {
+            Some(t) => serde_json::json!({ "room_version": crate::store::MATRIX_ROOM_VERSION, "type": t }),
+            None => serde_json::json!({ "room_version": crate::store::MATRIX_ROOM_VERSION }),
+        },
     )];
     state_events.extend(bootstrap_member_events(
         kind,
@@ -777,7 +789,7 @@ pub fn decide_and_apply_join(
         Some(Membership::Ban) => return Err(MatrixError::forbidden("banned from this room")),
         Some(Membership::Invite) => {}
         Some(Membership::Leave) | None => {
-            if room.join_rule != JoinRule::Public {
+            if room.join_rule != JoinRule::Public && !crate::spaces::restricted_allows(conn, room_id, caller_user_id)? {
                 return Err(MatrixError::forbidden("no invitation to this room"));
             }
         }

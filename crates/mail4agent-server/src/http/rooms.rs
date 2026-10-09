@@ -40,6 +40,35 @@ pub(super) fn routes() -> Router<Arc<Homeserver>> {
         )
         .route("/client/v3/rooms/{room_id}/members", get(get_members))
         .route("/client/v3/rooms/{room_id}/joined_members", get(get_joined_members))
+        .route("/client/v1/rooms/{room_id}/hierarchy", get(get_hierarchy))
+}
+
+#[derive(serde::Deserialize)]
+struct HierarchyQuery {
+    #[serde(default)]
+    suggested_only: bool,
+    limit: Option<usize>,
+    max_depth: Option<usize>,
+    from: Option<String>,
+}
+
+async fn get_hierarchy(
+    State(state): State<Arc<Homeserver>>,
+    headers: HeaderMap,
+    Path(room_id): Path<String>,
+    Query(q): Query<HierarchyQuery>,
+) -> Result<Json<serde_json::Value>, MatrixError> {
+    let caller = resolve_caller(&state, &headers, None).await?;
+    let from = match q.from.as_deref() {
+        None => 0,
+        Some(t) => t.strip_prefix('h').and_then(|n| n.parse::<usize>().ok()).ok_or_else(|| MatrixError::invalid_param("bad from token"))?,
+    };
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    let value = with_conn(&state, move |conn| {
+        crate::spaces::hierarchy(conn, caller.user_id, &room_id, q.suggested_only, limit, q.max_depth, from)
+    })
+    .await?;
+    value.map(Json).ok_or_else(|| MatrixError::not_found("room not found or not visible"))
 }
 
 /// Database work for one request. The mutex guard dies at the end of the
@@ -105,6 +134,11 @@ async fn create_room(
     let visibility_public = req.visibility.as_deref() == Some("public");
     let kind = derive_room_kind(req.is_direct, req.invite.len(), visibility_public)?;
     validate_power_level_override(kind, &req.power_level_content_override)?;
+    let room_type: Option<&'static str> = match req.creation_content.as_ref().and_then(|c| c.get("type")) {
+        None => None,
+        Some(t) if t.as_str() == Some(crate::spaces::SPACE_TYPE) => Some(crate::spaces::SPACE_TYPE),
+        Some(_) => return Err(MatrixError::invalid_param("only creation_content.type m.space is supported")),
+    };
     if req.room_alias_name.as_deref().is_some_and(|alias| !alias.is_empty()) {
         return Err(MatrixError::invalid_param("room aliases are not supported"));
     }
@@ -135,6 +169,7 @@ async fn create_room(
                 power_level_content_override: req.power_level_content_override,
                 name: req.name.as_deref(),
                 topic: req.topic.as_deref(),
+                room_type,
             },
             &now,
             origin_ts,
