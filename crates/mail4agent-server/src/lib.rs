@@ -11,6 +11,11 @@
 //! build of rusqlite (crate feature `sqlcipher`).
 
 pub mod account;
+pub mod account_source;
+pub mod accounts;
+pub mod external_login;
+pub mod nick_policy;
+pub mod policy;
 pub mod ephemeral;
 pub mod error;
 pub mod events;

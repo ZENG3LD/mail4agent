@@ -52,6 +52,32 @@ impl MatrixError {
         Self::new(401, "M_UNAUTHORIZED", msg)
     }
 
+    /// Nick fails the grammar or a forbidden list (`M4A_INVALID_NICK`, 400).
+    pub fn invalid_nick(msg: impl Into<String>) -> Self {
+        Self::new(400, "M4A_INVALID_NICK", msg)
+    }
+
+    /// Nick equals another live nick, a frozen localpart or a reserved one (`M4A_NICK_TAKEN`, 409).
+    pub fn nick_taken() -> Self {
+        Self::new(409, "M4A_NICK_TAKEN", "nick is taken")
+    }
+
+    /// An issuer asserted a nick that collides with another account's localpart
+    /// (`M4A_NICK_CONFLICT`, 409). The issuer must pick another nick.
+    pub fn nick_conflict() -> Self {
+        Self::new(409, "M4A_NICK_CONFLICT", "nick conflicts with an existing account; choose another nick")
+    }
+
+    /// Nick changed too recently (`M4A_NICK_COOLDOWN`, 429).
+    pub fn nick_cooldown(retry_after_ms: u64) -> Self {
+        Self { retry_after_ms: Some(retry_after_ms), ..Self::new(429, "M4A_NICK_COOLDOWN", "nick was changed recently") }
+    }
+
+    /// The deployment's policy hook refused the action (`M4A_POLICY_DENIED`, 403).
+    pub fn policy_denied(msg: impl Into<String>) -> Self {
+        Self::new(403, "M4A_POLICY_DENIED", msg)
+    }
+
     pub fn forbidden(msg: impl Into<String>) -> Self {
         Self::new(403, "M_FORBIDDEN", msg)
     }

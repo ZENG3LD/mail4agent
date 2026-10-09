@@ -465,6 +465,18 @@ impl Default for HttpKeyFetcher {
 }
 
 impl HttpKeyFetcher {
+    /// Unauthenticated GET of `uri` (full path and query) on `server`; `(status, json)`.
+    pub async fn get_unsigned(&self, server: &str, uri: &str) -> Result<(u16, Value), FedError> {
+        let base = self.base_url(server).await?;
+        let resp = self.client.get(format!("{base}{uri}")).send().await.map_err(|e| FedError::Network(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let bytes = resp.bytes().await.map_err(|e| FedError::Network(e.to_string()))?;
+        if bytes.len() > 64 * 1024 {
+            return Err(FedError::Network("body too large".into()));
+        }
+        Ok((status, serde_json::from_slice(&bytes).unwrap_or(Value::Null)))
+    }
+
     /// Base URL (`scheme://authority`) for a server name: staging override,
     /// else `.well-known` delegation, else `name:8448`.
     pub async fn base_url(&self, server: &str) -> Result<String, FedError> {

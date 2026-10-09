@@ -553,7 +553,8 @@ pub fn create_matrix_schema(conn: &Connection) -> rusqlite::Result<()> {
     crate::public_channels::create_public_schema(conn)?;
     crate::public_forum::create_forum_schema(conn)?;
     crate::media::create_media_schema(conn)?;
-    crate::fed_rooms::create_fed_schema(conn)
+    crate::fed_rooms::create_fed_schema(conn)?;
+    crate::accounts::create_accounts_schema(conn)
 }
 
 /// Open (creating if absent) the SQLCipher-encrypted `messenger.db` at
