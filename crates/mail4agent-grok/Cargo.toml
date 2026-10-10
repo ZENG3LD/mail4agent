@@ -4,7 +4,10 @@ version = "0.1.3"
 edition = "2021"
 description = "Model-less courier from a mail4agent doorbell into a Grok session, over the leader pipe or one webhook POST."
 license = "MIT"
-publish = false
+repository = "https://github.com/ZENG3LD/mail4agent"
+readme = "README.md"
+keywords = ["agent","grok","courier"]
+categories = ["command-line-utilities"]
 
 [[bin]]
 name = "mail4agent-grok"

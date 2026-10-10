@@ -1,5 +1,5 @@
 mail4agent-vodozemac
-Copyright 2026 Nemo Trading
+Copyright 2026 the mail4agent authors
 
 This product includes a reduced, modified fork of "vodozemac", a Rust
 implementation of the Olm and Megolm cryptographic ratchets and the SAS
@@ -16,7 +16,7 @@ Copyright 2021-2024 Damir Jelic, Denis Kasak, and the vodozemac contributors
 This fork removes the `ecies`, `hazmat`, and `pk_encryption` modules, the
 `libolm-compat` and MSC3814 device-dehydration code paths, and the `olm-rs`
 (C libolm FFI) dev-dependency and every test that depends on it; it keeps
-`olm`, `megolm`, `types`, `cipher`, `utilities`, and `sas`. See FORK.md for
+`olm`, `megolm`, `types`, `cipher`, `utilities`, and `sas`. Every modified source file carries a notice saying so. See FORK.md for
 the itemized list of local changes and the upstream-delta-review procedure.
 
 Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -30,3 +30,7 @@ distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 License for the specific language governing permissions and limitations
 under the License.
+
+"vodozemac" and the names of its authors and of the Matrix.org Foundation are
+used here only to identify the origin of the code. This crate is not
+affiliated with, endorsed by or supported by them; no trademark is claimed.

@@ -4,8 +4,13 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
-publish = false
-description = "Vendored, reduced fork of vodozemac 0.10.0 (Olm, Megolm, SAS) -- see FORK.md."
+repository = "https://github.com/ZENG3LD/mail4agent"
+readme = "README.md"
+authors = ["Damir Jelić <poljar@termina.org.uk>", "Denis Kasak <dkasak@termina.org.uk>", "the mail4agent authors"]
+keywords = ["matrix", "olm", "megolm", "e2ee", "fork"]
+categories = ["cryptography"]
+include = ["src/**", "Cargo.toml", "README.md", "LICENSE", "NOTICE", "FORK.md", "clippy.toml"]
+description = "Vendored, reduced and modified fork of vodozemac 0.10.0 (Olm, Megolm, SAS), Apache-2.0, upstream attribution in NOTICE and FORK.md. Not the upstream crate."
 
 [lib]
 name = "mail4agent_vodozemac"

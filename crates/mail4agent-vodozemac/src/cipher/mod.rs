@@ -1,3 +1,4 @@
+// Modified from vodozemac 0.10.0 by the mail4agent authors (this file differs from upstream; see FORK.md).
 // Copyright 2021 The Matrix.org Foundation C.I.C.
 // Copyright 2021 Damir Jelić
 //
