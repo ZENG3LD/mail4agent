@@ -17,6 +17,7 @@ use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
 use crate::error::MatrixError;
+#[cfg(feature = "legacy-local")]
 use crate::keys::CredentialKind;
 use crate::live::{ClaimRateLimiter, LiveRegistry};
 use crate::typing::TypingRegistry;
@@ -29,6 +30,7 @@ mod federation;
 pub mod fed_net;
 mod keys;
 mod messaging;
+#[cfg(feature = "legacy-local")]
 mod register;
 mod rooms;
 mod push;
@@ -134,6 +136,17 @@ pub async fn resolve_caller(
         .await
         .map_err(|_| MatrixError::internal())?;
     }
+    #[cfg(not(feature = "legacy-local"))]
+    {
+        let _ = query_token;
+        return Err(MatrixError::missing_token());
+    }
+    #[cfg(feature = "legacy-local")]
+    resolve_bearer(state, headers, query_token).await
+}
+
+#[cfg(feature = "legacy-local")]
+async fn resolve_bearer(state: &Arc<Homeserver>, headers: &HeaderMap, query_token: Option<&str>) -> Result<Caller, MatrixError> {
     let Some(raw) = raw_token(headers, query_token) else {
         return Err(MatrixError::missing_token());
     };
@@ -179,7 +192,7 @@ pub fn router(state: Arc<Homeserver>) -> Router {
         .merge(messaging::routes())
         .merge(ephemeral::routes())
         .merge(account::routes())
-        .merge(register::routes())
+        .merge(legacy_routes())
         .merge(keys::routes())
         .merge(sync::routes())
         .merge(push::routes())
@@ -253,4 +266,14 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(value["errcode"], "M_UNRECOGNIZED");
     }
+}
+
+#[cfg(feature = "legacy-local")]
+fn legacy_routes() -> Router<Arc<Homeserver>> {
+    register::routes()
+}
+
+#[cfg(not(feature = "legacy-local"))]
+fn legacy_routes() -> Router<Arc<Homeserver>> {
+    Router::new()
 }

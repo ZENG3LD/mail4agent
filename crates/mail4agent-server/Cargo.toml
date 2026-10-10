@@ -11,7 +11,11 @@ name = "mail4agent_server"
 path = "src/lib.rs"
 
 [features]
-default = []
+# TRANSITIONAL: device-bearer sessions, POST /register and the bootstrap user. A product
+# server replaces all three (see the product-boundary plan); the shell client still
+# needs them until it gets a product-session mode, then this feature is deleted.
+default = ["legacy-local"]
+legacy-local = []
 # Turns `PRAGMA key` into real SQLCipher. Off by default so a workspace
 # build of the mailbox daemon does not link OpenSSL. The builder enables
 # this on the binary that opens `init_messenger_db`.
