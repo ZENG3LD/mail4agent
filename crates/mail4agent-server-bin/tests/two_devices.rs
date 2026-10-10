@@ -4,22 +4,18 @@
 //! first. Tokens below are fixtures, not operator credentials. The raw
 //! database key is generated at runtime and is not printed.
 
+#[path = "support_product.rs"]
+mod support_product;
+
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use mail4agent_server::http::hash_token;
-use mail4agent_server::keys::{self, CredentialKind};
-use mail4agent_server::nick;
-use mail4agent_server::store::{self, init_messenger_db};
 use tungstenite::{stream::MaybeTlsStream, Message};
 
-const ALICE_TOKEN: &str = "fake-alice-token";
-const BOB_TOKEN: &str = "fake-bob-token";
 const TEXT: &str = "two-device-hello";
-const NOW: &str = "2026-10-05T00:00:00+00:00";
 
 struct StopServer(Option<Child>);
 
@@ -54,37 +50,6 @@ fn random_key_hex() -> String {
         .read_exact(&mut bytes)
         .expect("urandom read");
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn seed(db: &std::path::Path, key_hex: &str) {
-    match store::set_matrix_server_name("localhost") {
-        Ok(()) => {}
-        Err(_) if store::matrix_server_name() == "localhost" => {}
-        Err(err) => panic!("server name: {err}"),
-    }
-    let conn = init_messenger_db(db.to_str().expect("utf-8"), key_hex).expect("open db");
-    store::ensure_matrix_user(&conn, 1, "alicepub", NOW).expect("alice");
-    store::ensure_matrix_user(&conn, 2, "bobpub", NOW).expect("bob");
-    nick::set_nick(&conn, 1, "alice_nick").expect("alice nick");
-    nick::set_nick(&conn, 2, "bob_nick").expect("bob nick");
-    keys::create_device(
-        &conn,
-        1,
-        CredentialKind::Bearer,
-        &hash_token(ALICE_TOKEN),
-        NOW,
-    )
-    .expect("alice device");
-    keys::create_device(
-        &conn,
-        2,
-        CredentialKind::Bearer,
-        &hash_token(BOB_TOKEN),
-        NOW,
-    )
-    .expect("bob device");
-    conn.execute_batch("PRAGMA wal_checkpoint(FULL);")
-        .expect("checkpoint");
 }
 
 fn encode_path(segment: &str) -> String {
@@ -161,7 +126,6 @@ fn two_devices_exchange_one_private_room_message() {
     std::fs::create_dir_all(&temp.dir).expect("tmpdir");
     let db = temp.dir.join("messenger.db");
     let key_hex = random_key_hex();
-    seed(&db, &key_hex);
 
     let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
     let port = probe.local_addr().expect("addr").port();
@@ -187,23 +151,30 @@ fn two_devices_exchange_one_private_room_message() {
             "localhost",
         ])
         .env("M4A_DB_KEY_HEX", &key_hex)
-        .env_remove("M4A_BOOTSTRAP_PUBLIC_ID")
-        .env_remove("M4A_BOOTSTRAP_NICK")
-        .env_remove("M4A_BOOTSTRAP_TOKEN")
+        .env("M4A_ASSERTION_SECRET", support_product::SEAM_SECRET)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn server");
     let mut server = StopServer(Some(child));
     wait_until_accepts(&addr);
+    // Clients talk to a product server in front of the core; its users are real product users.
+    let product = support_product::start_product(&format!("http://{addr}"));
+    let alice_token = support_product::product_user(&product, "alice");
+    let bob_token = support_product::product_user(&product, "bob");
+    let addr = product.url.trim_start_matches("http://").to_string();
+    for token in [&alice_token, &bob_token] {
+        // First contact: the messenger learns the identity from the product's assertion.
+        assert_eq!(http(&addr, "GET", "/client/v3/account/whoami", token, None).0, 200);
+    }
 
     let (create_status, create_raw) = http(
         &addr,
         "POST",
         "/client/v3/createRoom",
-        ALICE_TOKEN,
+        &alice_token,
         Some(
-            r#"{"visibility":"private","is_direct":false,"invite":["@bobpub:localhost"],"name":"private"}"#,
+            r#"{"visibility":"private","is_direct":false,"invite":["@bob:localhost"],"name":"private"}"#,
         ),
     );
     assert_eq!(create_status, 200, "createRoom: {create_raw}");
@@ -216,13 +187,13 @@ fn two_devices_exchange_one_private_room_message() {
         &addr,
         "POST",
         &format!("/client/v3/rooms/{room_path}/join"),
-        BOB_TOKEN,
+        &bob_token,
         Some("{}"),
     );
     assert_eq!(join_status, 200, "join: {join_raw}");
 
     let (since_status, since_raw) =
-        http(&addr, "GET", "/client/v3/sync?timeout=0", BOB_TOKEN, None);
+        http(&addr, "GET", "/client/v3/sync?timeout=0", &bob_token, None);
     assert_eq!(since_status, 200, "bob sync before send: {since_raw}");
     let since_json: serde_json::Value =
         serde_json::from_str(response_body(&since_raw)).expect("since json");
@@ -238,7 +209,7 @@ fn two_devices_exchange_one_private_room_message() {
         &addr,
         "PUT",
         &format!("/client/v3/rooms/{room_path}/send/m.room.encrypted/txn-two-devices"),
-        ALICE_TOKEN,
+        &alice_token,
         Some(&send_body),
     );
     assert_eq!(send_status, 200, "send: {send_raw}");
@@ -250,7 +221,7 @@ fn two_devices_exchange_one_private_room_message() {
         &addr,
         "GET",
         &format!("/client/v3/sync?timeout=0&since={since}"),
-        BOB_TOKEN,
+        &bob_token,
         None,
     );
     assert_eq!(sync_status, 200, "bob sync after send: {sync_raw}");
@@ -292,7 +263,6 @@ fn encrypted_event_is_pushed_to_session_b_and_not_session_a() {
     std::fs::create_dir_all(&temp.dir).expect("tmpdir");
     let db = temp.dir.join("messenger.db");
     let key_hex = random_key_hex();
-    seed(&db, &key_hex);
 
     let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
     let port = probe.local_addr().expect("addr").port();
@@ -312,23 +282,30 @@ fn encrypted_event_is_pushed_to_session_b_and_not_session_a() {
             "localhost",
         ])
         .env("M4A_DB_KEY_HEX", &key_hex)
-        .env_remove("M4A_BOOTSTRAP_PUBLIC_ID")
-        .env_remove("M4A_BOOTSTRAP_NICK")
-        .env_remove("M4A_BOOTSTRAP_TOKEN")
+        .env("M4A_ASSERTION_SECRET", support_product::SEAM_SECRET)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn server");
     let mut server = StopServer(Some(child));
     wait_until_accepts(&addr);
+    // Clients talk to a product server in front of the core; its users are real product users.
+    let product = support_product::start_product(&format!("http://{addr}"));
+    let alice_token = support_product::product_user(&product, "alice");
+    let bob_token = support_product::product_user(&product, "bob");
+    let addr = product.url.trim_start_matches("http://").to_string();
+    for token in [&alice_token, &bob_token] {
+        // First contact: the messenger learns the identity from the product's assertion.
+        assert_eq!(http(&addr, "GET", "/client/v3/account/whoami", token, None).0, 200);
+    }
 
     let (create_status, create_raw) = http(
         &addr,
         "POST",
         "/client/v3/createRoom",
-        ALICE_TOKEN,
+        &alice_token,
         Some(
-            r#"{"visibility":"private","is_direct":false,"invite":["@bobpub:localhost"],"name":"encrypted-push"}"#,
+            r#"{"visibility":"private","is_direct":false,"invite":["@bob:localhost"],"name":"encrypted-push"}"#,
         ),
     );
     assert_eq!(create_status, 200, "createRoom: {create_raw}");
@@ -341,29 +318,28 @@ fn encrypted_event_is_pushed_to_session_b_and_not_session_a() {
         &addr,
         "POST",
         &format!("/client/v3/rooms/{room_path}/join"),
-        BOB_TOKEN,
+        &bob_token,
         Some("{}"),
     );
     assert_eq!(join_status, 200, "join: {join_raw}");
 
-    let (mut socket, _) =
-        tungstenite::connect(format!("ws://{addr}/client/v3/push")).expect("push socket");
-    match socket.get_mut() {
-        MaybeTlsStream::Plain(tcp) => {
-            tcp.set_read_timeout(Some(Duration::from_millis(800)))
-                .expect("timeout");
+    // One socket per identity; the product signs each handshake.
+    let open = |token: &str| {
+        let mut req = tungstenite::client::IntoClientRequest::into_client_request(format!("ws://{addr}/client/v3/push")).expect("request");
+        req.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
+        let (mut socket, _) = tungstenite::connect(req).expect("push socket");
+        match socket.get_mut() {
+            MaybeTlsStream::Plain(tcp) => {
+                tcp.set_read_timeout(Some(Duration::from_millis(800))).expect("timeout");
+            }
+            _ => panic!("loopback push socket was not plain"),
         }
-        _ => panic!("loopback push socket was not plain"),
-    }
-    let register = format!(r#"{{"type":"register","tokens":["{ALICE_TOKEN}","{BOB_TOKEN}"]}}"#);
-    socket
-        .send(Message::text(register))
-        .expect("register frame");
-    let registered = read_ws_text(&mut socket).expect("registered frame");
-    assert!(
-        registered.contains(r#""type":"registered""#),
-        "socket did not register: {registered}"
-    );
+        let registered = read_ws_text(&mut socket).expect("registered frame");
+        assert!(registered.contains(r#""type":"registered""#), "socket did not register: {registered}");
+        socket
+    };
+    let mut socket = open(&bob_token);
+    let mut alice_socket = open(&alice_token);
 
     let planted = "not-the-push-body";
     let send_body = format!(
@@ -373,7 +349,7 @@ fn encrypted_event_is_pushed_to_session_b_and_not_session_a() {
         &addr,
         "PUT",
         &format!("/client/v3/rooms/{room_path}/send/m.room.encrypted/txn-encrypted-push"),
-        ALICE_TOKEN,
+        &alice_token,
         Some(&send_body),
     );
     assert_eq!(send_status, 200, "send: {send_raw}");
@@ -389,8 +365,8 @@ fn encrypted_event_is_pushed_to_session_b_and_not_session_a() {
     assert_eq!(value["type"], "event");
     assert_eq!(value["v"], 1, "push v1 required");
     assert_eq!(value["event"]["room"], room_id);
-    assert_eq!(value["event"]["sender"], "@alicepub:localhost");
-    assert_eq!(value["event"]["recipient"], "@bobpub:localhost");
+    assert_eq!(value["event"]["sender"], "@alice:localhost");
+    assert_eq!(value["event"]["recipient"], "@bob:localhost");
     assert_eq!(value["event"]["event_id"], event_id);
     assert_eq!(value["event"]["wire_type"], "m.room.encrypted");
     assert!(
@@ -398,13 +374,13 @@ fn encrypted_event_is_pushed_to_session_b_and_not_session_a() {
         "body key on encrypted push"
     );
 
-    match read_ws_text(&mut socket) {
+    match read_ws_text(&mut alice_socket) {
         Err(err) if err == "timeout" => {}
         Ok(extra) => panic!("session A also received a push: {extra}"),
-        Err(err) => panic!("second read: {err}"),
+        Err(err) => panic!("alice read: {err}"),
     }
 
-    let (sync_status, sync_raw) = http(&addr, "GET", "/client/v3/sync?timeout=0", BOB_TOKEN, None);
+    let (sync_status, sync_raw) = http(&addr, "GET", "/client/v3/sync?timeout=0", &bob_token, None);
     assert_eq!(sync_status, 200, "sync: {sync_raw}");
     let sync_body = response_body(&sync_raw);
     assert!(
