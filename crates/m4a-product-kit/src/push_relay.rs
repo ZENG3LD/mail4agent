@@ -34,10 +34,24 @@ impl EdgeLink {
                 req.headers_mut().insert(axum::http::HeaderName::from_static(m4a_seam::LINK_TOKEN_HEADER), tv);
             }
         }
-        let Ok((upstream, _)) = tokio_tungstenite::connect_async(req).await else {
-            let _ = client.send(AMsg::Close(None)).await;
-            return;
-        };
+        if let Some(path) = &self.socket {
+            if let Ok(stream) = tokio::net::UnixStream::connect(path).await {
+                if let Ok((upstream, _)) = tokio_tungstenite::client_async(req, stream).await {
+                    return pump(client, upstream).await;
+                }
+            }
+        } else if let Ok((upstream, _)) = tokio_tungstenite::connect_async(req).await {
+            return pump(client, upstream).await;
+        }
+        let _ = client.send(AMsg::Close(None)).await;
+    }
+}
+
+async fn pump<S>(client: WebSocket, upstream: tokio_tungstenite::WebSocketStream<S>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    {
         let (mut c_tx, mut c_rx) = client.split();
         let (mut u_tx, mut u_rx) = upstream.split();
         let up = async {

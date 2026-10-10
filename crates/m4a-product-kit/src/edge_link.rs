@@ -25,17 +25,27 @@ pub struct EdgeLink {
     pub assertion_header: String,
     /// Barrier token for the link (`M4A_LINK_TOKEN`), sent in `x-m4a-link-token`.
     pub link_token: Option<String>,
+    /// Set when `base` was `unix:/path`: the link runs over that unix socket.
+    pub(crate) socket: Option<String>,
     client: reqwest::Client,
 }
 
 impl EdgeLink {
+    /// `base` is `http://host:port` (TCP or WireGuard address) or `unix:/path/to.sock`
+    /// for a co-located edge.
     pub fn new(base: &str, secret: Vec<u8>, assertion_header: Option<String>) -> Self {
+        let socket = base.strip_prefix("unix:").map(str::to_string);
+        let mut cb = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+        if let Some(path) = &socket {
+            cb = cb.unix_socket(path.clone());
+        }
         Self {
-            base: base.trim_end_matches('/').to_string(),
+            socket: socket.clone(),
+            client: cb.build().expect("client"),
+            base: if socket.is_some() { "http://m4a-edge.local".to_string() } else { base.trim_end_matches('/').to_string() },
             secret,
             assertion_header: assertion_header.unwrap_or_else(|| m4a_seam::DEFAULT_ASSERTION_HEADER.into()).to_ascii_lowercase(),
             link_token: None,
-            client: reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().expect("client"),
         }
     }
 

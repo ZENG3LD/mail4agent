@@ -25,6 +25,12 @@ async fn serve(app: axum::Router) -> SocketAddr {
     a
 }
 
+fn serve_unix(app: axum::Router, path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+    let l = tokio::net::UnixListener::bind(path).unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+}
+
 struct FakeDoor;
 impl LoginDoor for FakeDoor {
     fn id(&self) -> &str {
@@ -43,14 +49,33 @@ struct Stack {
 }
 
 async fn stack() -> Stack {
+    stack_with(None).await
+}
+
+/// With `unix_dir`, product -> edge and edge -> core run over unix sockets in that directory.
+async fn stack_with(unix_dir: Option<&std::path::Path>) -> Stack {
     let conn = Connection::open_in_memory().unwrap();
     mail4agent_server::store::create_matrix_schema(&conn).unwrap();
     mail4agent_server::keys::create_matrix_keys_schema(&conn).unwrap();
     let core = Arc::new(Homeserver::new(conn));
     let _ = core.seam.set(Arc::new(Seam::new(vec![SEAM_SECRET.to_vec()], 30, None, None)));
-    let core_addr = serve(require_edge_secret(mail4agent_server::http::router(core.clone()), EDGE_SECRET.to_string())).await;
-    let edge_addr = serve(m4a_edge::edge_router(m4a_edge::EdgeConfig { core_url: format!("http://{core_addr}"), secret: EDGE_SECRET.into(), link_token: Some(LINK.into()) })).await;
-    let link = EdgeLink::new(&format!("http://{edge_addr}"), SEAM_SECRET.to_vec(), None).with_link_token(Some(LINK.into()));
+    let core_app = require_edge_secret(mail4agent_server::http::router(core.clone()), EDGE_SECRET.to_string());
+    let (core_url, edge_url) = match unix_dir {
+        Some(d) => {
+            serve_unix(core_app, &d.join("core.sock"));
+            (format!("unix:{}", d.join("core.sock").display()), format!("unix:{}", d.join("edge.sock").display()))
+        }
+        None => (format!("http://{}", serve(core_app).await), String::new()),
+    };
+    let edge_app = m4a_edge::edge_router(m4a_edge::EdgeConfig { core_url, secret: EDGE_SECRET.into(), link_token: Some(LINK.into()) });
+    let edge_url = match unix_dir {
+        Some(d) => {
+            serve_unix(edge_app, &d.join("edge.sock"));
+            edge_url
+        }
+        None => format!("http://{}", serve(edge_app).await),
+    };
+    let link = EdgeLink::new(&edge_url, SEAM_SECRET.to_vec(), None).with_link_token(Some(LINK.into()));
     let app = Arc::new(ProductApp {
         users: UserService::new(Arc::new(SqliteStore::memory().unwrap()), NickRules::default(), TierTable::default()),
         events: EventPublisher::spawn(link.clone(), None, Duration::from_millis(50)),
@@ -59,7 +84,7 @@ async fn stack() -> Stack {
         doors: vec![Arc::new(FakeDoor)],
     });
     let product = format!("http://{}", serve(router(app)).await);
-    Stack { edge: format!("http://{edge_addr}"), core, product, c: reqwest::Client::new() }
+    Stack { edge: edge_url, core, product, c: reqwest::Client::new() }
 }
 
 impl Stack {
@@ -266,4 +291,29 @@ async fn barrier_token_gates_the_edge_but_not_the_public_protocol_surfaces() {
     let (_, tok) = s.register().await;
     let r = c.get(format!("{}/_matrix/client/v3/capabilities", s.product)).bearer_auth(&tok).header("x-m4a-link-token", "client-forged-0123456789").send().await.unwrap();
     assert_eq!(r.status().as_u16(), 200);
+}
+
+#[tokio::test]
+async fn unix_sockets_carry_product_to_edge_to_core_including_the_push_socket() {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let dir = std::env::temp_dir().join(format!("m4a-unix-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let s = stack_with(Some(&dir)).await;
+    let (_, tok) = s.register().await;
+    // A normal request crosses both unix hops and the core answers for the asserted identity.
+    let (st, who) = s.send("GET", "/_matrix/client/v3/account/whoami", Some(&tok), None).await;
+    assert_eq!(st, 200, "{who}");
+    assert!(who["user_id"].as_str().unwrap().ends_with(":example.org"));
+    // The push socket is relayed over both hops as well.
+    let mut req = format!("{}/client/v3/push", s.product.replacen("http", "ws", 1)).into_client_request().unwrap();
+    req.headers_mut().insert("authorization", format!("Bearer {tok}").parse().unwrap());
+    let (mut sock, _) = tokio_tungstenite::connect_async(req).await.expect("handshake");
+    let first = tokio::time::timeout(Duration::from_secs(5), sock.next()).await.expect("registered in time").unwrap().unwrap();
+    assert_eq!(first.into_text().unwrap().as_str(), r#"{"type":"registered"}"#);
+    // The barrier still applies: a request that skips the product link token is refused by the edge.
+    let c = reqwest::Client::builder().unix_socket(dir.join("edge.sock")).build().unwrap();
+    let r = c.get("http://edge.local/_matrix/client/v3/capabilities").send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 401);
+    let _ = std::fs::remove_dir_all(&dir);
 }

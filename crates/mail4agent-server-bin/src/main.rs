@@ -88,7 +88,15 @@ fn run() -> Result<(), String> {
     } else {
         None
     };
-    let bind = if role == "core" { parse_core_bind(&bind_raw)? } else { parse_loopback(&bind_raw)? };
+    // `unix:/path` binds a unix socket for a co-located edge or product server (mode 0600).
+    let unix_bind = bind_raw.strip_prefix("unix:").map(PathBuf::from);
+    let bind = if unix_bind.is_some() {
+        SocketAddr::from(([127, 0, 0, 1], 0))
+    } else if role == "core" {
+        parse_core_bind(&bind_raw)?
+    } else {
+        parse_loopback(&bind_raw)?
+    };
     let db_path = db_under_tmp(Path::new(&db_raw))?;
     let key_hex =
         env::var("M4A_DB_KEY_HEX").map_err(|_| "M4A_DB_KEY_HEX is required".to_string())?;
@@ -145,6 +153,9 @@ fn run() -> Result<(), String> {
         if let Some(hs) = fed_worker {
             mail4agent_server::http::fed_net::spawn_outbox_worker(hs);
         }
+        if let Some(path) = unix_bind {
+            return serve_unix(&path, app).await;
+        }
         serve(bind, app, role == "core").await
     })
 }
@@ -188,6 +199,15 @@ async fn serve(bind: SocketAddr, app: axum::Router, core: bool) -> Result<(), St
     axum::serve(listener, app)
         .await
         .map_err(|err| format!("serve: {err}"))
+}
+
+async fn serve_unix(path: &Path, app: axum::Router) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::remove_file(path);
+    let listener = tokio::net::UnixListener::bind(path).map_err(|err| format!("bind unix:{}: {err}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|err| format!("chmod socket: {err}"))?;
+    println!("listening unix:{}", path.display());
+    axum::serve(listener, app).await.map_err(|err| format!("serve: {err}"))
 }
 
 fn is_loopback(addr: SocketAddr) -> bool {
