@@ -4,6 +4,9 @@
 //! The database key and the bearer tokens are fixtures generated or named
 //! here and are not printed.
 
+#[path = "support_product.rs"]
+mod support_product;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -17,18 +20,11 @@ use mail4agent_messenger_shell::{
     session_store_dir, CreateRoomKind, DeviceId, MessageKind, MessengerCommand, OpenedStore,
     OutgoingMessage, RoomId, SessionWake,
 };
-use mail4agent_server::http::hash_token;
-use mail4agent_server::keys::{self, CredentialKind};
-use mail4agent_server::nick;
 use mail4agent_server::store::{self, init_messenger_db};
 
-const ALICE_TOKEN: &str = "fake-alice-token";
-const BOB_TOKEN: &str = "fake-bob-token";
-const CAROL_TOKEN: &str = "fake-carol-token";
 const TEXT: &str = "shell-two-device-hello";
 const GROUP_TEXT: &str = "shell-group-hello";
 const CHANNEL_TEXT: &str = "shell-channel-hello";
-const NOW: &str = "2026-10-05T00:00:00+00:00";
 
 struct StopServer(Option<Child>);
 
@@ -65,43 +61,17 @@ fn random_key_hex() -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn ensure_server_name() {
-    match store::set_matrix_server_name("localhost") {
-        Ok(()) => {}
-        Err(_) => assert_eq!(
-            store::matrix_server_name(),
-            "localhost",
-            "matrix server name was already set to a different host"
-        ),
-    }
-}
-
-fn seed(db: &std::path::Path, key_hex: &str) -> (String, String) {
-    ensure_server_name();
-    let conn = init_messenger_db(db.to_str().expect("utf-8"), key_hex).expect("open db");
-    store::ensure_matrix_user(&conn, 1, "alicepub", NOW).expect("alice");
-    store::ensure_matrix_user(&conn, 2, "bobpub", NOW).expect("bob");
-    nick::set_nick(&conn, 1, "alice_nick").expect("alice nick");
-    nick::set_nick(&conn, 2, "bob_nick").expect("bob nick");
-    let alice_device = keys::create_device(
-        &conn,
-        1,
-        CredentialKind::Bearer,
-        &hash_token(ALICE_TOKEN),
-        NOW,
-    )
-    .expect("alice device");
-    let bob_device = keys::create_device(
-        &conn,
-        2,
-        CredentialKind::Bearer,
-        &hash_token(BOB_TOKEN),
-        NOW,
-    )
-    .expect("bob device");
-    conn.execute_batch("PRAGMA wal_checkpoint(FULL);")
-        .expect("checkpoint");
-    (alice_device, bob_device)
+/// A product user with the given nick whose first contact has happened; returns (token, device id).
+fn login(product: &support_product::Product, nick: &str) -> (String, String) {
+    let token = support_product::product_user(product, nick);
+    let who: serde_json::Value = reqwest::blocking::Client::new()
+        .get(format!("{}/client/v3/account/whoami", product.url))
+        .bearer_auth(&token)
+        .send()
+        .expect("whoami")
+        .json()
+        .expect("whoami json");
+    (token, who["device_id"].as_str().expect("device id").to_string())
 }
 
 fn server_bin() -> PathBuf {
@@ -287,7 +257,6 @@ fn two_shells_exchange_one_text_over_loopback() {
     std::fs::create_dir_all(&temp.dir).expect("tmpdir");
     let db = temp.dir.join("messenger.db");
     let key_hex = random_key_hex();
-    let (alice_device, bob_device) = seed(&db, &key_hex);
 
     let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
     let port = probe.local_addr().expect("addr").port();
@@ -306,15 +275,17 @@ fn two_shells_exchange_one_text_over_loopback() {
             "localhost",
         ])
         .env("M4A_DB_KEY_HEX", &key_hex)
-        .env_remove("M4A_BOOTSTRAP_PUBLIC_ID")
-        .env_remove("M4A_BOOTSTRAP_NICK")
-        .env_remove("M4A_BOOTSTRAP_TOKEN")
+        .env("M4A_ASSERTION_SECRET", support_product::SEAM_SECRET)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn server");
     let mut server = StopServer(Some(child));
     wait_until_accepts(&addr);
+    let product = support_product::start_product(&base);
+    let base = product.url.clone();
+    let (alice_token, alice_device) = login(&product, "alice");
+    let (bob_token, bob_device) = login(&product, "bob");
 
     let alice_dir = temp.dir.join("alice");
     let bob_dir = temp.dir.join("bob");
@@ -322,17 +293,17 @@ fn two_shells_exchange_one_text_over_loopback() {
         &alice_dir,
         "session-alice",
         &alice_device,
-        "@alicepub:localhost",
+        "@alice:localhost",
         &base,
-        ALICE_TOKEN,
+        &alice_token,
     );
     let mut bob = open_shell(
         &bob_dir,
         "session-bob",
         &bob_device,
-        "@bobpub:localhost",
+        "@bob:localhost",
         &base,
-        BOB_TOKEN,
+        &bob_token,
     );
     let routine = start_routine();
     bob.set_wake(SessionWake {
@@ -348,7 +319,7 @@ fn two_shells_exchange_one_text_over_loopback() {
         .dispatch(
             MessengerCommand::CreateRoom {
                 kind: CreateRoomKind::Dm {
-                    peer: mail4agent_messenger_shell::UserId::parse("@bobpub:localhost")
+                    peer: mail4agent_messenger_shell::UserId::parse("@bob:localhost")
                         .expect("bob"),
                 },
             },
@@ -475,7 +446,7 @@ fn two_shells_exchange_one_text_over_loopback() {
     );
     assert!(!hits[0].0.contains("/mail/send"));
     drop(hits);
-    let ids = wake_event_ids(&routine, TEXT, "@alicepub:localhost");
+    let ids = wake_event_ids(&routine, TEXT, "@alice:localhost");
     assert_eq!(ids.len(), 1, "dm wake should be one json object");
 
     drop(alice);
@@ -493,47 +464,12 @@ struct ThreeShells {
     alice_device: String,
     bob_device: String,
     carol_device: String,
+    alice_token: String,
+    bob_token: String,
+    carol_token: String,
     base: String,
     server: StopServer,
     store_root: PathBuf,
-}
-
-fn seed_three(db: &std::path::Path, key_hex: &str) -> (String, String, String) {
-    ensure_server_name();
-    let conn = init_messenger_db(db.to_str().expect("utf-8"), key_hex).expect("open db");
-    store::ensure_matrix_user(&conn, 1, "alicepub", NOW).expect("alice");
-    store::ensure_matrix_user(&conn, 2, "bobpub", NOW).expect("bob");
-    store::ensure_matrix_user(&conn, 3, "carolpub", NOW).expect("carol");
-    nick::set_nick(&conn, 1, "alice_nick").expect("alice nick");
-    nick::set_nick(&conn, 2, "bob_nick").expect("bob nick");
-    nick::set_nick(&conn, 3, "carol_nick").expect("carol nick");
-    let alice_device = keys::create_device(
-        &conn,
-        1,
-        CredentialKind::Bearer,
-        &hash_token(ALICE_TOKEN),
-        NOW,
-    )
-    .expect("alice device");
-    let bob_device = keys::create_device(
-        &conn,
-        2,
-        CredentialKind::Bearer,
-        &hash_token(BOB_TOKEN),
-        NOW,
-    )
-    .expect("bob device");
-    let carol_device = keys::create_device(
-        &conn,
-        3,
-        CredentialKind::Bearer,
-        &hash_token(CAROL_TOKEN),
-        NOW,
-    )
-    .expect("carol device");
-    conn.execute_batch("PRAGMA wal_checkpoint(FULL);")
-        .expect("checkpoint");
-    (alice_device, bob_device, carol_device)
 }
 
 fn start_three_shells() -> ThreeShells {
@@ -550,7 +486,6 @@ fn start_three_shells() -> ThreeShells {
     std::fs::create_dir_all(&temp.dir).expect("tmpdir");
     let db = temp.dir.join("messenger.db");
     let key_hex = random_key_hex();
-    let (alice_device, bob_device, carol_device) = seed_three(&db, &key_hex);
 
     let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
     let port = probe.local_addr().expect("addr").port();
@@ -569,15 +504,18 @@ fn start_three_shells() -> ThreeShells {
             "localhost",
         ])
         .env("M4A_DB_KEY_HEX", &key_hex)
-        .env_remove("M4A_BOOTSTRAP_PUBLIC_ID")
-        .env_remove("M4A_BOOTSTRAP_NICK")
-        .env_remove("M4A_BOOTSTRAP_TOKEN")
+        .env("M4A_ASSERTION_SECRET", support_product::SEAM_SECRET)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn server");
     let server = StopServer(Some(child));
     wait_until_accepts(&addr);
+    let product = support_product::start_product(&base);
+    let base = product.url.clone();
+    let (alice_token, alice_device) = login(&product, "alice");
+    let (bob_token, bob_device) = login(&product, "bob");
+    let (carol_token, carol_device) = login(&product, "carol");
 
     // One root, the directory M4A_STORE_ROOT names. session_store_dir
     // gives each session id its own child. The shells are not pointed
@@ -590,6 +528,9 @@ fn start_three_shells() -> ThreeShells {
         alice_device,
         bob_device,
         carol_device,
+        alice_token,
+        bob_token,
+        carol_token,
         base,
         server,
         store_root,
@@ -773,22 +714,22 @@ fn open_trio(boot: &ThreeShells) -> (OpenedStore, OpenedStore, OpenedStore) {
         boot,
         "session-alice",
         &boot.alice_device,
-        "@alicepub:localhost",
-        ALICE_TOKEN,
+        "@alice:localhost",
+        &boot.alice_token,
     );
     let bob = open_session(
         boot,
         "session-bob",
         &boot.bob_device,
-        "@bobpub:localhost",
-        BOB_TOKEN,
+        "@bob:localhost",
+        &boot.bob_token,
     );
     let carol = open_session(
         boot,
         "session-carol",
         &boot.carol_device,
-        "@carolpub:localhost",
-        CAROL_TOKEN,
+        "@carol:localhost",
+        &boot.carol_token,
     );
     (alice, bob, carol)
 }
@@ -819,9 +760,9 @@ fn three_local_shells_exchange_one_text_in_an_encrypted_group() {
                 kind: CreateRoomKind::Group {
                     name: "shell-group".to_string(),
                     invite: vec![
-                        mail4agent_messenger_shell::UserId::parse("@bobpub:localhost")
+                        mail4agent_messenger_shell::UserId::parse("@bob:localhost")
                             .expect("bob"),
-                        mail4agent_messenger_shell::UserId::parse("@carolpub:localhost")
+                        mail4agent_messenger_shell::UserId::parse("@carol:localhost")
                             .expect("carol"),
                     ],
                     members_can_invite: false,
@@ -860,7 +801,7 @@ fn three_local_shells_exchange_one_text_in_an_encrypted_group() {
     wait_text(&mut bob, &mut bob_now, GROUP_TEXT);
     wait_text(&mut carol, &mut carol_now, GROUP_TEXT);
 
-    let ids = wake_event_ids(&routine, GROUP_TEXT, "@alicepub:localhost");
+    let ids = wake_event_ids(&routine, GROUP_TEXT, "@alice:localhost");
     assert_eq!(
         ids.len(),
         2,
@@ -949,7 +890,7 @@ fn three_local_shells_exchange_one_text_in_a_public_plaintext_channel() {
     wait_text(&mut bob, &mut bob_now, CHANNEL_TEXT);
     wait_text(&mut carol, &mut carol_now, CHANNEL_TEXT);
 
-    let ids = wake_event_ids(&routine, CHANNEL_TEXT, "@alicepub:localhost");
+    let ids = wake_event_ids(&routine, CHANNEL_TEXT, "@alice:localhost");
     assert_eq!(
         ids.len(),
         2,
@@ -991,7 +932,7 @@ fn m4_late_joiner_decrypts_history_from_an_existing_member() {
             MessengerCommand::CreateRoom {
                 kind: CreateRoomKind::Group {
                     name: "history".to_string(),
-                    invite: vec![mail4agent_messenger_shell::UserId::parse("@bobpub:localhost").expect("bob")],
+                    invite: vec![mail4agent_messenger_shell::UserId::parse("@bob:localhost").expect("bob")],
                     members_can_invite: true,
                 },
             },
@@ -1014,7 +955,7 @@ fn m4_late_joiner_decrypts_history_from_an_existing_member() {
         .dispatch(
             MessengerCommand::Invite {
                 room_id: RoomId::parse(&room_id).expect("room id"),
-                user_id: mail4agent_messenger_shell::UserId::parse("@carolpub:localhost").expect("carol"),
+                user_id: mail4agent_messenger_shell::UserId::parse("@carol:localhost").expect("carol"),
             },
             alice_now,
         )
@@ -1055,7 +996,7 @@ fn m5_rich_commands_roundtrip() {
         as_nick: "x".to_string(),
         args,
     };
-    let made = alice.run_command(&cmd("rooms.create", serde_json::json!({"name": "m5chan", "kind": "group", "invite": ["@bobpub:localhost"]})), alice_now);
+    let made = alice.run_command(&cmd("rooms.create", serde_json::json!({"name": "m5chan", "kind": "group", "invite": ["@bob:localhost"]})), alice_now);
     assert!(made.ok, "create: {:?}", made.error);
     alice_now += 10_000;
     let room_id = made.data["room"].as_str().unwrap_or_else(|| panic!("room id; {}", describe(&alice))).to_string();
