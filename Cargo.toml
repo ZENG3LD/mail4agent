@@ -1,6 +1,6 @@
 [package]
 name = "mail4agent"
-version = "0.1.4"
+version.workspace = true
 edition = "2021"
 description = "A mailbox for agent sessions: addresses, messages, threads and acknowledgements, served over HTTP and MCP."
 license = "MIT"
@@ -30,13 +30,12 @@ nemo = ["mcp-service4agent/nemo"]
 # core (always on) gives `McpServer`/`Budget`/`Tool`/`DocRouter`; the `nemo`
 # feature above turns on its own `nemo` feature (manifest + register).
 mcp-service4agent = "0.1.0"
-mail4agent-api = { path = "crates/mail4agent-api", version = "0.1.2" }
-mail4agent-core = { path = "crates/mail4agent-core", version = "0.1.2" }
-mail4agent-store-sqlite = { path = "crates/mail4agent-store-sqlite", version = "0.1.2" }
+mail4agent-api = { workspace = true  }
+mail4agent-core = { workspace = true  }
+mail4agent-store-sqlite = { workspace = true  }
 # Resolves which OS process is on the other end of a request's connection --
 # see `src/identity.rs`, "Point 1" of the session-identity work.
-mail4agent-attest = { path = "crates/mail4agent-attest", version = "0.1.2" }
-
+mail4agent-attest = { workspace = true  }
 axum = { version = "0.8", features = ["json"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net"] }
 tower-http = { version = "0.6", features = ["cors"] }
@@ -87,3 +86,25 @@ members = [
     "crates/m4a-product-kit",
     "crates/m4a-product-example",
 ]
+
+# One version for the whole set: every crate below ships under the same number, always.
+# See docs/versioning.md.
+[workspace.package]
+version = "0.3.0"
+
+[workspace.dependencies]
+mail4agent-api = { path = "crates/mail4agent-api", version = "=0.3.0" }
+mail4agent-attest = { path = "crates/mail4agent-attest", version = "=0.3.0" }
+mail4agent-core = { path = "crates/mail4agent-core", version = "=0.3.0" }
+mail4agent-store-sqlite = { path = "crates/mail4agent-store-sqlite", version = "=0.3.0" }
+mail4agent-client = { path = "crates/mail4agent-client", version = "=0.3.0" }
+mail4agent-grok = { path = "crates/mail4agent-grok", version = "=0.3.0" }
+mail4agent-vodozemac = { path = "crates/mail4agent-vodozemac", version = "=0.3.0" }
+mail4agent-messenger = { path = "crates/mail4agent-messenger", version = "=0.3.0" }
+mail4agent-messenger-shell = { path = "crates/mail4agent-messenger-shell", version = "=0.3.0" }
+mail4agent-server = { path = "crates/mail4agent-server", version = "=0.3.0" }
+mail4agent-server-bin = { path = "crates/mail4agent-server-bin", version = "=0.3.0" }
+m4a-edge = { path = "crates/m4a-edge", version = "=0.3.0" }
+m4a-seam = { path = "crates/m4a-seam", version = "=0.3.0" }
+m4a-product-kit = { path = "crates/m4a-product-kit", version = "=0.3.0" }
+m4a-product-example = { path = "crates/m4a-product-example", version = "=0.3.0" }

@@ -1,13 +1,12 @@
 [package]
 name = "mail4agent-core"
-version = "0.1.2"
+version.workspace = true
 edition = "2021"
 description = "The mail4agent mailbox engine: participants, addressing, delivery, threading, acknowledgement and persistence."
 license = "MIT"
 
 [dependencies]
-mail4agent-api = { path = "../mail4agent-api", version = "0.1.2" }
-
+mail4agent-api = { workspace = true  }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

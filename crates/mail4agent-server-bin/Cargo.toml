@@ -1,6 +1,6 @@
 [package]
 name = "mail4agent-server-bin"
-version = "0.2.0"
+version.workspace = true
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/ZENG3LD/mail4agent"
@@ -14,7 +14,7 @@ name = "mail4agent-server-bin"
 path = "src/main.rs"
 
 [dependencies]
-mail4agent-server = { path = "../mail4agent-server", version = "0.2.0" }
+mail4agent-server = { workspace = true  }
 # Names the connection type init_messenger_db returns. Features stay on
 # mail4agent-server's sqlcipher flag; this dependency does not add its own.
 rusqlite = "0.32"
@@ -24,12 +24,12 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 chrono = { version = "0.4", features = ["clock"] }
 
 [dev-dependencies]
-mail4agent-server = { path = "../mail4agent-server", version = "0.2.0" }
-m4a-seam = { path = "../m4a-seam", version = "0.2.0" }
-mail4agent-messenger-shell = { path = "../mail4agent-messenger-shell", version = "0.2.0" }
+mail4agent-server = { workspace = true  }
+m4a-seam = { workspace = true  }
+mail4agent-messenger-shell = { workspace = true  }
 serde_json = "1"
-m4a-product-example = { path = "../m4a-product-example", version = "0.2.0" }
-m4a-product-kit = { path = "../m4a-product-kit", version = "0.2.0" }
+m4a-product-example = { workspace = true  }
+m4a-product-kit = { workspace = true  }
 axum = { version = "0.8", features = ["json"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
