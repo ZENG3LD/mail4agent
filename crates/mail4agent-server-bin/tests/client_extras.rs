@@ -173,6 +173,7 @@ fn simplified_sliding_sync_lists_rooms_sends_deltas_and_shows_invites() {
     let (st, first) = alice("POST", path, Some(req.clone()));
     assert_eq!(st, 200, "{first}");
     assert_eq!(first["lists"]["all"]["count"], 2);
+    assert_eq!(first["lists"]["all"]["ops"], json!([{"op":"SYNC","range":[0,9],"room_ids":[group, chan]}]), "{first}");
     assert_eq!(first["rooms"][&chan]["initial"], true);
     assert_eq!(first["rooms"][&chan]["name"], "general");
     assert!(first["rooms"][&chan]["timeline"].as_array().unwrap().iter().any(|e| e["content"]["body"] == "first"));
@@ -186,6 +187,16 @@ fn simplified_sliding_sync_lists_rooms_sends_deltas_and_shows_invites() {
     assert_eq!(d["rooms"][&chan]["initial"], false, "{d}");
     assert!(d["rooms"][&chan]["timeline"].as_array().unwrap().iter().any(|e| e["content"]["body"] == "second"));
     assert!(d["rooms"].get(&group).is_none(), "an unchanged room is not repeated: {d}");
+    assert_eq!(d["lists"]["all"]["ops"], json!([{"op":"DELETE","index":1},{"op":"INSERT","index":0,"room_id":chan}]), "the room that got a message moves to the top: {d}");
+
+    // Other orders and a narrow range: only the rooms in view are sent.
+    let by_name = json!({"conn_id":"names","lists":{"n":{"ranges":[[0,0]],"sort":["by_name"],"timeline_limit":1,"required_state":[["m.room.name",""]]}}});
+    let (_, n) = alice("POST", path, Some(by_name));
+    assert_eq!(n["lists"]["n"]["ops"][0]["room_ids"], json!([chan]), "general sorts before the unnamed-by-alphabet one: {n}");
+    assert_eq!(n["rooms"].as_object().unwrap().len(), 1, "a first response holds only the asked range: {n}");
+    let by_activity = json!({"conn_id":"act","lists":{"n":{"ranges":[[0,9]],"sort":["by_activity"],"timeline_limit":1,"required_state":[]}}});
+    let (_, n) = alice("POST", path, Some(by_activity));
+    assert_eq!(n["lists"]["n"]["ops"][0]["room_ids"].as_array().unwrap().len(), 2, "{n}");
 
     // A long poll with nothing new returns empty after the timeout.
     let pos2 = d["pos"].as_str().unwrap().to_string();

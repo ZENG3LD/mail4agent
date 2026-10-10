@@ -77,6 +77,9 @@ pub struct SyncFilter {
     pub room: RoomFilter,
     #[serde(default)]
     pub account_data: AccountDataFilter,
+    /// Build room blocks only for these rooms (sliding sync: the rooms inside the asked ranges).
+    #[serde(skip)]
+    pub only_rooms: Option<std::collections::HashSet<String>>,
 }
 
 
@@ -481,7 +484,10 @@ pub fn build_sync_response(
 
     let timeline_limit = filter.timeline_limit();
 
-    let joined_room_ids = crate::store::rooms_for_user(conn, caller_user_id, Some(Membership::Join))?;
+    let mut joined_room_ids = crate::store::rooms_for_user(conn, caller_user_id, Some(Membership::Join))?;
+    if let Some(only) = &filter.only_rooms {
+        joined_room_ids.retain(|r| only.contains(r));
+    }
     // Changed-room prefilter (manager review, 2026-09-24): on an initial/
     // `full_state` sync every joined room is built regardless (there is no
     // `since` boundary to prefilter against). On an incremental sync,
@@ -528,6 +534,9 @@ pub fn build_sync_response(
 
     let mut rooms_invite = serde_json::Map::new();
     for room_id in crate::store::rooms_for_user(conn, caller_user_id, Some(Membership::Invite))? {
+        if filter.only_rooms.as_ref().is_some_and(|o| !o.contains(&room_id)) {
+            continue;
+        }
         if let Some(block) = build_invite_room_block(conn, &room_id, caller_mxid, is_initial, since_stream)? {
             rooms_invite.insert(room_id, block);
         }

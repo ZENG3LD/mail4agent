@@ -1,7 +1,8 @@
 //! Simplified sliding sync (MSC4186): `POST .../org.matrix.simplified_msc3575/sync`.
 //!
 //! Built on the regular sync: `pos` is a sync token, the room lists are sorted by recent activity
-//! (newest first), the rooms inside a list's ranges are sent in full once and then by delta, and
+//! (`sort`: by_recency, by_activity or by_name; changes between responses come as SYNC / INSERT /
+//! DELETE / INVALIDATE operations), the rooms inside a list's ranges are sent in full once and then by delta, and
 //! the to-device, e2ee, account-data, receipts and typing extensions are filled from the same
 //! response. Per connection (user, device, `conn_id`) the server remembers which rooms it has sent
 //! in memory; after a restart those rooms are simply sent in full again.
@@ -24,9 +25,99 @@ use crate::store::{self, Membership};
 
 type ConnKey = (i64, String, String);
 
-fn conns() -> &'static Mutex<HashMap<ConnKey, HashSet<String>>> {
-    static C: OnceLock<Mutex<HashMap<ConnKey, HashSet<String>>>> = OnceLock::new();
+/// What the server remembers of one connection: the rooms it has sent in full, and per list the
+/// room ids it last reported for each range (to say what changed as list operations).
+#[derive(Clone, Default)]
+struct ConnState {
+    sent: HashSet<String>,
+    lists: HashMap<String, Vec<(Range, Vec<String>)>>,
+}
+
+type Range = (usize, usize);
+
+fn conns() -> &'static Mutex<HashMap<ConnKey, ConnState>> {
+    static C: OnceLock<Mutex<HashMap<ConnKey, ConnState>>> = OnceLock::new();
     C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// How a list is ordered: the first known entry of its `sort` array.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Sort {
+    /// Newest message first (state changes do not move a room). The default.
+    Recency,
+    /// Newest event of any kind first (a rename or a join moves the room too).
+    Activity,
+    /// Alphabetical by room name.
+    Name,
+}
+
+fn sort_of(l: &Value) -> Sort {
+    l.get("sort")
+        .and_then(Value::as_array)
+        .and_then(|a| {
+            a.iter().find_map(|s| match s.as_str()? {
+                "by_recency" => Some(Sort::Recency),
+                "by_activity" => Some(Sort::Activity),
+                "by_name" => Some(Sort::Name),
+                _ => None,
+            })
+        })
+        .unwrap_or(Sort::Recency)
+}
+
+/// The list operations that turn what the client holds for one range into the current rooms.
+/// `prev` is what was reported before (None: a fresh connection or list); `ranges` are the
+/// ranges asked now. A range never seen is SYNCed; an unchanged one says nothing; a room that
+/// moved (or one that came in while another fell out) is a DELETE plus an INSERT; anything else
+/// is SYNCed again; ranges the client stopped asking for are INVALIDATEd.
+fn list_ops(prev: Option<&[(Range, Vec<String>)]>, ranges: &[Range], matching: &[String]) -> (Vec<Value>, Vec<(Range, Vec<String>)>) {
+    let mut ops = Vec::new();
+    let mut now = Vec::new();
+    for &(a, b) in ranges {
+        let ids: Vec<String> = matching.iter().skip(a).take(b.saturating_sub(a) + 1).cloned().collect();
+        match prev.and_then(|p| p.iter().find(|(r, _)| *r == (a, b))) {
+            None => ops.push(json!({ "op": "SYNC", "range": [a, b], "room_ids": ids })),
+            Some((_, old)) if *old == ids => {}
+            Some((_, old)) => match single_move(old, &ids) {
+                Some((j, k)) => {
+                    ops.push(json!({ "op": "DELETE", "index": a + j }));
+                    ops.push(json!({ "op": "INSERT", "index": a + k, "room_id": ids[k] }));
+                }
+                None => ops.push(json!({ "op": "SYNC", "range": [a, b], "room_ids": ids })),
+            },
+        }
+        now.push(((a, b), ids));
+    }
+    for (r, _) in prev.into_iter().flatten() {
+        if !ranges.contains(r) {
+            ops.insert(0, json!({ "op": "INVALIDATE", "range": [r.0, r.1] }));
+        }
+    }
+    (ops, now)
+}
+
+/// `Some((j, k))` when deleting index `j` of `old` and inserting at index `k` of `new` makes them equal.
+fn single_move(old: &[String], new: &[String]) -> Option<(usize, usize)> {
+    if old.len() != new.len() || old.len() > 150 || old.is_empty() {
+        return None;
+    }
+    (0..old.len()).find(|&i| old[i] != new[i])?;
+    // Prefer a pure move (the same room at both ends); a room that bumped to the top is the
+    // usual case, so look from the back.
+    for pure in [true, false] {
+        for j in (0..old.len()).rev() {
+            let mut p = old.to_vec();
+            let gone = p.remove(j);
+            for k in 0..new.len() {
+                let mut n = new.to_vec();
+                let put = n.remove(k);
+                if p == n && (!pure || gone == put) {
+                    return Some((j, k));
+                }
+            }
+        }
+    }
+    None
 }
 
 pub(super) fn routes() -> Router<Arc<Homeserver>> {
@@ -184,39 +275,89 @@ fn room_json(cx: &Ctx, room: &store::Room, member: Membership, ask: &RoomAsk, in
     Ok(out)
 }
 
-fn build(cx: &Ctx, typing: &crate::typing::TypingRegistry, pos: Option<crate::sync_token::SyncToken>, req: &Value, sent: &HashSet<String>) -> Result<(Value, HashSet<String>, bool), MatrixError> {
+struct Row {
+    recency: i64,
+    activity: i64,
+    room: store::Room,
+    member: Membership,
+}
+
+fn name_key(conn: &Connection, room_id: &str) -> String {
+    store::current_state_event(conn, room_id, "m.room.name", "")
+        .ok()
+        .flatten()
+        .and_then(|e| serde_json::from_str::<Value>(&e.content).ok())
+        .and_then(|c| c.get("name").and_then(Value::as_str).map(str::to_lowercase))
+        .unwrap_or_default()
+}
+
+fn build(cx: &Ctx, typing: &crate::typing::TypingRegistry, pos: Option<crate::sync_token::SyncToken>, req: &Value, st: &ConnState) -> Result<(Value, ConnState, bool), MatrixError> {
     let conn = cx.conn;
     let since = pos.map(|p| p.stream_id).unwrap_or(0);
-    let sync = crate::sync::build_sync_response(conn, typing, cx.uid, cx.mxid, cx.dev, pos, &crate::sync::SyncFilter::default(), false, Instant::now())?;
     let upto = store::max_stream_id(conn)?;
-    // Every room the user is in or invited to, newest activity first.
-    let mut rooms: Vec<(i64, store::Room, Membership)> = Vec::new();
+    let fresh = pos.is_none();
+    // Every room the user is in or invited to, with the two stamps lists sort by.
+    let mut rows: Vec<Row> = Vec::new();
     for m in [Membership::Join, Membership::Invite] {
         for id in store::rooms_for_user(conn, cx.uid, Some(m))? {
             if let Some(r) = store::get_room(conn, &id)? {
-                let bump = if m == Membership::Invite {
-                    store::current_state_event(conn, &id, "m.room.member", cx.mxid)?.map(|e| e.stream_id).unwrap_or(0)
+                let (recency, activity) = if m == Membership::Invite {
+                    let s = store::current_state_event(conn, &id, "m.room.member", cx.mxid)?.map(|e| e.stream_id).unwrap_or(0);
+                    (s, s)
                 } else {
-                    last_event(conn, &id).map(|e| e.stream_id).unwrap_or(0)
+                    let public = crate::public_channels::is_public_room(conn, &id).unwrap_or(false);
+                    let evs = if public { crate::public_channels::events_before(conn, &id, i64::MAX, 20) } else { store::events_in_room_before(conn, &id, i64::MAX, 20) }.unwrap_or_default();
+                    let activity = evs.first().map(|e| e.stream_id).unwrap_or(0);
+                    let recency = evs.iter().find(|e| e.state_key.is_none()).map(|e| e.stream_id).unwrap_or(activity);
+                    (recency, activity)
                 };
-                rooms.push((bump, r, m));
+                rows.push(Row { recency, activity, room: r, member: m });
             }
         }
     }
-    rooms.sort_by(|a, b| b.0.cmp(&a.0));
+    // What each list shows, in its own order, and what that means for the rooms to send.
     let mut wanted: Vec<(String, RoomAsk)> = Vec::new();
     let mut lists_out = serde_json::Map::new();
+    let mut lists_state: HashMap<String, Vec<(Range, Vec<String>)>> = HashMap::new();
+    let mut any_ops = false;
+    let mut names: HashMap<String, String> = HashMap::new();
     if let Some(lists) = req.get("lists").and_then(Value::as_object) {
         for (name, l) in lists {
             let ask = ask_of(l);
             let filt = l.get("filters").cloned().unwrap_or(json!({}));
-            let matching: Vec<&(i64, store::Room, Membership)> = rooms.iter().filter(|(_, r, m)| filter_passes(conn, cx.uid, r, *m, &filt)).collect();
-            lists_out.insert(name.clone(), json!({ "count": matching.len() }));
-            for rg in l.get("ranges").and_then(Value::as_array).cloned().unwrap_or_default() {
-                let (a, b) = (rg.get(0).and_then(Value::as_u64).unwrap_or(0) as usize, rg.get(1).and_then(Value::as_u64).unwrap_or(0) as usize);
-                for (_, r, _) in matching.iter().skip(a).take(b.saturating_sub(a) + 1) {
-                    if !wanted.iter().any(|(id, _)| *id == r.id) {
-                        wanted.push((r.id.clone(), ask.clone()));
+            let mut matching: Vec<&Row> = rows.iter().filter(|r| filter_passes(conn, cx.uid, &r.room, r.member, &filt)).collect();
+            match sort_of(l) {
+                Sort::Recency => matching.sort_by(|a, b| b.recency.cmp(&a.recency).then_with(|| a.room.id.cmp(&b.room.id))),
+                Sort::Activity => matching.sort_by(|a, b| b.activity.cmp(&a.activity).then_with(|| a.room.id.cmp(&b.room.id))),
+                Sort::Name => {
+                    for r in &matching {
+                        names.entry(r.room.id.clone()).or_insert_with(|| name_key(conn, &r.room.id));
+                    }
+                    // Named rooms alphabetically, unnamed ones after them by recency.
+                    matching.sort_by(|a, b| {
+                        let (na, nb) = (&names[&a.room.id], &names[&b.room.id]);
+                        na.is_empty().cmp(&nb.is_empty()).then_with(|| na.cmp(nb)).then_with(|| b.recency.cmp(&a.recency)).then_with(|| a.room.id.cmp(&b.room.id))
+                    });
+                }
+            }
+            let ids: Vec<String> = matching.iter().map(|r| r.room.id.clone()).collect();
+            let ranges: Vec<Range> = l
+                .get("ranges")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().map(|rg| (rg.get(0).and_then(Value::as_u64).unwrap_or(0) as usize, rg.get(1).and_then(Value::as_u64).unwrap_or(0) as usize)).filter(|(a, b)| a <= b).take(8).collect())
+                .unwrap_or_default();
+            let (ops, kept) = list_ops(if fresh { None } else { st.lists.get(name).map(Vec::as_slice) }, &ranges, &ids);
+            any_ops |= !ops.is_empty();
+            let mut entry = json!({ "count": ids.len() });
+            if !ops.is_empty() {
+                entry["ops"] = json!(ops);
+            }
+            lists_out.insert(name.clone(), entry);
+            lists_state.insert(name.clone(), kept);
+            for (a, b) in ranges {
+                for id in ids.iter().skip(a).take(b - a + 1) {
+                    if !wanted.iter().any(|(w, _)| w == id) {
+                        wanted.push((id.clone(), ask.clone()));
                     }
                 }
             }
@@ -224,23 +365,28 @@ fn build(cx: &Ctx, typing: &crate::typing::TypingRegistry, pos: Option<crate::sy
     }
     if let Some(subs) = req.get("room_subscriptions").and_then(Value::as_object) {
         for (id, s) in subs {
-            if rooms.iter().any(|(_, r, _)| r.id == *id) && !wanted.iter().any(|(w, _)| w == id) {
+            if rows.iter().any(|r| r.room.id == *id) && !wanted.iter().any(|(w, _)| w == id) {
                 wanted.push((id.clone(), ask_of(s)));
             }
         }
     }
+    // Only the rooms in view are built: a first response costs the size of the asked ranges.
+    let filter = crate::sync::SyncFilter { only_rooms: Some(wanted.iter().map(|(id, _)| id.clone()).collect()), ..Default::default() };
+    let sync = crate::sync::build_sync_response(conn, typing, cx.uid, cx.mxid, cx.dev, pos, &filter, false, Instant::now())?;
     let mut rooms_out = serde_json::Map::new();
     let mut now_sent = HashSet::new();
     let mut receipts = serde_json::Map::new();
     let mut typing_out = serde_json::Map::new();
     let mut room_account = serde_json::Map::new();
     for (id, ask) in &wanted {
-        let Some((_, room, member)) = rooms.iter().find(|(_, r, _)| r.id == *id) else { continue };
+        let Some(row) = rows.iter().find(|r| r.room.id == *id) else { continue };
+        let (room, member) = (&row.room, row.member);
         now_sent.insert(id.clone());
         let block = sync.pointer(&format!("/rooms/join/{}", json_ptr(id)));
-        let initial = !sent.contains(id) || pos.is_none();
-        if initial || block.is_some() || *member == Membership::Invite && !sent.contains(id) {
-            let j = room_json(cx, room, *member, ask, initial, since, upto, block)?;
+        let initial = !st.sent.contains(id) || fresh;
+        if initial || block.is_some() {
+            let mut j = room_json(cx, room, member, ask, initial, since, upto, block)?;
+            j["bump_stamp"] = json!(row.recency);
             rooms_out.insert(id.clone(), j);
         }
         if let Some(b) = block {
@@ -281,13 +427,14 @@ fn build(cx: &Ctx, typing: &crate::typing::TypingRegistry, pos: Option<crate::sy
         ext.insert("typing".into(), json!({ "rooms": typing_out }));
     }
     let quiet = rooms_out.is_empty()
+        && !any_ops
         && sync["to_device"]["events"].as_array().is_none_or(|a| a.is_empty())
         && sync["account_data"]["events"].as_array().is_none_or(|a| a.is_empty())
         && sync["device_lists"]["changed"].as_array().is_none_or(|a| a.is_empty())
         && receipts.is_empty()
         && typing_out.is_empty();
     let resp = json!({ "pos": sync["next_batch"], "lists": lists_out, "rooms": rooms_out, "extensions": ext });
-    Ok((resp, now_sent, quiet))
+    Ok((resp, ConnState { sent: now_sent, lists: lists_state }, quiet))
 }
 
 fn json_ptr(s: &str) -> String {
@@ -303,9 +450,9 @@ async fn sliding_sync(State(state): State<Arc<Homeserver>>, headers: HeaderMap, 
     let pos = q.pos.as_deref().map(crate::sync_token::parse).transpose()?;
     let timeout = Duration::from_millis(q.timeout.unwrap_or(0).min(crate::sync::SYNC_MAX_TIMEOUT_MS));
     let deadline = Instant::now() + timeout;
-    let mut sent: HashSet<String> = match pos {
+    let mut sent: ConnState = match pos {
         Some(_) => conns().lock().map(|c| c.get(&key).cloned().unwrap_or_default()).unwrap_or_default(),
-        None => HashSet::new(),
+        None => ConnState::default(),
     };
     loop {
         let registration = state.live.register(&format!("user:{uid}"));
@@ -326,7 +473,7 @@ async fn sliding_sync(State(state): State<Arc<Homeserver>>, headers: HeaderMap, 
             .await?
         };
         if pos_now.is_none() {
-            sent.clear();
+            sent = ConnState::default();
         }
         let (st, req2, sent2, mxid2, dev2) = (Arc::clone(&state), req.clone(), sent.clone(), mxid.clone(), dev.clone());
         let (resp, now_sent, quiet) = with_read_pub(&state, move |c| {
@@ -344,5 +491,44 @@ async fn sliding_sync(State(state): State<Arc<Homeserver>>, headers: HeaderMap, 
             }
             return Ok(Json(resp));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v(s: &[&str]) -> Vec<String> {
+        s.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn list_operations_describe_what_changed() {
+        let (ops, kept) = list_ops(None, &[(0, 2)], &v(&["a", "b", "c", "d"]));
+        assert_eq!(ops, vec![json!({"op":"SYNC","range":[0,2],"room_ids":["a","b","c"]})]);
+        // Nothing changed: no operation.
+        assert!(list_ops(Some(&kept), &[(0, 2)], &v(&["a", "b", "c", "d"])).0.is_empty());
+        // A room moved to the top.
+        let (ops, _) = list_ops(Some(&kept), &[(0, 2)], &v(&["c", "a", "b", "d"]));
+        assert_eq!(ops, vec![json!({"op":"DELETE","index":2}), json!({"op":"INSERT","index":0,"room_id":"c"})]);
+        // A new room at the top pushes the last one out of the range.
+        let (ops, _) = list_ops(Some(&kept), &[(0, 2)], &v(&["x", "a", "b", "c"]));
+        assert_eq!(ops, vec![json!({"op":"DELETE","index":2}), json!({"op":"INSERT","index":0,"room_id":"x"})]);
+        // A moved room inside a range that does not start at 0 reports absolute indexes.
+        let (_, k2) = list_ops(None, &[(1, 3)], &v(&["a", "b", "c", "d"]));
+        let (ops, _) = list_ops(Some(&k2), &[(1, 3)], &v(&["a", "c", "d", "b"]));
+        assert_eq!(ops, vec![json!({"op":"DELETE","index":1}), json!({"op":"INSERT","index":3,"room_id":"b"})]);
+        // A shuffle is a SYNC; a dropped range is INVALIDATEd while the new one is SYNCed.
+        let (ops, _) = list_ops(Some(&kept), &[(0, 2)], &v(&["c", "b", "a", "d"]));
+        assert_eq!(ops[0]["op"], "SYNC");
+        let (ops, _) = list_ops(Some(&kept), &[(3, 5)], &v(&["a", "b", "c", "d"]));
+        assert_eq!((ops[0]["op"].as_str(), ops[0]["range"].clone(), ops[1]["op"].as_str()), (Some("INVALIDATE"), json!([0, 2]), Some("SYNC")));
+    }
+
+    #[test]
+    fn sort_modes_are_read_from_the_first_known_entry() {
+        assert_eq!(sort_of(&json!({})), Sort::Recency);
+        assert_eq!(sort_of(&json!({"sort":["by_name"]})), Sort::Name);
+        assert_eq!(sort_of(&json!({"sort":["by_notification_level","by_activity"]})), Sort::Activity);
     }
 }
