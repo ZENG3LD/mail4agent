@@ -508,16 +508,47 @@ impl RemoteKeys for HttpKeyFetcher {
 }
 
 /// Boxed future returned by [`FedTransport::request`].
+/// A binary federation answer.
+pub struct RawResponse {
+    pub status: u16,
+    pub content_type: Option<String>,
+    pub body: Vec<u8>,
+}
+pub type RawFuture<'a> = Pin<Box<dyn Future<Output = Result<RawResponse, FedError>> + Send + 'a>>;
 pub type ReqFuture<'a> = Pin<Box<dyn Future<Output = Result<(u16, Value), FedError>> + Send + 'a>>;
 
 /// Sends one signed federation request and returns `(status, json body)`.
 /// `uri` is the full path and query including `/_matrix`.
 pub trait FedTransport: Send + Sync {
+    /// Like [`request`](Self::request) but for a binary answer (media): the raw body, capped at
+    /// `max_bytes` (a longer body is an error). Transports that cannot do it say so.
+    fn request_raw<'a>(&'a self, _destination: &'a str, _method: &'a str, _uri: &'a str, _authorization: &'a str, _max_bytes: usize) -> RawFuture<'a> {
+        Box::pin(async { Err(FedError::Network("raw requests are not supported by this transport".into())) })
+    }
+
     /// Deliver to `destination`; `authorization` is the complete `X-Matrix` header value.
     fn request<'a>(&'a self, destination: &'a str, method: &'a str, uri: &'a str, authorization: &'a str, body: Option<&'a Value>) -> ReqFuture<'a>;
 }
 
 impl FedTransport for HttpKeyFetcher {
+    fn request_raw<'a>(&'a self, destination: &'a str, method: &'a str, uri: &'a str, authorization: &'a str, max_bytes: usize) -> RawFuture<'a> {
+        Box::pin(async move {
+            let base = self.base_url(destination).await?;
+            let m = reqwest::Method::from_bytes(method.as_bytes()).map_err(|_| FedError::Malformed("method".into()))?;
+            let mut resp = self.client.request(m, format!("{base}{uri}")).header("Authorization", authorization).send().await.map_err(|e| FedError::Network(e.to_string()))?;
+            let status = resp.status().as_u16();
+            let content_type = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).map(str::to_string);
+            let mut body = Vec::new();
+            while let Some(chunk) = resp.chunk().await.map_err(|e| FedError::Network(e.to_string()))? {
+                if body.len() + chunk.len() > max_bytes {
+                    return Err(FedError::Network("body too large".into()));
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(RawResponse { status, content_type, body })
+        })
+    }
+
     fn request<'a>(&'a self, destination: &'a str, method: &'a str, uri: &'a str, authorization: &'a str, body: Option<&'a Value>) -> ReqFuture<'a> {
         Box::pin(async move {
             let base = self.base_url(destination).await?;

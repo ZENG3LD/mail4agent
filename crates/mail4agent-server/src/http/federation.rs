@@ -23,6 +23,8 @@ pub(super) fn routes() -> Router<Arc<Homeserver>> {
         .route("/key/v2/server", get(own_keys))
         .route("/key/v2/server/{key_id}", get(own_keys_by_id))
         .route("/federation/v1/version", get(version))
+        .route("/federation/v1/media/download/{media_id}", get(fed_media_download))
+        .route("/federation/v1/media/thumbnail/{media_id}", get(fed_media_thumbnail))
         .route("/federation/v1/query/profile", get(profile))
         .route("/federation/v1/send/{txn_id}", put(send_txn))
         .route("/federation/v1/make_join/{room_id}/{user_id}", get(make_join))
@@ -598,6 +600,39 @@ async fn state_ids() -> Result<Json<Value>, MatrixError> {
 #[cfg(not(feature = "f3-hash-ids"))]
 async fn state_events() -> Result<Json<Value>, MatrixError> {
     Err(MatrixError::new(404, "M_UNRECOGNIZED", "hash-id rooms are not enabled"))
+}
+
+/// `GET media/download`: one of our local files for another server (multipart: `{}`, then bytes).
+async fn fed_media_download(State(state): State<Arc<Homeserver>>, OriginalUri(uri): OriginalUri, headers: HeaderMap, Path(media_id): Path<String>) -> Result<axum::response::Response, MatrixError> {
+    fed_media(state, uri, headers, media_id, None).await
+}
+
+async fn fed_media_thumbnail(State(state): State<Arc<Homeserver>>, OriginalUri(uri): OriginalUri, headers: HeaderMap, Path(media_id): Path<String>, Query(q): Query<HashMap<String, String>>) -> Result<axum::response::Response, MatrixError> {
+    let num = |k: &str| q.get(k).and_then(|v| v.parse::<u32>().ok()).filter(|n| (1..=2048).contains(n));
+    let (Some(w), Some(h)) = (num("width"), num("height")) else { return Err(MatrixError::invalid_param("width and height are required")) };
+    fed_media(state, uri, headers, media_id, Some((w, h, q.get("method").map(String::as_str) == Some("crop")))).await
+}
+
+async fn fed_media(state: Arc<Homeserver>, uri: axum::http::Uri, headers: HeaderMap, media_id: String, thumb: Option<(u32, u32, bool)>) -> Result<axum::response::Response, MatrixError> {
+    use axum::response::IntoResponse;
+    require_enabled(&state)?;
+    authenticate(&state, "GET", &uri, &headers, &[]).await?;
+    if !crate::media::federation_enabled() {
+        return Err(MatrixError::not_found("media federation is off on this server"));
+    }
+    let blob = with_conn_pub(&state, move |c| Ok(crate::media::get(c, &media_id)?)).await?.ok_or_else(|| MatrixError::not_found("no such media"))?;
+    let blob = match thumb {
+        Some((w, h, crop)) => {
+            let data = blob.data.clone();
+            match tokio::task::spawn_blocking(move || crate::media::thumbnail(&data, w, h, crop)).await.ok().flatten() {
+                Some((bytes, mime)) => crate::media::Blob { content_type: mime.into(), filename: blob.filename, data: bytes },
+                None => blob,
+            }
+        }
+        None => blob,
+    };
+    let (ct, body) = crate::media::multipart_body(&blob);
+    Ok(([(axum::http::header::CONTENT_TYPE, ct)], body).into_response())
 }
 
 /// `GET publicRooms`: the public channels of this server, for another server's room directory.

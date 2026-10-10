@@ -29,6 +29,16 @@ pub(crate) async fn fed_request(state: &Arc<Homeserver>, dest: &str, method: &st
     transport.request(dest, method, &uri, &auth, body.as_ref()).await.map_err(|e| MatrixError::unknown(format!("federation to {dest}: {e}")))
 }
 
+/// A signed GET whose answer is binary (media); `path` is without the `/_matrix` prefix.
+pub(crate) async fn fed_request_raw(state: &Arc<Homeserver>, dest: &str, path: &str, max_bytes: usize) -> Result<crate::federation::RawResponse, MatrixError> {
+    let transport = state.fed_transport.get().cloned().ok_or_else(|| MatrixError::unknown("federation transport is not configured"))?;
+    let local = crate::store::matrix_server_name();
+    let uri = format!("/_matrix{path}");
+    let (key_id, key) = with_conn_pub(state, |c| fed::active_signing_key(c, fed::now_ms()).map_err(internal)).await?;
+    let auth = fed::build_x_matrix_header(local, dest, &key_id, &key, "GET", &uri, None);
+    transport.request_raw(dest, "GET", &uri, &auth, max_bytes).await.map_err(|e| MatrixError::unknown(format!("federation to {dest}: {e}")))
+}
+
 /// Verify a PDU's signature with its signer's keys. `Ok(false)`: signature
 /// good, content hash wrong (keep only the redacted form).
 pub(crate) async fn verify_pdu(state: &Arc<Homeserver>, pdu: &Value) -> Result<bool, MatrixError> {

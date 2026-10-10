@@ -15,7 +15,8 @@ path = "src/main.rs"
 
 [features]
 # Closed rooms are DAG rooms (hash ids, signed events). On by default; turn off for legacy-id-only.
-default = ["f3-hash-ids", "presence", "media-federation"]
+default = ["f3-hash-ids", "presence", "media-federation", "media-thumbnails"]
+media-thumbnails = ["mail4agent-server/media-thumbnails"]
 presence = ["mail4agent-server/presence"]
 media-federation = ["mail4agent-server/media-federation"]
 f3-hash-ids = ["mail4agent-server/f3-hash-ids"]

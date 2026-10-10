@@ -14,11 +14,13 @@ name = "mail4agent_server"
 path = "src/lib.rs"
 
 [features]
-default = ["f3-hash-ids", "presence", "media-federation"]
+default = ["f3-hash-ids", "presence", "media-federation", "media-thumbnails"]
 # Presence (PUT/GET status, sync section, m.presence EDUs). Env: M4A_PRESENCE=off.
 presence = []
 # Remote media (federation download, cache) and the authenticated media routes. Env: M4A_MEDIA_FEDERATION=off.
 media-federation = []
+# Real thumbnails (scale/crop) for image uploads; without it the original is served. Env: none (cheap).
+media-thumbnails = ["dep:image"]
 # Device-bearer credentials resolve to a caller. Only the client shell's in-process local
 # bus enables it (its own private bus, no network); the server binary never does.
 local-bearer = []
@@ -46,6 +48,7 @@ sha2 = "0.10"
 hex = "0.4"
 m4a-seam = { workspace = true  }
 hmac = "0.12"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 [dev-dependencies]

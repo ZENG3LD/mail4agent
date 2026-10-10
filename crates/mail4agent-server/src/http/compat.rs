@@ -8,10 +8,8 @@
 
 use std::sync::Arc;
 
-use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde_json::{json, Value};
@@ -21,9 +19,6 @@ use crate::error::MatrixError;
 use super::{resolve_caller, Homeserver};
 
 pub(super) fn routes() -> Router<Arc<Homeserver>> {
-    let upload = Router::new()
-        .route("/media/v3/upload", post(upload))
-        .layer(DefaultBodyLimit::max(crate::media::MAX_UPLOAD_BYTES));
     Router::new()
         .route("/.well-known/matrix/client", get(well_known_client))
         .route("/.well-known/matrix/server", get(well_known_server))
@@ -40,13 +35,6 @@ pub(super) fn routes() -> Router<Arc<Homeserver>> {
         .route("/client/v3/pushers", get(pushers))
         .route("/client/v3/pushers/set", post(ok_empty))
         .route("/client/v3/notifications", get(notifications))
-        .route("/client/v1/media/config", get(media_config))
-        .route("/media/v3/config", get(media_config))
-        .route("/client/v1/media/download/{server}/{media_id}", get(download))
-        .route("/client/v1/media/download/{server}/{media_id}/{filename}", get(download_named))
-        .route("/media/v3/download/{server}/{media_id}", get(download))
-        .route("/media/v3/download/{server}/{media_id}/{filename}", get(download_named))
-        .merge(upload)
 }
 
 async fn ok_empty() -> Json<Value> {
@@ -132,76 +120,11 @@ async fn notifications(State(state): State<Arc<Homeserver>>, headers: HeaderMap)
 }
 
 
-async fn media_config(State(state): State<Arc<Homeserver>>, headers: HeaderMap) -> Result<Json<Value>, MatrixError> {
-    resolve_caller(&state, &headers, None).await?;
-    Ok(Json(json!({ "m.upload.size": crate::media::MAX_UPLOAD_BYTES })))
-}
-
-#[derive(serde::Deserialize)]
-struct UploadQuery {
-    filename: Option<String>,
-}
-
-async fn upload(
-    State(state): State<Arc<Homeserver>>,
-    headers: HeaderMap,
-    Query(q): Query<UploadQuery>,
-    body: Bytes,
-) -> Result<Json<Value>, MatrixError> {
-    let caller = resolve_caller(&state, &headers, None).await?;
-    state.check_policy(&caller, crate::policy::Action::UploadMedia, None)?;
-    if body.is_empty() {
-        return Err(MatrixError::invalid_param("empty upload"));
-    }
-    let content_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .filter(|v| !v.is_empty() && v.len() <= 128)
-        .unwrap_or("application/octet-stream")
-        .to_string();
-    let id = super::with_conn_pub(&state, move |conn| {
-        Ok(crate::media::put(conn, caller.user_id, &content_type, q.filename.as_deref(), &body, chrono::Utc::now().timestamp_millis())?)
-    })
-    .await?;
-    Ok(Json(json!({ "content_uri": format!("mxc://{}/{}", crate::store::matrix_server_name(), id) })))
-}
-
-async fn fetch(state: Arc<Homeserver>, headers: HeaderMap, server: String, media_id: String, name: Option<String>) -> Result<Response, MatrixError> {
-    resolve_caller(&state, &headers, None).await?;
-    if !crate::store::is_local_server_name(&server) {
-        return Err(MatrixError::not_found("media is not local"));
-    }
-    let blob = super::with_conn_pub(&state, move |conn| Ok(crate::media::get(conn, &media_id)?))
-        .await?
-        .ok_or_else(|| MatrixError::not_found("no such media"))?;
-    let mut resp = (StatusCode::OK, blob.data).into_response();
-    let h = resp.headers_mut();
-    if let Ok(v) = HeaderValue::from_str(&blob.content_type) {
-        h.insert(header::CONTENT_TYPE, v);
-    }
-    // Always a download, never inline-rendered by the browser; nosniff.
-    let fname = name.or(blob.filename).unwrap_or_else(|| "file".into()).replace(['"', '\\', '\r', '\n'], "_");
-    if let Ok(v) = HeaderValue::from_str(&format!("attachment; filename=\"{fname}\"")) {
-        h.insert(header::CONTENT_DISPOSITION, v);
-    }
-    h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
-    h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("sandbox; default-src 'none'"));
-    Ok(resp)
-}
-
-async fn download(State(state): State<Arc<Homeserver>>, headers: HeaderMap, Path((server, media_id)): Path<(String, String)>) -> Result<Response, MatrixError> {
-    fetch(state, headers, server, media_id, None).await
-}
-
-async fn download_named(State(state): State<Arc<Homeserver>>, headers: HeaderMap, Path((server, media_id, name)): Path<(String, String, String)>) -> Result<Response, MatrixError> {
-    fetch(state, headers, server, media_id, Some(name)).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::body::{to_bytes, Body};
-    use axum::http::Request;
+    use axum::http::{header, Request, StatusCode};
     use rusqlite::Connection;
     use tower::ServiceExt;
 

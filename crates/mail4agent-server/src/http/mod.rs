@@ -25,6 +25,7 @@ use crate::typing::TypingRegistry;
 mod account;
 pub(crate) mod extras;
 pub mod presence;
+mod media;
 mod compat;
 pub mod edge_auth;
 mod ephemeral;
@@ -241,6 +242,7 @@ pub fn router(state: Arc<Homeserver>) -> Router {
         .merge(account::routes())
         .merge(extras::routes())
         .merge(presence::routes())
+        .merge(media::routes())
         .merge(sliding::routes())
                 .merge(keys::routes())
         .merge(sync::routes())
