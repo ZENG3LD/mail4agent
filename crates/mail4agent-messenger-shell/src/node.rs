@@ -12,13 +12,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::ipc::{SendListener, SendStream};
-use crate::machine::{
-    load_device_bearer, lock_store, save_device_bearer, KEYCHAIN_DIR_ENV,
-};
+use crate::machine::lock_store;
 use crate::push::PushLink;
 use crate::send::{send_sock_path_named, SendReply, SendRequest};
 use crate::{
-    nonempty_var, OpenedStore, SessionConfig, SessionWake, ShellError, DEVICE_TOKEN_ENV,
+    nonempty_var, OpenedStore, SessionConfig, SessionWake, ShellError,
     LEADER_SOCK_ENV, STORE_ROOT_ENV,
 };
 
@@ -92,27 +90,11 @@ impl NodeClient {
             ));
         }
 
-        // Host keychain may hold a previously minted bearer.
-        if nonempty_var(DEVICE_TOKEN_ENV).is_none() {
-            if let (Some(dir), Some(session_id)) = (
-                nonempty_var(KEYCHAIN_DIR_ENV).map(PathBuf::from),
-                nonempty_var(crate::SESSION_ID_ENV),
-            ) {
-                if let Some(token) = load_device_bearer(&dir, &session_id) {
-                    std::env::set_var(DEVICE_TOKEN_ENV, token);
-                }
-            }
-        }
-
         let config = SessionConfig::from_env()?;
         let lock = lock_store(&config.store_dir())?;
         let store = OpenedStore::connect_with_wake(&config, wake)?;
 
-        if let Some(dir) = nonempty_var(KEYCHAIN_DIR_ENV).map(PathBuf::from) {
-            save_device_bearer(&dir, config.session_id(), store.device_bearer());
-        }
-
-        let push = PushLink::open(config.homeserver_url(), vec![store.device_bearer().to_string()], config.is_product())?;
+        let push = PushLink::open(config.homeserver_url(), vec![store.device_bearer().to_string()], true)?;
         let store_root = PathBuf::from(
             nonempty_var(STORE_ROOT_ENV).ok_or(ShellError::StoreRoot)?,
         );

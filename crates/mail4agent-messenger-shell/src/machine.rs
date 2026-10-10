@@ -52,10 +52,10 @@
 //! [`MachineClient::tick`] is that loop step; the `m4a-web-client` binary
 //! runs it.
 //!
-//! Device bearers. The homeserver returns one only when register creates
+//! Session bearers. Each session logs in by signature with its own vaulted identity; the
+//! bearer lives in memory only and is never stored or handed in.
+
 //! the device. With [`KEYCHAIN_DIR_ENV`] set, [`MachineClient::from_env`]
-//! reads and stores each session's bearer in that directory (0600), which
-//! is kept apart from the sealed stores. Unset, bearers stay in memory.
 
 use std::fs::File;
 use std::collections::{HashMap, HashSet};
@@ -115,12 +115,11 @@ pub struct HostSession {
     pub routine_url: Option<String>,
     /// Bearer for that routine POST. Memory only.
     pub routine_bearer: Option<String>,
-    /// Device bearer from the host keychain, for a session that already
-    /// registered. `None` on the first connect.
-    pub device_token: Option<String>,
-    /// Product-session mode: the product nick. With it, `device_token` is the
-    /// product session token and every call goes through the product proxy.
-    pub product_nick: Option<String>,
+    /// The operator's one-time invite code, needed only until this session's identity is
+    /// enrolled. Read by the client, never given to the agent.
+    pub invite: Option<String>,
+    /// `server` tier (default) or `matrix`.
+    pub tier: m4a_agent::BackendKind,
 }
 
 impl HostSession {
@@ -132,30 +131,25 @@ impl HostSession {
             agent_id: None,
             routine_url: None,
             routine_bearer: None,
-            device_token: None,
-            product_nick: None,
+            invite: None,
+            tier: m4a_agent::BackendKind::Server,
         }
-    }
-
-    /// Product-session mode for this session: log in at the product as
-    /// `nick` with an existing product session `token`.
-    pub fn with_product(mut self, nick: impl Into<String>, token: impl Into<String>) -> Self {
-        self.product_nick = Some(nick.into());
-        self.device_token = Some(token.into());
-        self
     }
 
     pub(crate) fn config(&self, url: &str, store_root: &Path) -> Result<SessionConfig, ShellError> {
-        match (&self.product_nick, &self.device_token) {
-            (Some(nick), Some(token)) => SessionConfig::new_product(
-                url,
-                nick,
-                crate::ProductSecret::Token(zeroize::Zeroizing::new(token.clone())),
-                &self.session_id,
-                store_root,
-            ),
-            _ => SessionConfig::new(url, &self.bot_name, &self.session_id, store_root, self.device_token.clone()),
-        }
+        SessionConfig::new_identity(url, self.tier, &self.session_id, store_root, self.invite.clone())
+    }
+
+    /// The operator's invite for this session's first login.
+    pub fn with_invite(mut self, invite: impl Into<String>) -> Self {
+        self.invite = Some(invite.into());
+        self
+    }
+
+    /// Which tier this session logs in on.
+    pub fn with_tier(mut self, tier: m4a_agent::BackendKind) -> Self {
+        self.tier = tier;
+        self
     }
 
     /// Attaches a routine target. The bearer is kept only as this value.
@@ -165,11 +159,6 @@ impl HostSession {
         self
     }
 
-    /// Device bearer the host keychain already holds.
-    pub fn with_device_token(mut self, token: impl Into<String>) -> Self {
-        self.device_token = Some(token.into());
-        self
-    }
 }
 
 impl std::fmt::Debug for HostSession {
@@ -182,10 +171,6 @@ impl std::fmt::Debug for HostSession {
             .field(
                 "routine_bearer",
                 &self.routine_bearer.as_ref().map(|_| "[redacted]"),
-            )
-            .field(
-                "device_token",
-                &self.device_token.as_ref().map(|_| "[redacted]"),
             )
             .finish()
     }
@@ -930,15 +915,6 @@ fn attach_webhook_routines(
     Ok(())
 }
 
-/// Keychain directory for device bearers, kept apart from the sealed
-/// stores (a bearer is never written next to sealed records). The
-/// homeserver returns a device bearer only once, on the call that creates
-/// the device; with this set, [`MachineClient::from_env`] reads each
-/// session's bearer from `<dir>/<session hash>/device-bearer` (mode 0600)
-/// and writes a newly minted one there. Unset: bearers stay in memory and
-/// the host injects them. Never logged.
-pub const KEYCHAIN_DIR_ENV: &str = "M4A_KEYCHAIN_DIR";
-
 /// Lock file in each sealed session directory. [`MachineClient::open`]
 /// holds an exclusive lock on it for as long as the client lives, so a
 /// second process (another client, or `m4a-send` opening the store itself)
@@ -966,9 +942,6 @@ pub(crate) fn lock_store(dir: &Path) -> Result<File, ShellError> {
         )),
     }
 }
-
-/// File name of one session's device bearer under [`KEYCHAIN_DIR_ENV`].
-pub const DEVICE_KEYCHAIN_FILE: &str = "device-bearer";
 
 /// Writes `bytes` to `path` atomically, file 0600, parent created 0700.
 fn write_secret_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -1000,27 +973,6 @@ fn write_secret_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     file.sync_all()?;
     drop(file);
     std::fs::rename(&tmp, path)
-}
-
-fn device_bearer_path(keychain_dir: &Path, session_id: &str) -> PathBuf {
-    crate::session_store_dir(keychain_dir, session_id).join(DEVICE_KEYCHAIN_FILE)
-}
-
-pub(crate) fn load_device_bearer(keychain_dir: &Path, session_id: &str) -> Option<String> {
-    let text = std::fs::read_to_string(device_bearer_path(keychain_dir, session_id)).ok()?;
-    let token = text.trim().to_string();
-    (!token.is_empty()).then_some(token)
-}
-
-pub(crate) fn save_device_bearer(keychain_dir: &Path, session_id: &str, token: &str) {
-    if write_secret_file(
-        &device_bearer_path(keychain_dir, session_id),
-        token.as_bytes(),
-    )
-    .is_err()
-    {
-        eprintln!("mail4agent: device keychain write failed for one session");
-    }
 }
 
 fn keychain_path(store_root: &Path, session_id: &str) -> PathBuf {
@@ -1218,6 +1170,7 @@ fn delete_agent_automation(
 
 pub(crate) struct Prepared {
     pub(crate) config: SessionConfig,
+    pub(crate) nick: String,
     pub(crate) user_id: String,
     pub(crate) device_id: DeviceId,
     pub(crate) bearer: Zeroizing<String>,
@@ -1266,8 +1219,6 @@ pub struct MachineClient {
     /// Homeserver the sessions registered on; a bot found by
     /// [`Self::poll_agent_directory`] registers there too.
     homeserver_url: String,
-    /// [`KEYCHAIN_DIR_ENV`] as read at open.
-    keychain_dir: Option<PathBuf>,
     /// Next local-bus user row for a session opened after start.
     bus_next_user: i64,
     /// Session ids whose late open failed, and when. Retried after
@@ -1357,18 +1308,11 @@ impl MachineClient {
             if seen_ids.iter().any(|id: &String| id == config.session_id()) {
                 return Err(ShellError::SessionList("duplicate session id".to_string()));
             }
-            if seen_nicks
-                .iter()
-                .any(|nick: &String| nick.eq_ignore_ascii_case(config.nick()))
-            {
-                return Err(ShellError::SessionList("duplicate nick".to_string()));
-            }
             seen_ids.push(config.session_id().to_string());
-            seen_nicks.push(config.nick().to_string());
             let lock = match lock_store(&config.store_dir()) {
                 Ok(lock) => lock,
                 Err(err) if lenient => {
-                    eprintln!("mail4agent: session {} left out: {err}", config.nick());
+                    eprintln!("mail4agent: session {} left out: {err}", config.session_id());
                     continue;
                 }
                 Err(err) => return Err(err),
@@ -1376,14 +1320,19 @@ impl MachineClient {
             let registered = match register_session(&config) {
                 Ok(registered) => registered,
                 Err(err) if lenient => {
-                    eprintln!("mail4agent: session {} left out: {err}", config.nick());
+                    eprintln!("mail4agent: session {} left out: {err}", config.session_id());
                     continue;
                 }
                 Err(err) => return Err(err),
             };
+            if seen_nicks.iter().any(|nick: &String| nick.eq_ignore_ascii_case(&registered.nick)) {
+                return Err(ShellError::SessionList("duplicate nick".to_string()));
+            }
+            seen_nicks.push(registered.nick.clone());
             locks.push(lock);
             prepared.push(Prepared {
                 config,
+                nick: registered.nick,
                 user_id: registered.user_id,
                 device_id: registered.device_id,
                 bearer: registered.bearer,
@@ -1408,7 +1357,7 @@ impl MachineClient {
         let bus = Arc::new(LocalBus::open(&prepared)?);
         let peers: Vec<(String, String)> = prepared
             .iter()
-            .map(|item| (item.config.nick().to_string(), item.user_id.clone()))
+            .map(|item| (item.nick.to_string(), item.user_id.clone()))
             .collect();
         let mut opened = Vec::with_capacity(prepared.len());
         for item in &prepared {
@@ -1422,12 +1371,12 @@ impl MachineClient {
                 &item.config.homeserver_url,
                 item.bearer.as_str(),
             )?;
-            store.set_registered_nick(item.config.nick().to_string());
+            store.set_registered_nick(item.nick.to_string());
             store.attach_bus(Arc::clone(&bus));
             store.set_local_peers(
                 peers
                     .iter()
-                    .filter(|(nick, _)| nick != item.config.nick())
+                    .filter(|(nick, _)| *nick != item.nick)
                     .cloned()
                     .collect(),
             );
@@ -1438,7 +1387,7 @@ impl MachineClient {
                 leader_cwd: None,
             });
             if item.routine_url.is_none() {
-                attach_detected_chain(&mut store, &item.config);
+                attach_detected_chain(&mut store, &item.config, &item.nick);
             }
             store.drive(1_000, false)?;
             store.abandon_inflight_sync(1_000)?;
@@ -1448,7 +1397,7 @@ impl MachineClient {
             .iter()
             .map(|item| item.bearer.as_str().to_string())
             .collect();
-        let product_mode = prepared[0].config.is_product();
+        let product_mode = true;
         let push = crate::push::PushLink::open(&prepared[0].config.homeserver_url, tokens, product_mode)?;
         Ok(Self {
             product_mode,
@@ -1472,7 +1421,6 @@ impl MachineClient {
             send_sock: None,
             send_queue: Vec::new(),
             homeserver_url: homeserver_url.to_string(),
-            keychain_dir: None,
             bus_next_user: prepared.len() as i64 + 1,
             failed_opens: HashMap::new(),
         })
@@ -1578,35 +1526,8 @@ impl MachineClient {
             }
         }
         let options = WakeOptions::from_lookup(&mut get);
-        let keychain_dir = get(KEYCHAIN_DIR_ENV).map(PathBuf::from);
-        let mut sessions = sessions;
-        let mut loaded_bearers = Vec::new();
-        if let Some(dir) = keychain_dir.as_deref() {
-            for session in sessions.iter_mut() {
-                if session.device_token.is_none() {
-                    session.device_token = load_device_bearer(dir, &session.session_id);
-                }
-                loaded_bearers.push((
-                    crate::session_store_dir(Path::new(&store_root), &session.session_id),
-                    session.session_id.clone(),
-                    session.device_token.clone(),
-                ));
-            }
-        }
         let mut client = Self::open_with(&homeserver_url, Path::new(&store_root), sessions, true)?;
-        if let Some(dir) = keychain_dir.as_deref() {
-            for (store_dir, session_id, loaded) in &loaded_bearers {
-                let Some(store) = client.sessions.iter().find(|s| s.store_dir() == store_dir)
-                else {
-                    continue;
-                };
-                if loaded.as_deref() != Some(store.device_bearer()) {
-                    save_device_bearer(dir, session_id, store.device_bearer());
-                }
-            }
-        }
         client.store_root = Some(PathBuf::from(&store_root));
-        client.keychain_dir = keychain_dir;
         client.skip_nicks = options.skip_nicks;
         client.profile_note = options.profile_note;
         client.session_ids = options.session_ids;
@@ -1782,12 +1703,6 @@ impl MachineClient {
         mut session: HostSession,
         nick: &str,
     ) -> Result<(), ShellError> {
-        if session.device_token.is_none() {
-            if let Some(dir) = self.keychain_dir.as_deref() {
-                session.device_token = load_device_bearer(dir, &session.session_id);
-            }
-        }
-        let loaded = session.device_token.clone();
         if session.routine_url.is_none() || session.routine_bearer.is_none() {
             if let Some(folder) = crate::nick::routine_folder_id(nick) {
                 if let Some((url, key)) = load_wake(store_root, &session.session_id, &folder) {
@@ -1808,6 +1723,7 @@ impl MachineClient {
         }
         let item = Prepared {
             config,
+            nick: registered.nick,
             user_id: registered.user_id,
             device_id: registered.device_id,
             bearer: registered.bearer,
@@ -1825,7 +1741,7 @@ impl MachineClient {
             &item.config.homeserver_url,
             item.bearer.as_str(),
         )?;
-        store.set_registered_nick(item.config.nick().to_string());
+        store.set_registered_nick(item.nick.to_string());
         store.attach_bus(Arc::clone(&self.bus));
         store.set_wake(SessionWake {
             routine_url: item.routine_url.clone(),
@@ -1834,15 +1750,10 @@ impl MachineClient {
             leader_cwd: None,
         });
         if item.routine_url.is_none() {
-            attach_detected_chain(&mut store, &item.config);
+            attach_detected_chain(&mut store, &item.config, &item.nick);
         }
         store.drive(1_000, false)?;
         store.abandon_inflight_sync(1_000)?;
-        if let Some(dir) = self.keychain_dir.as_deref() {
-            if loaded.as_deref() != Some(store.device_bearer()) {
-                save_device_bearer(dir, &session.session_id, store.device_bearer());
-            }
-        }
         self.sessions.push(store);
         self._locks.push(lock);
         self.refresh_local_peers();
@@ -2319,10 +2230,10 @@ fn server_name_of(mxid: &str) -> Result<&str, ShellError> {
 /// provider wake chain (hooks in the open session first, last-resort
 /// spawn only when headless). Nothing changes on the Grok Bot box or for
 /// a session that has a routine.
-fn attach_detected_chain(store: &mut OpenedStore, config: &SessionConfig) {
+fn attach_detected_chain(store: &mut OpenedStore, config: &SessionConfig, nick: &str) {
     if let Some((session, chain)) = crate::provider::chain::detected_web_chain(
         config.session_id(),
-        config.nick(),
+        nick,
         &config.store_root,
     ) {
         store.set_wake_chain(session, chain);
@@ -2392,7 +2303,7 @@ mod tests {
         assert!(loaded[0].agent_id.is_none());
         assert!(loaded[1].routine_url.is_none());
         assert!(loaded[1].routine_bearer.is_none());
-        assert!(loaded[1].device_token.is_none());
+        assert!(loaded[1].invite.is_none());
 
         std::fs::write(
             dir.join("leaked.json"),

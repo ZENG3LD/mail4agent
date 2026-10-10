@@ -10,6 +10,7 @@ use m4a_product_kit::nick_rules::NickRules;
 use m4a_product_kit::tiers::TierTable;
 use m4a_product_kit::{EdgeLink, EventPublisher, UserService};
 
+pub const ADMIN_TOKEN: &str = "admin-token-for-tests";
 pub const SEAM_SECRET: &str = "seam-secret-0123456789abcdef";
 
 pub struct Product {
@@ -28,7 +29,7 @@ pub fn start_product(core_url: &str) -> Product {
                 users: UserService::new(Arc::new(SqliteStore::memory().expect("db")), NickRules::default(), TierTable::default()),
                 events: EventPublisher::spawn(link.clone(), None, Duration::from_millis(50)),
                 link,
-                admin_token: String::new(),
+                admin_token: ADMIN_TOKEN.into(),
                 doors: vec![],
                 anon_read: false,
         tokens: Default::default(),
@@ -52,4 +53,17 @@ pub fn product_user(p: &Product, nick: &str) -> String {
     let st = c.put(format!("{}/product/v1/nick", p.url)).bearer_auth(&token).json(&serde_json::json!({ "nick": nick })).send().expect("nick").status();
     assert!(st.is_success(), "set nick {nick}: {st}");
     token
+}
+
+/// The operator's one-time invite for an agent session that will be called `nick`.
+pub fn product_invite(p: &Product, nick: &str) -> String {
+    let r: serde_json::Value = reqwest::blocking::Client::new()
+        .post(format!("{}/product/v1/admin/invite", p.url))
+        .bearer_auth(ADMIN_TOKEN)
+        .json(&serde_json::json!({ "nick": nick }))
+        .send()
+        .expect("invite")
+        .json()
+        .expect("json");
+    r["invite"].as_str().expect("invite code").to_string()
 }

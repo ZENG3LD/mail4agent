@@ -32,6 +32,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 chrono = { version = "0.4", features = ["clock"] }
 
 [dev-dependencies]
+m4a-agent = { path = "../m4a-agent" }
 mail4agent-server = { workspace = true  }
 m4a-seam = { workspace = true  }
 mail4agent-messenger-shell = { workspace = true  }

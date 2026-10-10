@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::ipc::{SendListener, SendStream};
-use crate::machine::{load_device_bearer, lock_store, save_device_bearer};
+use crate::machine::lock_store;
 use crate::push::PushLink;
 use crate::send::{self, SendReply};
 use crate::{
@@ -133,7 +133,6 @@ struct Slot {
 pub struct GrokListener {
     homeserver_url: String,
     store_root: PathBuf,
-    keychain_dir: PathBuf,
     leader_sock: PathBuf,
     slots: Vec<Slot>,
     push: Option<PushLink>,
@@ -165,13 +164,11 @@ impl GrokListener {
     pub fn new(
         homeserver_url: impl Into<String>,
         store_root: impl Into<PathBuf>,
-        keychain_dir: impl Into<PathBuf>,
         leader_sock: impl Into<PathBuf>,
     ) -> Self {
         Self {
             homeserver_url: homeserver_url.into(),
             store_root: store_root.into(),
-            keychain_dir: keychain_dir.into(),
             leader_sock: leader_sock.into(),
             slots: Vec::new(),
             push: None,
@@ -425,14 +422,7 @@ impl GrokListener {
     }
 
     fn adopt(&mut self, session: &Heard) -> Result<String, ShellError> {
-        let token = load_device_bearer(&self.keychain_dir, &session.session_id);
-        let config = SessionConfig::new(
-            &self.homeserver_url,
-            &session.nick,
-            &session.session_id,
-            &self.store_root,
-            token,
-        )?;
+        let config = SessionConfig::for_session(&self.homeserver_url, &session.session_id, &self.store_root)?;
         let lock = lock_store(&config.store_dir())?;
         let wake = SessionWake {
             routine_url: None,
@@ -441,11 +431,6 @@ impl GrokListener {
             leader_cwd: Some(session.cwd.clone()),
         };
         let store = OpenedStore::connect_with_wake(&config, wake)?;
-        save_device_bearer(
-            &self.keychain_dir,
-            &session.session_id,
-            store.device_bearer(),
-        );
         let user_id = store.user_id().to_string();
         let nick = store.nick().unwrap_or(&session.nick).to_string();
         self.slots.push(Slot {
@@ -463,14 +448,7 @@ impl GrokListener {
         &mut self,
         session: &crate::provider::ProviderSession,
     ) -> Result<String, ShellError> {
-        let token = load_device_bearer(&self.keychain_dir, &session.session_id);
-        let config = SessionConfig::new(
-            &self.homeserver_url,
-            &session.nick,
-            &session.session_id,
-            &self.store_root,
-            token,
-        )?;
+        let config = SessionConfig::for_session(&self.homeserver_url, &session.session_id, &self.store_root)?;
         let lock = lock_store(&config.store_dir())?;
         let store_wake = SessionWake::default();
         let mut store = OpenedStore::connect_with_wake(&config, store_wake)?;
@@ -479,11 +457,6 @@ impl GrokListener {
         ));
         let chain = crate::provider::plan_chain(session, &self.host, &adapters);
         store.set_wake_chain(session.clone(), chain);
-        save_device_bearer(
-            &self.keychain_dir,
-            &session.session_id,
-            store.device_bearer(),
-        );
         let user_id = store.user_id().to_string();
         let nick = store.nick().unwrap_or(&session.nick).to_string();
         self.slots.push(Slot {

@@ -256,15 +256,12 @@ the box host and its local gateway.
   another routine. `M4A_SKIP_NICKS` (comma-separated) lists bots the client
   leaves alone. `m4a-ensure-agent-webhooks` runs the same pass once and
   prints `nick<TAB>folder<TAB>status`.
-- **Sessions and bearers.** `M4A_SESSION_IDS` (`agent_id=session_id`,
-  comma-separated) reuses an existing session for a bot instead of its
-  agent id, e.g. a session registered before this client. The server
-  returns a device bearer only on the register call that creates the
-  device; with `M4A_KEYCHAIN_DIR` set the client reads each session's
-  bearer from `<dir>/<session hash>/device-bearer` and stores a newly
-  minted one there (mode 0600, directory 0700). The keychain directory is
-  separate from `M4A_STORE_ROOT`: no bearer is written next to sealed
-  records.
+- **Sessions and secrets.** `M4A_SESSION_IDS` (`agent_id=session_id`,
+  comma-separated) reuses an existing session id for a bot. Every session logs in by key
+  signature: its identity is generated and kept in the client's vault, enrolled once with the
+  operator's invite (left as `<M4A_STORE_ROOT>/invites/<hash of session id>`, read and deleted
+  by the client; the agent never sees it). No password, token or bearer is read from the
+  environment or stored; the session bearer lives in process memory.
 - **Running it.** `m4a-web-client` opens every session (`from_env`), then
   loops `MachineClient::tick`: pushed events are handed to their session,
   which syncs, decrypts, and POSTs the wake; every `M4A_DRIVE_SECS`
@@ -332,7 +329,7 @@ published. Wire shapes may still move.
 - `mail4agent-grok` — the Grok session courier. Not linked by the daemon. Not published.
 - `mail4agent-vodozemac` — Olm/Megolm fork (Apache-2.0). Not linked by the daemon. Not published.
 - `mail4agent-messenger` — sans-I/O room sync and E2EE engine. Not linked by the daemon. Not published.
-- `mail4agent-server` — Client-Server HTTP routes plus the protocol decisions. No chart accounts and no billing. Nick lives on a messenger session. `POST /client/v3/register` returns the raw device bearer once; the database keeps the SHA-256 hex. Not linked by the daemon. Not published. Mount `http::router`. Enable the `sqlcipher` feature on the binary that opens the database.
+- `mail4agent-server` — Client-Server HTTP routes plus the protocol decisions. No chart accounts and no billing. Nick lives on a messenger session. Sessions come from signed assertions of the product (or the client's own key login); the core has no register door. Not linked by the daemon. Not published. Mount `http::router`. Enable the `sqlcipher` feature on the binary that opens the database.
 - `mail4agent` — the daemon.
 
 ## License

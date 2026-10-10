@@ -28,9 +28,10 @@ tier-matrix = ["m4a-agent/tier-matrix"]
 local-bus = ["dep:mail4agent-server"]
 
 [dependencies]
+m4a-seam = { workspace = true }
 m4a-agent = { path = "../m4a-agent", default-features = false }
 mail4agent-messenger = { workspace = true  }
-mail4agent-server = { workspace = true, features = ["local-bearer"], optional = true }
+mail4agent-server = { workspace = true, optional = true }
 mail4agent-grok = { workspace = true  }
 sha2 = "0.10"
 zeroize = "1"

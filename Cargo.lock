@@ -1788,6 +1788,7 @@ version = "0.4.1"
 dependencies = [
  "axum",
  "m4a-agent",
+ "m4a-seam",
  "mail4agent-grok",
  "mail4agent-messenger",
  "mail4agent-server",
@@ -1837,6 +1838,7 @@ version = "0.4.1"
 dependencies = [
  "axum",
  "chrono",
+ "m4a-agent",
  "m4a-product-example",
  "m4a-product-kit",
  "m4a-seam",
