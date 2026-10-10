@@ -1630,6 +1630,7 @@ dependencies = [
  "m4a-edge",
  "m4a-product-kit",
  "m4a-seam",
+ "mail4agent-messenger",
  "mail4agent-messenger-shell",
  "mail4agent-server",
  "reqwest",

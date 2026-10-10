@@ -63,6 +63,7 @@ impl HttpExec {
     /// Our own mounts serve `/client/v3` without the spec prefix. Anything else is asked, never
     /// assumed: `GET /_matrix/client/versions` answering 2xx means the prefix is served.
     pub fn probe_prefix(&mut self) -> bool {
+        self.keep_prefix = true; // ask with the prefix on
         self.keep_prefix = self.get_status("/_matrix/client/versions").is_some_and(|s| (200..300).contains(&s));
         self.keep_prefix
     }
