@@ -2386,8 +2386,9 @@ impl LocalBus {
     /// Adds one session opened after start, as [`Self::open`] seeds each.
     fn seed(&self, user_row: i64, item: &Prepared) -> Result<(), ShellError> {
         let _gate = self.gate.lock().unwrap_or_else(|err| err.into_inner());
-        let conn = self.state.conn.lock().unwrap_or_else(|err| err.into_inner());
+        self.state.conn_scope(|conn: &mut rusqlite::Connection| {
         seed_session(&conn, user_row, item)
+        })
     }
 
     fn set_local_only(&self, enabled: bool) {

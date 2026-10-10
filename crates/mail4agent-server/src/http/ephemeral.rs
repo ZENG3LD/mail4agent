@@ -42,8 +42,9 @@ async fn put_typing(
     let state_for_blocking = Arc::clone(&state);
 
     let wake_ids = tokio::task::spawn_blocking(move || {
-        let conn = state_for_blocking.conn.lock().unwrap_or_else(|e| e.into_inner());
+        state_for_blocking.conn_scope(|conn: &mut rusqlite::Connection| {
         ephemeral::apply_typing(&conn, &state_for_blocking.typing, &room_id, user_id, typing, timeout_ms, Instant::now())
+        })
     })
     .await
     .map_err(|_| MatrixError::internal())??;
@@ -68,10 +69,11 @@ async fn post_receipt(
     let state_for_blocking = Arc::clone(&state);
 
     let wake_ids = tokio::task::spawn_blocking(move || {
-        let mut conn = state_for_blocking.conn.lock().unwrap_or_else(|e| e.into_inner());
+        state_for_blocking.conn_scope(|conn: &mut rusqlite::Connection| {
         let room = crate::store::get_room(&conn, &room_id)?.ok_or_else(|| MatrixError::not_found("no such room"))?;
         let now_ms = chrono::Utc::now().timestamp_millis();
-        ephemeral::apply_receipt(&mut conn, &room, user_id, receipt_type, &event_id, now_ms)
+        ephemeral::apply_receipt(&mut *conn, &room, user_id, receipt_type, &event_id, now_ms)
+        })
     })
     .await
     .map_err(|_| MatrixError::internal())??;
@@ -93,11 +95,11 @@ async fn post_read_markers(
     let state_for_blocking = Arc::clone(&state);
 
     let wake_ids = tokio::task::spawn_blocking(move || {
-        let mut conn = state_for_blocking.conn.lock().unwrap_or_else(|e| e.into_inner());
+        state_for_blocking.conn_scope(|conn: &mut rusqlite::Connection| {
         let room = crate::store::get_room(&conn, &room_id)?.ok_or_else(|| MatrixError::not_found("no such room"))?;
         let now_ms = chrono::Utc::now().timestamp_millis();
         ephemeral::apply_read_markers(
-            &mut conn,
+            &mut *conn,
             &room,
             user_id,
             body.fully_read.as_deref(),
@@ -105,6 +107,7 @@ async fn post_read_markers(
             body.read_private.as_deref(),
             now_ms,
         )
+        })
     })
     .await
     .map_err(|_| MatrixError::internal())??;

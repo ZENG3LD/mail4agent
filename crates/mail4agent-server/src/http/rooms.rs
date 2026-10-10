@@ -81,8 +81,9 @@ where
     let state = Arc::clone(state);
     tokio::task::spawn_blocking(move || {
         let result = {
-            let mut conn = state.conn.lock().unwrap_or_else(|e| e.into_inner());
-            work(&mut conn)
+            state.conn_scope(|conn: &mut rusqlite::Connection| {
+            work(&mut *conn)
+            })
         };
         result
     })
@@ -612,10 +613,7 @@ mod tests {
         let text = String::from_utf8_lossy(&body);
         assert!(text.contains("choose a nick"), "{text}");
 
-        {
-            let conn = state.conn.lock().unwrap_or_else(|e| e.into_inner());
-            crate::nick::set_nick(&conn, 1, "alice_nick").expect("nick");
-        }
+        state.conn_async(|conn| crate::nick::set_nick(conn, 1, "alice_nick").expect("nick")).await;
 
         let response = crate::http::router(state)
             .oneshot(create_room_request(Some(RAW_TOKEN)))

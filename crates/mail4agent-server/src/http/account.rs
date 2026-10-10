@@ -54,10 +54,11 @@ async fn get_account_data_global(
     account::check_caller_owns_user_id(&user_id, &caller.mxid)?;
     let owner = caller.user_id;
     let content = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MatrixError> {
-        let conn = state.conn.lock().unwrap_or_else(|e| e.into_inner());
+        state.conn_scope(|conn: &mut rusqlite::Connection| {
         let row = crate::store::get_account_data(&conn, owner, crate::store::GLOBAL_ACCOUNT_DATA_ROOM, &event_type)?
             .ok_or_else(|| MatrixError::not_found("no account data of this type"))?;
         Ok(serde_json::from_str(&row.content)?)
+        })
     })
     .await
     .map_err(|_| MatrixError::internal())??;
@@ -77,9 +78,10 @@ async fn put_account_data_global(
     let state_db = Arc::clone(&state);
     let owner = caller.user_id;
     tokio::task::spawn_blocking(move || -> Result<(), MatrixError> {
-        let mut conn = state_db.conn.lock().unwrap_or_else(|e| e.into_inner());
-        crate::store::upsert_account_data(&mut conn, owner, crate::store::GLOBAL_ACCOUNT_DATA_ROOM, &event_type, &content_str)?;
+        state_db.conn_scope(|conn: &mut rusqlite::Connection| {
+        crate::store::upsert_account_data(&mut *conn, owner, crate::store::GLOBAL_ACCOUNT_DATA_ROOM, &event_type, &content_str)?;
         Ok(())
+        })
     })
     .await
     .map_err(|_| MatrixError::internal())??;
@@ -96,11 +98,12 @@ async fn get_account_data_room(
     account::check_caller_owns_user_id(&user_id, &caller.mxid)?;
     let owner = caller.user_id;
     let content = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MatrixError> {
-        let conn = state.conn.lock().unwrap_or_else(|e| e.into_inner());
+        state.conn_scope(|conn: &mut rusqlite::Connection| {
         require_room(&conn, &room_id, owner, false)?;
         let row = crate::store::get_account_data(&conn, owner, &room_id, &event_type)?
             .ok_or_else(|| MatrixError::not_found("no account data of this type"))?;
         Ok(serde_json::from_str(&row.content)?)
+        })
     })
     .await
     .map_err(|_| MatrixError::internal())??;
@@ -120,10 +123,11 @@ async fn put_account_data_room(
     let state_db = Arc::clone(&state);
     let owner = caller.user_id;
     tokio::task::spawn_blocking(move || -> Result<(), MatrixError> {
-        let mut conn = state_db.conn.lock().unwrap_or_else(|e| e.into_inner());
+        state_db.conn_scope(|conn: &mut rusqlite::Connection| {
         require_room(&conn, &room_id, owner, false)?;
-        crate::store::upsert_account_data(&mut conn, owner, &room_id, &event_type, &content_str)?;
+        crate::store::upsert_account_data(&mut *conn, owner, &room_id, &event_type, &content_str)?;
         Ok(())
+        })
     })
     .await
     .map_err(|_| MatrixError::internal())??;
@@ -140,9 +144,10 @@ async fn get_tags(
     account::check_caller_owns_user_id(&user_id, &caller.mxid)?;
     let owner = caller.user_id;
     let tags = tokio::task::spawn_blocking(move || -> Result<serde_json::Map<String, serde_json::Value>, MatrixError> {
-        let conn = state.conn.lock().unwrap_or_else(|e| e.into_inner());
+        state.conn_scope(|conn: &mut rusqlite::Connection| {
         require_room(&conn, &room_id, owner, true)?;
         account::read_tags(&conn, owner, &room_id)
+        })
     })
     .await
     .map_err(|_| MatrixError::internal())??;
@@ -161,9 +166,10 @@ async fn put_tag(
     let owner = caller.user_id;
     let order = body.order;
     tokio::task::spawn_blocking(move || -> Result<(), MatrixError> {
-        let mut conn = state_db.conn.lock().unwrap_or_else(|e| e.into_inner());
+        state_db.conn_scope(|conn: &mut rusqlite::Connection| {
         require_room(&conn, &room_id, owner, true)?;
-        account::apply_tag_put(&mut conn, owner, &room_id, &tag, order)
+        account::apply_tag_put(&mut *conn, owner, &room_id, &tag, order)
+        })
     })
     .await
     .map_err(|_| MatrixError::internal())??;
@@ -181,9 +187,10 @@ async fn delete_tag(
     let state_db = Arc::clone(&state);
     let owner = caller.user_id;
     tokio::task::spawn_blocking(move || -> Result<(), MatrixError> {
-        let mut conn = state_db.conn.lock().unwrap_or_else(|e| e.into_inner());
+        state_db.conn_scope(|conn: &mut rusqlite::Connection| {
         require_room(&conn, &room_id, owner, true)?;
-        account::apply_tag_delete(&mut conn, owner, &room_id, &tag)
+        account::apply_tag_delete(&mut *conn, owner, &room_id, &tag)
+        })
     })
     .await
     .map_err(|_| MatrixError::internal())??;
@@ -202,8 +209,9 @@ async fn post_filter(
     let definition = account::validate_filter_definition(&body)?;
     let owner = caller.user_id;
     let filter_id = tokio::task::spawn_blocking(move || -> Result<i64, MatrixError> {
-        let conn = state.conn.lock().unwrap_or_else(|e| e.into_inner());
+        state.conn_scope(|conn: &mut rusqlite::Connection| {
         Ok(crate::store::create_filter(&conn, owner, &definition)?)
+        })
     })
     .await
     .map_err(|_| MatrixError::internal())??;
@@ -220,8 +228,9 @@ async fn get_filter(
     let filter_id: i64 = filter_id.parse().map_err(|_| MatrixError::invalid_param("filterId must be numeric"))?;
     let owner = caller.user_id;
     let content = tokio::task::spawn_blocking(move || -> Result<String, MatrixError> {
-        let conn = state.conn.lock().unwrap_or_else(|e| e.into_inner());
+        state.conn_scope(|conn: &mut rusqlite::Connection| {
         crate::store::get_filter(&conn, owner, filter_id)?.ok_or_else(|| MatrixError::not_found("no such filter"))
+        })
     })
     .await
     .map_err(|_| MatrixError::internal())??;
@@ -251,9 +260,10 @@ async fn profile_response(
 ) -> Result<Json<serde_json::Value>, MatrixError> {
     super::resolve_caller(&state, &headers, None).await?;
     let displayname = tokio::task::spawn_blocking(move || -> Result<String, MatrixError> {
-        let conn = state.conn.lock().unwrap_or_else(|e| e.into_inner());
+        state.conn_scope(|conn: &mut rusqlite::Connection| {
         let user_id = crate::store::user_id_of(&conn, &mxid)?.ok_or_else(|| MatrixError::not_found("unknown user"))?;
         Ok(crate::nick::effective_label(&conn, user_id)?)
+        })
     })
     .await
     .map_err(|_| MatrixError::internal())??;
@@ -286,13 +296,14 @@ async fn user_directory_search(
         None => account::DEFAULT_DIRECTORY_RESULTS,
     };
     let response = tokio::task::spawn_blocking(move || -> Result<account::UserDirectorySearchResponse, MatrixError> {
-        let conn = state.conn.lock().unwrap_or_else(|e| e.into_inner());
+        state.conn_scope(|conn: &mut rusqlite::Connection| {
         let (hits, limited) = crate::nick::search_nicks(&conn, &term, limit)?;
         let results = hits
             .into_iter()
             .map(|hit| account::UserDirectoryResult { user_id: hit.mxid, display_name: hit.nick })
             .collect();
         Ok(account::UserDirectorySearchResponse { results, limited })
+        })
     })
     .await
     .map_err(|_| MatrixError::internal())??;
@@ -324,8 +335,9 @@ async fn public_rooms(
 ) -> Result<Json<serde_json::Value>, MatrixError> {
     super::resolve_caller(&state, &headers, None).await?;
     let response = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MatrixError> {
-        let conn = state.conn.lock().unwrap_or_else(|e| e.into_inner());
+        state.conn_scope(|conn: &mut rusqlite::Connection| {
         account::list_public_rooms(&conn, since.as_deref(), limit, search_term.as_deref())
+        })
     })
     .await
     .map_err(|_| MatrixError::internal())??;

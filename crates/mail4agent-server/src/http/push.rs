@@ -64,7 +64,7 @@ fn parse_register(text: &str) -> Option<Vec<String>> {
 
 async fn resolve_users(state: Arc<Homeserver>, tokens: Vec<String>) -> Result<Vec<i64>, ()> {
     tokio::task::spawn_blocking(move || -> Result<Vec<i64>, ()> {
-        let conn = state.conn.lock().unwrap_or_else(|err| err.into_inner());
+        state.conn_scope(|conn: &mut rusqlite::Connection| {
         let mut users = Vec::new();
         for token in &tokens {
             let hash = hash_token(token);
@@ -79,6 +79,7 @@ async fn resolve_users(state: Arc<Homeserver>, tokens: Vec<String>) -> Result<Ve
             return Err(());
         }
         Ok(users)
+        })
     })
     .await
     .map_err(|_| ())?

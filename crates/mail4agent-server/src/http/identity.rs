@@ -133,9 +133,10 @@ pub(super) async fn assertion_layer(State(state): State<Arc<Homeserver>>, mut re
     }
     let st = Arc::clone(&state);
     let done = tokio::task::spawn_blocking(move || -> Result<String, MatrixError> {
-        let mut conn = st.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let r = identities::resolve_assertion(&mut conn, &a.nick, &a.cred_ref, now)?;
+        st.conn_scope(|conn: &mut rusqlite::Connection| {
+        let r = identities::resolve_assertion(&mut *conn, &a.nick, &a.cred_ref, now)?;
         Ok(format!("{}|{}|{}", r.identity.id, r.device_id, a.paid))
+        })
     })
     .await;
     match done {
@@ -268,12 +269,12 @@ mod tests {
         let (st, body) = call(&hs, signed_req("GET", p, &assertion("ivy", "c1", "n1", 0), Body::empty())).await;
         assert_eq!(st, StatusCode::OK, "{body}");
         assert_eq!(body["displayname"], "ivy");
-        {
-            let c = hs.conn.lock().unwrap();
-            let a = identities::identity_by_nick(&c, "ivy").unwrap().unwrap();
-            assert_eq!(crate::store::mxid_of(&c, a.id).unwrap().as_deref(), Some("@ivy:example.org"));
-            assert_eq!(crate::keys::list_devices(&c, a.id).unwrap().len(), 1);
-        }
+        hs.conn_async(|c| {
+            let a = identities::identity_by_nick(c, "ivy").unwrap().unwrap();
+            assert_eq!(crate::store::mxid_of(c, a.id).unwrap().as_deref(), Some("@ivy:example.org"));
+            assert_eq!(crate::keys::list_devices(c, a.id).unwrap().len(), 1);
+        })
+        .await;
         let forged = Req::builder().uri(p).header(RESOLVED_HEADER, "1|X|1").body(Body::empty()).unwrap();
         assert_eq!(call(&hs, forged).await.0, StatusCode::UNAUTHORIZED, "no token, forged hand-over is stripped");
         let mut r = signed_req("GET", p, &assertion("ivy", "c1", "n2", 0), Body::empty());
@@ -282,7 +283,7 @@ mod tests {
         // no assertion at all never creates anything
         let none = Req::builder().uri("/client/v3/capabilities").body(Body::empty()).unwrap();
         assert_eq!(call(&hs, none).await.0, StatusCode::UNAUTHORIZED);
-        let n: i64 = hs.conn.lock().unwrap().query_row("SELECT COUNT(*) FROM identities", [], |r| r.get(0)).unwrap();
+        let n: i64 = hs.conn_async(|c| c.query_row("SELECT COUNT(*) FROM identities", [], |r| r.get(0)).unwrap()).await;
         assert_eq!(n, 1);
     }
 
@@ -294,7 +295,7 @@ mod tests {
         assert_eq!(st, StatusCode::FORBIDDEN, "displayname is the product's, the core never sets it");
         let (st, _) = call(&hs, signed_req("PUT", "/client/v3/profile/@jay:example.org/displayname", &a, Body::from("{}"))).await;
         assert_eq!(st, StatusCode::UNAUTHORIZED, "same nonce again");
-        hs.conn.lock().unwrap().execute_batch("INSERT INTO matrix_users (user_id, mxid, created_at) VALUES (77, '@taken:example.org', 't')").unwrap();
+        hs.conn_async(|c| c.execute_batch("INSERT INTO matrix_users (user_id, mxid, created_at) VALUES (77, '@taken:example.org', 't')").unwrap()).await;
         let (st, body) = call(&hs, signed_req("GET", "/client/v3/capabilities", &assertion("taken", "c3", "n9", 0), Body::empty())).await;
         assert_eq!((st, body["errcode"].as_str()), (StatusCode::CONFLICT, Some("M4A_NICK_CONFLICT")));
     }

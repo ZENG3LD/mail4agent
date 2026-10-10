@@ -111,9 +111,11 @@ impl Stack {
         (b["nick"].as_str().unwrap().to_string(), b["token"].as_str().unwrap().to_string())
     }
     /// Poll the core until `f` holds (events are delivered asynchronously).
-    async fn until(&self, what: &str, f: impl Fn(&Connection) -> bool) {
+    async fn until(&self, what: &str, f: impl Fn(&Connection) -> bool + Send + Sync + 'static) {
+        let f = Arc::new(f);
         for _ in 0..100 {
-            if f(&self.core.conn.lock().unwrap()) {
+            let g = Arc::clone(&f);
+            if self.core.conn_async(move |c| g(c)).await {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -130,7 +132,7 @@ async fn register_contact_room_message_rename_logout_and_delete_through_the_whol
     assert_eq!((a_nick.len(), b_nick.len()), (8, 8), "placeholder nicks");
 
     // Registration alone does not touch the messenger.
-    assert_eq!(s.core.conn.lock().unwrap().query_row::<i64, _, _>("SELECT COUNT(*) FROM identities", [], |r| r.get(0)).unwrap(), 0);
+    assert_eq!(s.core.conn_async(|c| c.query_row::<i64, _, _>("SELECT COUNT(*) FROM identities", [], |r| r.get(0)).unwrap()).await, 0);
 
     // Nick before first contact: free, and the messenger's localpart becomes the short nick.
     let (st, b) = s.send("PUT", "/product/v1/nick", Some(&a_tok), Some(json!({"nick":"alice"}))).await;
@@ -150,11 +152,8 @@ async fn register_contact_room_message_rename_logout_and_delete_through_the_whol
         let (st, b) = s.send("GET", "/_matrix/client/v3/capabilities", Some(t), None).await;
         assert_eq!(st, 200, "{b}");
     }
-    {
-        let c = s.core.conn.lock().unwrap();
-        let ids: Vec<String> = c.prepare("SELECT localpart FROM identities ORDER BY id").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
-        assert_eq!(ids, vec!["alice", "bobby"]);
-    }
+    let ids: Vec<String> = s.core.conn_async(|c| c.prepare("SELECT localpart FROM identities ORDER BY id").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect()).await;
+    assert_eq!(ids, vec!["alice", "bobby"]);
 
     // Room, invite, join, message, read: a normal Matrix flow through the proxy.
     let (st, b) = s.post("/_matrix/client/v3/createRoom", Some(&a_tok), json!({"name":"hello","preset":"private_chat"})).await;
@@ -183,25 +182,25 @@ async fn register_contact_room_message_rename_logout_and_delete_through_the_whol
     assert_eq!(s.send("GET", "/_matrix/client/v3/capabilities", Some(&c_tok), None).await.0, 200);
     let (st, b) = s.send("PUT", "/product/v1/nick", Some(&c_tok), Some(json!({"nick":"carla"}))).await;
     assert_eq!((st, b["nick"].as_str()), (200, Some("carla")));
-    s.until("identity renamed", |c| c.query_row("SELECT nick FROM identities WHERE localpart = ?1", [&c_nick], |r| r.get::<_, String>(0)).map(|n| n == "carla").unwrap_or(false)).await;
+    s.until("identity renamed", {let c_nick = c_nick.clone(); move |c: &Connection| c.query_row("SELECT nick FROM identities WHERE localpart = ?1", [&c_nick], |r| r.get::<_, String>(0)).map(|n| n == "carla").unwrap_or(false)}).await;
     let (st, b) = s.send("GET", &format!("/_matrix/client/v3/profile/@{c_nick}:example.org/displayname"), Some(&c_tok), None).await;
     assert_eq!((st, b["displayname"].as_str()), (200, Some("carla")));
     // Same credential keeps working under the new nick, same identity.
     assert_eq!(s.send("GET", "/_matrix/client/v3/capabilities", Some(&c_tok), None).await.0, 200);
-    assert_eq!(s.core.conn.lock().unwrap().query_row::<i64, _, _>("SELECT COUNT(*) FROM identities", [], |r| r.get(0)).unwrap(), 3);
+    assert_eq!(s.core.conn_async(|c| c.query_row::<i64, _, _>("SELECT COUNT(*) FROM identities", [], |r| r.get(0)).unwrap()).await, 3);
 
     // Logout: product refuses the token at once; the core drops the device.
     let devs = |c: &Connection, n: &str| c.query_row::<i64, _, _>("SELECT COUNT(*) FROM devices d JOIN identities i ON i.id = d.user_id WHERE i.nick = ?1", [n], |r| r.get(0)).unwrap();
-    assert_eq!(devs(&s.core.conn.lock().unwrap(), "bobby"), 1);
+    assert_eq!(s.core.conn_async(move |c| devs(c, "bobby")).await, 1);
     assert_eq!(s.post("/product/v1/logout", Some(&b_tok), json!({})).await.0, 200);
     assert_eq!(s.send("GET", "/_matrix/client/v3/capabilities", Some(&b_tok), None).await.0, 401);
-    s.until("device removed", |c| devs(c, "bobby") == 0).await;
+    s.until("device removed", move |c| devs(c, "bobby") == 0).await;
 
     // Admin API is closed without the admin token; delete retires the identity in the core.
     assert_eq!(s.post("/product/v1/admin/delete", Some("nope"), json!({"nick":"alice"})).await.0, 403);
     assert_eq!(s.post("/product/v1/admin/delete", Some(ADMIN), json!({"nick":"alice"})).await.0, 200);
     s.until("identity retired", |c| c.query_row::<i64, _, _>("SELECT COUNT(*) FROM identities WHERE nick = 'alice'", [], |r| r.get(0)).unwrap() == 0).await;
-    assert_eq!(s.core.conn.lock().unwrap().query_row::<i64, _, _>("SELECT COUNT(*) FROM reserved_localparts WHERE localpart = 'alice'", [], |r| r.get(0)).unwrap(), 1);
+    assert_eq!(s.core.conn_async(|c| c.query_row::<i64, _, _>("SELECT COUNT(*) FROM reserved_localparts WHERE localpart = 'alice'", [], |r| r.get(0)).unwrap()).await, 1);
     assert_eq!(s.send("GET", "/_matrix/client/v3/capabilities", Some(&a_tok), None).await.0, 401);
 }
 
@@ -365,20 +364,18 @@ async fn startup_reconcile_applies_revocations_and_deletions_the_messenger_never
         assert_eq!(s.send("GET", "/_matrix/client/v3/account/whoami", Some(t), None).await.0, 200);
     }
     let count = |sql: &'static str| move |c: &Connection| c.query_row::<i64, _, _>(sql, [], |r| r.get(0)).unwrap();
-    assert_eq!(count("SELECT COUNT(*) FROM identities")(&s.core.conn.lock().unwrap()), 2);
+    assert_eq!(s.core.conn_async(move |c| count("SELECT COUNT(*) FROM identities")(c)).await, 2);
     // The product lost track of b entirely and of a's only credential, without any event having been sent.
     let snap = m4a_seam::Reconcile { id: "r1".into(), complete: true, nicks: vec![m4a_seam::LiveNick { nick: a_nick.clone(), creds: vec![] }] };
     m4a_product_kit::send_reconcile(&s.link, None, &snap, Duration::from_millis(20), 3).await.unwrap();
-    s.until("b retired and a's device gone", |c| count("SELECT COUNT(*) FROM identities")(c) == 1 && count("SELECT COUNT(*) FROM devices")(c) == 0).await;
-    let c = s.core.conn.lock().unwrap();
-    let left: String = c.query_row("SELECT nick FROM identities", [], |r| r.get(0)).unwrap();
+    s.until("b retired and a's device gone", move |c| count("SELECT COUNT(*) FROM identities")(c) == 1 && count("SELECT COUNT(*) FROM devices")(c) == 0).await;
+    let left: String = s.core.conn_async(|c| c.query_row("SELECT nick FROM identities", [], |r| r.get(0)).unwrap()).await;
     assert_eq!(left, a_nick);
     assert_ne!(left, b_nick);
-    drop(c);
     // A partial snapshot never retires anyone.
     let partial = m4a_seam::Reconcile { id: "r2".into(), complete: false, nicks: vec![] };
     m4a_product_kit::send_reconcile(&s.link, None, &partial, Duration::from_millis(20), 3).await.unwrap();
-    assert_eq!(count("SELECT COUNT(*) FROM identities")(&s.core.conn.lock().unwrap()), 1);
+    assert_eq!(s.core.conn_async(move |c| count("SELECT COUNT(*) FROM identities")(c)).await, 1);
     // A forged snapshot is refused.
     let forged = s.c.post(format!("{}/_matrix/account-source/v1/reconcile", s.edge)).header("x-m4a-link-token", LINK).header(m4a_seam::DEFAULT_EVENT_SIG_HEADER, "00").body("{\"id\":\"x\",\"complete\":true,\"nicks\":[]}").send().await.unwrap();
     assert_eq!(forged.status().as_u16(), 401);

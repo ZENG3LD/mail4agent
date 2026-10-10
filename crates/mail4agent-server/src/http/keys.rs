@@ -64,8 +64,9 @@ where
 {
     let state = Arc::clone(state);
     tokio::task::spawn_blocking(move || {
-        let mut conn = state.conn.lock().unwrap_or_else(|poison| poison.into_inner());
-        f(&mut conn)
+        state.conn_scope(|conn: &mut rusqlite::Connection| {
+        f(&mut *conn)
+        })
     })
     .await
     .map_err(|_| MatrixError::internal())?

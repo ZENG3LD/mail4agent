@@ -1,16 +1,25 @@
 //! One-shot: open homeserver SQLCipher DB with M4A_DB_KEY_HEX and print
 //! schema + nick/session inventory. Does not print bearer tokens or key material.
 use std::env;
-use mail4agent_server::store::init_messenger_db;
+use mail4agent_server::store::open_messenger_db;
 
 fn main() {
     let path = env::args().nth(1).expect("usage: dump_db <db-path>");
     let key = env::var("M4A_DB_KEY_HEX").expect("M4A_DB_KEY_HEX required");
-    let conn = init_messenger_db(&path, &key).unwrap_or_else(|e| {
+    let db = open_messenger_db(&path, &key).unwrap_or_else(|e| {
         eprintln!("OPEN_FAILED: {e}");
         std::process::exit(2);
     });
-    println!("OPEN_OK path={path}");
+    db.read_blocking(|conn| {
+        dump(conn);
+        Ok(())
+    })
+    .expect("dump");
+}
+
+fn dump(conn: &rusqlite::Connection) {
+    println!("OPEN_OK");
+
     println!("=== sqlite_master ===");
     let mut stmt = conn
         .prepare("SELECT type, name FROM sqlite_master ORDER BY type, name")

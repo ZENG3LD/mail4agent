@@ -15,13 +15,12 @@ default = []
 # Device-bearer credentials resolve to a caller. Only the client shell's in-process local
 # bus enables it (its own private bus, no network); the server binary never does.
 local-bearer = []
-# Turns `PRAGMA key` into real SQLCipher. Off by default so a workspace
-# build of the mailbox daemon does not link OpenSSL. The builder enables
-# this on the binary that opens `init_messenger_db`.
-sqlcipher = ["rusqlite/bundled-sqlcipher"]
 
 [dependencies]
-rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+# Storage engine: one writer, bounded parallel readers, SQLCipher (the published crate; its
+# `cipher-native` feature selects the SQLCipher build of rusqlite, there is no plaintext build here).
+tesserax-store = { version = "0.1.1", features = ["cipher-native"] }
+rusqlite = { version = "0.32", features = ["backup"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"

@@ -43,8 +43,9 @@ async fn sync_handler(
         let state = Arc::clone(&state);
         let filter_raw = query.filter.clone();
         tokio::task::spawn_blocking(move || -> Result<crate::sync::SyncFilter, MatrixError> {
-            let conn = state.conn.lock().unwrap_or_else(|poison| poison.into_inner());
+            state.conn_scope(|conn: &mut rusqlite::Connection| {
             crate::sync::parse_filter_param(&conn, user_id, filter_raw.as_deref())
+            })
         })
         .await
         .map_err(|_| MatrixError::internal())??
@@ -61,7 +62,7 @@ async fn sync_handler(
             let device_id = device_id.clone();
             let filter = filter.clone();
             tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MatrixError> {
-                let conn = state.conn.lock().unwrap_or_else(|poison| poison.into_inner());
+                state.conn_scope(|conn: &mut rusqlite::Connection| {
                 // A `since` above the server's own stream counter cannot come from this
                 // store (fresh instance, restored backup): answer with an initial sync.
                 let since = match since {
@@ -87,6 +88,7 @@ async fn sync_handler(
                     full_state,
                     std::time::Instant::now(),
                 )
+                })
             })
             .await
             .map_err(|_| MatrixError::internal())??

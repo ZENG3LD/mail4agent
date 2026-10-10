@@ -44,7 +44,11 @@ pub struct Caller {
 }
 
 pub struct Homeserver {
-    pub conn: std::sync::Mutex<Connection>,
+    /// The store: one writer, bounded parallel readers (tesserax-store). Reach it through
+    /// [`Homeserver::conn_scope`] (blocking threads) or [`with_conn_pub`] (async).
+    pub db: tesserax_store::Db,
+    /// Parallel read-only connections (file-backed stores only; `None` for in-memory stores).
+    pub readers: std::sync::OnceLock<tesserax_store::ReadPool>,
     pub live: LiveRegistry,
     pub typing: TypingRegistry,
     pub claim_rate: ClaimRateLimiter,
@@ -72,9 +76,24 @@ pub struct Homeserver {
 }
 
 impl Homeserver {
+    /// A store over an already-open in-memory connection (tests, the client's local bus).
+    /// File-backed stores come from [`Homeserver::from_db`].
     pub fn new(conn: Connection) -> Self {
+        let db = tesserax_store::Db::open(&tesserax_store::DbConfig::in_memory()).expect("in-memory store");
+        // Nothing else holds the fresh writer yet, so this never contends (and never blocks a runtime thread).
+        db.blocking(|c| {
+            *c = conn;
+            Ok(())
+        })
+        .expect("install connection");
+        Self::from_db(db)
+    }
+
+    /// A store over an opened tesserax-store writer.
+    pub fn from_db(db: tesserax_store::Db) -> Self {
         Self {
-            conn: std::sync::Mutex::new(conn),
+            db,
+            readers: std::sync::OnceLock::new(),
             live: LiveRegistry::new(),
             typing: TypingRegistry::new(),
             claim_rate: ClaimRateLimiter::new(),
@@ -119,6 +138,19 @@ pub fn raw_token(headers: &HeaderMap, query_token: Option<&str>) -> Option<Strin
     query_token.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
 }
 
+impl Homeserver {
+    /// Runs `f` on the single writer connection, waiting for it. For blocking threads only
+    /// (`spawn_blocking`, plain threads); async code uses [`with_conn_pub`].
+    /// Async form of [`Homeserver::conn_scope`] (runs on the blocking pool).
+    pub async fn conn_async<T: Send + 'static>(&self, f: impl FnOnce(&mut Connection) -> T + Send + 'static) -> T {
+        self.db.write(move |c| Ok(f(c))).await.expect("store writer")
+    }
+
+    pub fn conn_scope<T>(&self, f: impl FnOnce(&mut Connection) -> T) -> T {
+        self.db.write_blocking(|c| Ok(f(c))).expect("store writer")
+    }
+}
+
 pub async fn resolve_caller(
     state: &Arc<Homeserver>,
     headers: &HeaderMap,
@@ -131,9 +163,10 @@ pub async fn resolve_caller(
         }
         let state = Arc::clone(state);
         return tokio::task::spawn_blocking(move || -> Result<Caller, MatrixError> {
-            let conn = state.conn.lock().unwrap_or_else(|e| e.into_inner());
+            state.conn_scope(|conn: &mut rusqlite::Connection| {
             let mxid = crate::store::mxid_of(&conn, user_id)?.ok_or_else(MatrixError::unknown_token)?;
             Ok(Caller { user_id, mxid, device_id, claims })
+            })
         })
         .await
         .map_err(|_| MatrixError::internal())?;
@@ -155,11 +188,12 @@ async fn resolve_bearer(state: &Arc<Homeserver>, headers: &HeaderMap, query_toke
     let hash = hash_token(&raw);
     let state = Arc::clone(state);
     tokio::task::spawn_blocking(move || -> Result<Caller, MatrixError> {
-        let conn = state.conn.lock().unwrap_or_else(|e| e.into_inner());
+        state.conn_scope(|conn: &mut rusqlite::Connection| {
         let device = crate::keys::device_for_credential(&conn, CredentialKind::Bearer, &hash)?
             .ok_or_else(MatrixError::unknown_token)?;
         let mxid = crate::store::mxid_of(&conn, device.user_id)?.ok_or_else(MatrixError::unknown_token)?;
         Ok(Caller { user_id: device.user_id, mxid, device_id: device.device_id, claims: crate::policy::Claims::new() })
+        })
     })
     .await
     .map_err(|_| MatrixError::internal())?
@@ -172,12 +206,7 @@ where
     F: FnOnce(&mut Connection) -> Result<T, MatrixError> + Send + 'static,
 {
     let state = Arc::clone(state);
-    tokio::task::spawn_blocking(move || {
-        let mut conn = state.conn.lock().unwrap_or_else(|e| e.into_inner());
-        work(&mut conn)
-    })
-    .await
-    .map_err(|_| MatrixError::internal())?
+    state.db.write(move |conn| Ok(work(conn))).await.map_err(|_| MatrixError::internal())?
 }
 
 pub fn wake_users(state: &Homeserver, ids: impl IntoIterator<Item = i64>) {

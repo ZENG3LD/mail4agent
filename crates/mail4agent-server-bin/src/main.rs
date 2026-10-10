@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use mail4agent_server::http::{router, Homeserver};
-use mail4agent_server::store::{self, init_messenger_db};
+use mail4agent_server::store::{self, open_messenger_db};
 use rusqlite::Connection;
 use tokio::net::TcpListener;
 
@@ -100,12 +100,12 @@ fn run() -> Result<(), String> {
         env::var("M4A_DB_KEY_HEX").map_err(|_| "M4A_DB_KEY_HEX is required".to_string())?;
     validate_key_hex(&key_hex)?;
 
-    let mut conn = open_messenger(&server_name, &db_path, &key_hex)?;
+    let db = open_messenger(&server_name, &db_path, &key_hex)?;
     if let Ok(names) = env::var("M4A_LOCAL_NAMES") {
         mail4agent_server::store::set_local_aliases(names.split(',').map(str::to_string));
     }
-    run_boot_migrations(&mut conn)?;
-    let hs = Arc::new(Homeserver::new(conn));
+    db.blocking(|conn| Ok(run_boot_migrations(conn))).map_err(|e| format!("store: {e}"))??;
+    let hs = Arc::new(Homeserver::from_db(db));
     if let Ok(url) = env::var("M4A_PUBLIC_BASE_URL") {
         let _ = hs.public_base_url.set(url.trim_end_matches('/').to_string());
     }
@@ -178,12 +178,12 @@ fn run_boot_migrations(conn: &mut Connection) -> Result<(), String> {
     Ok(())
 }
 
-fn open_messenger(server_name: &str, db_path: &Path, key_hex: &str) -> Result<Connection, String> {
+fn open_messenger(server_name: &str, db_path: &Path, key_hex: &str) -> Result<tesserax_store::Db, String> {
     store::set_matrix_server_name(server_name).map_err(|err| err.to_string())?;
     let path = db_path
         .to_str()
         .ok_or_else(|| "db path is not utf-8".to_string())?;
-    init_messenger_db(path, key_hex).map_err(|err| format!("open db: {err}"))
+    open_messenger_db(path, key_hex).map_err(|err| format!("open db: {err}"))
 }
 
 async fn serve(bind: SocketAddr, app: axum::Router, core: bool) -> Result<(), String> {
@@ -266,10 +266,7 @@ fn db_under_tmp(path: &Path) -> Result<PathBuf, String> {
 }
 
 fn validate_key_hex(raw: &str) -> Result<(), String> {
-    if raw.len() < 2 || raw.len() % 2 != 0 || !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err("M4A_DB_KEY_HEX must be even-length hex".into());
-    }
-    Ok(())
+    mail4agent_server::store::parse_db_key(raw).map(|_| ()).map_err(|e| format!("M4A_DB_KEY_HEX: {e}"))
 }
 
 #[cfg(test)]
@@ -313,8 +310,8 @@ mod tests {
             "/tmp/mail4agent-server-bin-test-{}.db",
             std::process::id()
         )));
-        let conn = open_messenger("localhost", &db.0, &random_key_hex()).expect("open");
-        let hs = Arc::new(Homeserver::new(conn));
+        let db_handle = open_messenger("localhost", &db.0, &random_key_hex()).expect("open");
+        let hs = Arc::new(Homeserver::from_db(db_handle));
         let secret = b"0123456789abcdef0123".to_vec();
         let _ = hs.seam.set(Arc::new(mail4agent_server::http::identity::Seam::new(vec![secret.clone()], 30, None, None)));
         let app = router(hs);
@@ -366,12 +363,13 @@ fn spawn_retention(hs: Arc<Homeserver>) {
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_secs(600));
         let now_ms = Utc::now().timestamp_millis();
-        let mut conn = hs.conn.lock().unwrap_or_else(|e| e.into_inner());
-        match purge_delivered_events(&mut conn, now_ms, &policy) {
+        hs.conn_scope(|conn: &mut rusqlite::Connection| {
+        match purge_delivered_events(&mut *conn, now_ms, &policy) {
             Ok(0) => {}
             Ok(n) => eprintln!("retention: removed {n} delivered event(s)"),
             Err(err) => eprintln!("retention: skipped: {err}"),
         }
+        })
     });
 }
 

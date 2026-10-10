@@ -21,10 +21,6 @@ use crate::store::{self, HistoryWindow};
 
 use super::{resolve_caller, wake_users, Homeserver};
 
-fn lock_conn(state: &Homeserver) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
-    state.conn.lock().unwrap_or_else(|e| e.into_inner())
-}
-
 async fn send_event(
     State(state): State<Arc<Homeserver>>,
     headers: HeaderMap,
@@ -43,13 +39,13 @@ async fn send_event(
     let device_id = caller.device_id;
     let state_db = Arc::clone(&state);
     let (event_id, wake_ids, room_text) = tokio::task::spawn_blocking(move || -> Result<(String, HashSet<i64>, Option<crate::push::RoomTextPush>), MatrixError> {
-        let mut conn = lock_conn(&state_db);
+        state_db.conn_scope(|conn: &mut rusqlite::Connection| {
         let room = store::get_room(&conn, &room_id)?.ok_or_else(|| MatrixError::not_found("no such room"))?;
         let now = chrono::Utc::now().to_rfc3339();
         let origin_ts = chrono::Utc::now().timestamp_millis();
         let event_id = store::new_event_id();
         let outcome = crate::messaging::apply_send(
-            &mut conn,
+            &mut *conn,
             &room,
             user_id,
             &mxid,
@@ -76,6 +72,7 @@ async fn send_event(
             None
         };
         Ok((outcome.event.event_id, outcome.wake_ids, room_text))
+        })
     })
     .await
     .map_err(|_| MatrixError::internal())??;
@@ -99,13 +96,13 @@ async fn redact_event_handler(
     let device_id = caller.device_id;
     let state_db = Arc::clone(&state);
     let (event_id, wake_ids) = tokio::task::spawn_blocking(move || -> Result<(String, HashSet<i64>), MatrixError> {
-        let mut conn = lock_conn(&state_db);
+        state_db.conn_scope(|conn: &mut rusqlite::Connection| {
         store::get_room(&conn, &room_id)?.ok_or_else(|| MatrixError::not_found("no such room"))?;
         let now = chrono::Utc::now().to_rfc3339();
         let origin_ts = chrono::Utc::now().timestamp_millis();
         let redaction_event_id = store::new_event_id();
         let outcome = crate::messaging::apply_redact(
-            &mut conn,
+            &mut *conn,
             &room_id,
             user_id,
             &mxid,
@@ -118,6 +115,7 @@ async fn redact_event_handler(
             origin_ts,
         )?;
         Ok((outcome.event.event_id, outcome.wake_ids))
+        })
     })
     .await
     .map_err(|_| MatrixError::internal())??;
@@ -142,7 +140,7 @@ async fn get_messages(
     let device_id = caller.device_id;
 
     let body = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MatrixError> {
-        let conn = lock_conn(&state);
+        state.conn_scope(|conn: &mut rusqlite::Connection| {
         let room = store::get_room(&conn, &room_id)?.ok_or_else(|| MatrixError::not_found("no such room"))?;
         let window = store::visible_upper_bound(&conn, &room, user_id)?;
         if window == HistoryWindow::Nothing {
@@ -165,6 +163,7 @@ async fn get_messages(
             body["state"] = serde_json::Value::Array(lazy_load_member_state(&conn, &room_id, &page.chunk)?);
         }
         Ok(body)
+        })
     })
     .await
     .map_err(|_| MatrixError::internal())??;
@@ -182,7 +181,7 @@ async fn get_event(
     let device_id = caller.device_id;
 
     let body = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MatrixError> {
-        let conn = lock_conn(&state);
+        state.conn_scope(|conn: &mut rusqlite::Connection| {
         let room = store::get_room(&conn, &room_id)?.ok_or_else(|| MatrixError::not_found("no such room"))?;
         let window = store::visible_upper_bound(&conn, &room, user_id)?;
         if window == HistoryWindow::Nothing {
@@ -196,6 +195,7 @@ async fn get_event(
         }
         let own_txn_id = store::txn_id_for_event(&conn, user_id, &device_id, &event.event_id)?;
         client_event_json(&conn, &event, own_txn_id.as_deref())
+        })
     })
     .await
     .map_err(|_| MatrixError::internal())??;
@@ -221,7 +221,7 @@ async fn get_relations_inner(
     let user_id = caller.user_id;
 
     let body = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MatrixError> {
-        let conn = lock_conn(&state);
+        state.conn_scope(|conn: &mut rusqlite::Connection| {
         let room = store::get_room(&conn, &room_id)?.ok_or_else(|| MatrixError::not_found("no such room"))?;
         let window = store::visible_upper_bound(&conn, &room, user_id)?;
         if window == HistoryWindow::Nothing {
@@ -249,6 +249,7 @@ async fn get_relations_inner(
             }
         }
         Ok(body)
+        })
     })
     .await
     .map_err(|_| MatrixError::internal())??;

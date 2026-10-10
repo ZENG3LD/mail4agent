@@ -557,23 +557,41 @@ pub fn create_matrix_schema(conn: &Connection) -> rusqlite::Result<()> {
     crate::identities::create_identities_schema(conn)
 }
 
-/// Open (creating if absent) the SQLCipher-encrypted `messenger.db` at
-/// `path`, key it, and create BOTH halves of the schema. Mirrors
-/// `social_db::init_social_db`: the key is the very first statement on the
-/// connection, then WAL + foreign keys, then schema. Calls
-/// `crate::keys::create_matrix_keys_schema` right after this module's
-/// own [`create_matrix_schema`] — both idempotent, so this is the one place
-/// the whole `messenger.db` schema comes into existence on boot.
-pub fn init_messenger_db(path: &str, key_hex: &str) -> rusqlite::Result<Connection> {
-    let conn = Connection::open(path)?;
-    conn.execute_batch(&format!("PRAGMA key = \"x'{key_hex}'\";"))?;
-    conn.execute_batch("PRAGMA journal_mode=WAL;")?;
-    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
-    create_matrix_schema(&conn)?;
-    crate::keys::create_matrix_keys_schema(&conn)?;
-    crate::retention::create_retention_schema(&conn)?;
-    crate::public_channels::create_public_schema(&conn)?;
-    Ok(conn)
+/// Parses the 32-byte database key given as 64 hex characters (the raw SQLCipher key).
+pub fn parse_db_key(key_hex: &str) -> Result<[u8; 32], String> {
+    let h = key_hex.trim();
+    if h.len() != 64 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("database key must be 64 hex characters (32 bytes)".into());
+    }
+    let mut key = [0u8; 32];
+    for (i, b) in key.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&h[2 * i..2 * i + 2], 16).map_err(|_| "database key must be hex".to_string())?;
+    }
+    Ok(key)
+}
+
+/// The SQLCipher store configuration for `path` and a hex key (see [`parse_db_key`]).
+pub fn messenger_db_config(path: &str, key_hex: &str) -> Result<tesserax_store::DbConfig, String> {
+    let key = parse_db_key(key_hex)?;
+    Ok(tesserax_store::DbConfig::encrypted_native(path, std::sync::Arc::new(tesserax_store::keysource::StaticKeySource(key))))
+}
+
+/// Opens the messenger store (tesserax-store: SQLCipher, WAL, one writer) and makes sure every
+/// table exists. The key is applied first on every connection the engine opens.
+pub fn open_messenger_db(path: &str, key_hex: &str) -> Result<tesserax_store::Db, String> {
+    let cfg = messenger_db_config(path, key_hex)?;
+    let db = tesserax_store::Db::open(&cfg).map_err(|e| e.to_string())?;
+    db.blocking(|conn| ensure_schema(conn)).map_err(|e| e.to_string())?;
+    Ok(db)
+}
+
+/// Creates every messenger table that does not exist yet (idempotent).
+pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
+    create_matrix_schema(conn)?;
+    crate::keys::create_matrix_keys_schema(conn)?;
+    crate::retention::create_retention_schema(conn)?;
+    crate::public_channels::create_public_schema(conn)?;
+    Ok(())
 }
 
 // ============================================================================

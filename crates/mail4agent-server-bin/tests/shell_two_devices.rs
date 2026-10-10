@@ -20,7 +20,6 @@ use mail4agent_messenger_shell::{
     session_store_dir, CreateRoomKind, DeviceId, MessageKind, MessengerCommand, OpenedStore,
     OutgoingMessage, RoomId, SessionWake,
 };
-use mail4agent_server::store::init_messenger_db;
 
 const TEXT: &str = "shell-two-device-hello";
 const GROUP_TEXT: &str = "shell-group-hello";
@@ -687,25 +686,21 @@ fn timeline_messages(
     key_hex: &str,
     room_id: &str,
 ) -> Vec<(String, String, String)> {
-    let conn = init_messenger_db(db.to_str().expect("utf-8"), key_hex).expect("reopen db");
-    let mut stmt = conn
-        .prepare(
-            "SELECT event_id, event_type, content FROM events \
-             WHERE room_id = ?1 AND state_key IS NULL \
-             AND event_type IN ('m.room.message', 'm.room.encrypted') \
-             ORDER BY stream_id",
-        )
-        .expect("prepare");
-    stmt.query_map([room_id], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    })
-    .expect("query")
-    .collect::<Result<Vec<_>, _>>()
-    .expect("rows")
+    let cfg = mail4agent_server::store::messenger_db_config(db.to_str().expect("utf-8"), key_hex).expect("key");
+    let reader = tesserax_store::Db::open(&cfg).expect("reopen db");
+    let room_id = room_id.to_string();
+    reader
+        .read_blocking(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT event_id, event_type, content FROM events \
+                 WHERE room_id = ?1 AND state_key IS NULL \
+                 AND event_type IN ('m.room.message', 'm.room.encrypted') \
+                 ORDER BY stream_id",
+            )?;
+            let rows = stmt.query_map([room_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))?.collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .expect("rows")
 }
 
 fn open_trio(boot: &ThreeShells) -> (OpenedStore, OpenedStore, OpenedStore) {
@@ -909,9 +904,12 @@ fn three_local_shells_exchange_one_text_in_a_public_plaintext_channel() {
         closed.iter().all(|(_, event_type, _)| event_type != "m.room.message" && event_type != "m.room.encrypted"),
         "public channel post leaked into the closed events table: {closed:?}"
     );
-    let conn = init_messenger_db(boot.temp.dir.join("messenger.db").to_str().expect("utf-8"), &boot.key_hex).expect("reopen db");
-    let public: i64 = conn
-        .query_row("SELECT COUNT(*) FROM pub_events WHERE room_id = ?1 AND content LIKE ?2", rusqlite::params![room_id, format!("%{CHANNEL_TEXT}%")], |r| r.get(0))
+    let cfg = mail4agent_server::store::messenger_db_config(boot.temp.dir.join("messenger.db").to_str().expect("utf-8"), &boot.key_hex).expect("key");
+    let reader = tesserax_store::Db::open(&cfg).expect("reopen db");
+    let like = format!("%{CHANNEL_TEXT}%");
+    let rid = room_id.to_string();
+    let public: i64 = reader
+        .read_blocking(move |conn| conn.query_row("SELECT COUNT(*) FROM pub_events WHERE room_id = ?1 AND content LIKE ?2", rusqlite::params![rid, like], |r| r.get(0)))
         .expect("pub_events");
     assert_eq!(public, 1, "public post must live in pub_events");
 }
