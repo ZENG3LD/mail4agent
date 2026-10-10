@@ -14,10 +14,18 @@
 //! | `mail`                 | `m4a`                      |
 //! | `ensure-agent-webhooks`| `m4a-ensure-agent-webhooks`|
 //! | `enroll`               | —                          |
+//! | `wake`                 | — (owner control of wakes) |
+//! | `vault`                | — (status, backup, restore)|
+//! | `element-open`         | — (open Element, logged in)|
 
 #[cfg(feature = "wake-claude")]
 pub mod claude_channel;
 pub mod enroll;
+pub mod session_arg;
+pub mod vault;
+pub mod wake;
+#[cfg(feature = "element-open")]
+pub mod element_open;
 pub mod ensure_agent_webhooks;
 #[cfg(feature = "wake-grok")]
 pub mod grok_listen;
@@ -29,7 +37,7 @@ pub mod send;
 pub mod web_client;
 
 /// The subcommand names, in the order of the table above.
-pub const COMMANDS: &[&str] = &["web-client", "node-client", "grok-listen", "claude-channel", "inbox", "send", "mail", "ensure-agent-webhooks", "enroll"];
+pub const COMMANDS: &[&str] = &["web-client", "node-client", "grok-listen", "claude-channel", "inbox", "send", "mail", "ensure-agent-webhooks", "enroll", "wake", "vault", "element-open"];
 
 /// Runs `command` with its arguments. `Err` names an unknown command (or one this build lacks).
 pub fn dispatch(command: &str, args: Vec<String>) -> Result<(), String> {
@@ -48,6 +56,12 @@ pub fn dispatch(command: &str, args: Vec<String>) -> Result<(), String> {
         "mail" => mail::run(args),
         "ensure-agent-webhooks" => ensure_agent_webhooks::run(args),
         "enroll" => enroll::run(args),
+        "wake" => wake::run(args),
+        "vault" => vault::run(args),
+        #[cfg(feature = "element-open")]
+        "element-open" => element_open::run(args),
+        #[cfg(not(feature = "element-open"))]
+        "element-open" => return Err("this build was made without feature element-open".to_string()),
         other => return Err(format!("unknown command {other:?}; commands: {}", COMMANDS.join(", "))),
     }
     Ok(())
