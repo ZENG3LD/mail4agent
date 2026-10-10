@@ -9,9 +9,19 @@ keywords = ["matrix","messenger","client","agent"]
 categories = ["network-programming"]
 description = "Client shell that opens the sealed messenger store for one session."
 
+[features]
+default = ["full"]
+full = ["tier-server", "tier-matrix", "local-bus"]
+tier-server = ["m4a-agent/tier-server"]
+tier-matrix = ["m4a-agent/tier-matrix"]
+# The in-process homeserver that lets bots on one machine reach each other without a network.
+# It is the only thing that links the whole server crate.
+local-bus = ["dep:mail4agent-server"]
+
 [dependencies]
+m4a-agent = { path = "../m4a-agent", default-features = false }
 mail4agent-messenger = { workspace = true  }
-mail4agent-server = { workspace = true, features = ["local-bearer"]  }
+mail4agent-server = { workspace = true, features = ["local-bearer"], optional = true }
 mail4agent-grok = { workspace = true  }
 sha2 = "0.10"
 zeroize = "1"
@@ -61,3 +71,6 @@ path = "src/bin/m4a.rs"
 [[bin]]
 name = "m4a-send"
 path = "src/bin/send.rs"
+
+[dev-dependencies]
+tempfile = "3"

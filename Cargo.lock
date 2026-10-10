@@ -1787,6 +1787,7 @@ name = "mail4agent-messenger-shell"
 version = "0.4.1"
 dependencies = [
  "axum",
+ "m4a-agent",
  "mail4agent-grok",
  "mail4agent-messenger",
  "mail4agent-server",
@@ -1795,6 +1796,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "thiserror",
  "tokio",
  "toml 0.8.23",

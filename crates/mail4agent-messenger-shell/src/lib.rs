@@ -1,7 +1,7 @@
-//! Client holder for the messenger record-seal key, the one web-bot wake,
+//! Client shell of the messenger: the store key (random, in the client vault), the one web-bot wake,
 //! and the HTTP a released [`OutgoingRequest`] actually performs.
 //!
-//! `store_seal_key` is SHA-256 of the session id string. The client derives
+//! (Historical: the store key was SHA-256 of the session id string; it is now random and lives in the vault, see `store_key`.) `store_seal_key` is that old derivation. The client derives
 //! it when it opens the store. It is not a passphrase, it is not stored
 //! beside the records, and nothing here is a KDF or a vault.
 //!
@@ -73,6 +73,7 @@ mod node;
 pub mod provider;
 mod push;
 mod send;
+pub mod store_key;
 
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
@@ -161,6 +162,11 @@ pub const DEVICE_TOKEN_ENV: &str = "M4A_DEVICE_TOKEN";
 /// Product-session mode: base URL of the product server. Every Client-Server
 /// call goes through its proxy with the product session token as bearer.
 pub const PRODUCT_URL_ENV: &str = "M4A_PRODUCT_URL";
+/// Identity mode: the operator's one-time invite code (read by the CLIENT process, once; the agent
+/// is never given it). Not needed after the identity is enrolled.
+pub const PRODUCT_INVITE_ENV: &str = "M4A_PRODUCT_INVITE";
+/// Identity mode: `server` (our product API, default) or `matrix` (the Matrix client API).
+pub const TIER_ENV: &str = "M4A_TIER";
 /// Product-session mode: the product nick to log in as.
 pub const PRODUCT_NICK_ENV: &str = "M4A_PRODUCT_NICK";
 /// Product-session mode: password for `POST /product/v1/login` (not logged).
@@ -173,6 +179,15 @@ pub const PRODUCT_TOKEN_ENV: &str = "M4A_PRODUCT_TOKEN";
 pub enum ProductSecret {
     Password(Zeroizing<String>),
     Token(Zeroizing<String>),
+}
+
+/// Identity mode: the client owns an ed25519 identity and logs in by signature. There is no
+/// password and no token the agent could be handed; `invite` is the operator's one-time code,
+/// needed only until the identity is enrolled.
+#[derive(Clone)]
+struct IdentityAuth {
+    tier: m4a_agent::BackendKind,
+    invite: Option<Zeroizing<String>>,
 }
 
 #[derive(Clone)]
@@ -350,9 +365,37 @@ pub struct SessionConfig {
     store_root: PathBuf,
     device_token: Option<Zeroizing<String>>,
     product: Option<ProductAuth>,
+    identity: Option<IdentityAuth>,
 }
 
 impl SessionConfig {
+    /// Identity mode: the session's identity is generated and kept by the client's vault under
+    /// `store_root`, it enrolls with the operator's `invite` once, and logs in by signature
+    /// afterwards. `tier` picks the product API (tier 2) or the Matrix API (tier 3).
+    pub fn new_identity(
+        product_url: impl Into<String>,
+        tier: m4a_agent::BackendKind,
+        session_id: impl Into<String>,
+        store_root: impl Into<PathBuf>,
+        invite: Option<String>,
+    ) -> Result<Self, ShellError> {
+        let homeserver_url = product_url.into();
+        parse_base_url(&homeserver_url)?;
+        let session_id = session_id.into();
+        validate_session_id(&session_id)?;
+        Ok(Self {
+            homeserver_url,
+            // The operator assigned the nick; it is learned at enrollment.
+            public_id: String::new(),
+            nick: String::new(),
+            session_id,
+            store_root: store_root.into(),
+            device_token: None,
+            product: None,
+            identity: Some(IdentityAuth { tier, invite: invite.filter(|i| !i.is_empty()).map(Zeroizing::new) }),
+        })
+    }
+
     /// `bot_name` is the display name (`Alice`, `Привет мир`), not a nick.
     pub fn new(
         homeserver_url: impl Into<String>,
@@ -378,6 +421,7 @@ impl SessionConfig {
             store_root: store_root.into(),
             device_token: device_token.map(Zeroizing::new),
             product: None,
+            identity: None,
         })
     }
 
@@ -406,6 +450,7 @@ impl SessionConfig {
             store_root: store_root.into(),
             device_token: None,
             product: Some(ProductAuth { nick: nick.to_string(), secret }),
+            identity: None,
         })
     }
 
@@ -428,6 +473,16 @@ impl SessionConfig {
         toml_text: Option<&str>,
     ) -> Result<Self, ShellError> {
         if let Some(product_url) = get(PRODUCT_URL_ENV) {
+            if get(PRODUCT_NICK_ENV).is_none() && get(PRODUCT_TOKEN_ENV).is_none() && get(PRODUCT_PASSWORD_ENV).is_none() {
+                let tier = match get(TIER_ENV).as_deref() {
+                    None | Some("server") => m4a_agent::BackendKind::Server,
+                    Some("matrix") => m4a_agent::BackendKind::Matrix,
+                    Some(_) => return Err(ShellError::Register(format!("{TIER_ENV} is server or matrix"))),
+                };
+                let session_id = get(SESSION_ID_ENV).ok_or(ShellError::EmptySession)?;
+                let store_root = get(STORE_ROOT_ENV).ok_or(ShellError::StoreRoot)?;
+                return Self::new_identity(product_url, tier, session_id, store_root, get(PRODUCT_INVITE_ENV));
+            }
             let nick = get(PRODUCT_NICK_ENV).ok_or_else(|| ShellError::Register(format!("{PRODUCT_NICK_ENV} is required with {PRODUCT_URL_ENV}")))?;
             let secret = match (get(PRODUCT_TOKEN_ENV), get(PRODUCT_PASSWORD_ENV)) {
                 (Some(t), _) => ProductSecret::Token(Zeroizing::new(t)),
@@ -906,7 +961,7 @@ impl OpenedStore {
         fs_create_dir(dir)?;
         let user_id = UserId::parse(user_id)?;
         let secrets = CoreSecrets {
-            store_seal_key: Some(Zeroizing::new(store_seal_key(session_id))),
+            store_seal_key: Some(store_key::store_key(dir, session_id)?),
             backup_key: None,
         };
         let config = CoreConfig {
@@ -988,10 +1043,10 @@ impl OpenedStore {
             registered.device_id,
             &registered.user_id,
             server_name,
-            &config.homeserver_url,
+            registered.base_url.as_ref().map(|u| u.as_str()).unwrap_or(&config.homeserver_url),
             &registered.bearer,
         )?;
-        opened.nick = Some(config.nick.clone());
+        opened.nick = Some(registered.nick.clone().unwrap_or_else(|| config.nick.clone()));
         opened.set_wake(wake);
         // The first sync is what publishes the public keys.
         opened.drive(1_000, false)?;
@@ -2249,7 +2304,7 @@ fn parse_base_url(raw: &str) -> Result<reqwest::Url, ShellError> {
     }
     if url.host_str().is_none()
         || url.query().is_some()
-        || url.fragment().is_some()
+        || url.fragment().is_some_and(|f| f != KEEP_MATRIX_PREFIX)
         || !url.username().is_empty()
         || url.password().is_some()
     {
@@ -2262,6 +2317,10 @@ struct RegisteredSession {
     user_id: String,
     device_id: DeviceId,
     bearer: Zeroizing<String>,
+    /// Identity mode: the nick the operator assigned.
+    nick: Option<String>,
+    /// Identity mode: the base URL to use (it carries the prefix decision).
+    base_url: Option<reqwest::Url>,
 }
 
 /// Product session: login (or reuse the token), then `whoami` through the
@@ -2307,10 +2366,60 @@ fn product_session(config: &SessionConfig, auth: &ProductAuth) -> Result<Registe
     if user_id.is_empty() || device_raw.is_empty() {
         return Err(ShellError::Register("whoami missed an id".into()));
     }
-    Ok(RegisteredSession { user_id, device_id: DeviceId::parse(device_raw)?, bearer: token })
+    Ok(RegisteredSession { user_id, device_id: DeviceId::parse(device_raw)?, bearer: token, nick: None, base_url: None })
+}
+
+/// Identity mode: the client's own identity logs in by signature (enrolling first when it has to).
+fn identity_session(config: &SessionConfig, auth: &IdentityAuth) -> Result<RegisteredSession, ShellError> {
+    use m4a_agent::Backend;
+    let fail = |e: m4a_agent::AgentError| ShellError::Register(clip_public(e.to_string()));
+    let ids = m4a_agent::IdentityStore::new(store_key::vault(&config.store_root)?);
+    let mut backend: Box<dyn Backend> = match auth.tier {
+        #[cfg(feature = "tier-server")]
+        m4a_agent::BackendKind::Server => Box::new(m4a_agent::backend::server::ServerBackend::new(&config.homeserver_url).map_err(fail)?),
+        #[cfg(feature = "tier-matrix")]
+        m4a_agent::BackendKind::Matrix => Box::new(m4a_agent::backend::matrix::MatrixBackend::new(&config.homeserver_url).map_err(fail)?),
+        #[allow(unreachable_patterns)]
+        _ => return Err(ShellError::Register("this build does not include that tier".into())),
+    };
+    let mut id = ids.resolve(&config.session_id, auth.tier, backend.server_ref()).map_err(fail)?;
+    let session = backend.ensure_session(&ids, &mut id, auth.invite.as_ref().map(|i| i.as_str())).map_err(fail)?;
+    ids.adopt_nick(&mut id, &session.nick).map_err(fail)?;
+    let http = |e: reqwest::Error| ShellError::Http(clip_public(e.to_string()));
+    let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(10)).http1_only().build().map_err(http)?;
+    let mut base = parse_base_url(&config.homeserver_url)?;
+    // Tier 3 asks the server whether it serves the spec prefix and keeps it when it does.
+    if auth.tier == m4a_agent::BackendKind::Matrix {
+        let mut probe = base.clone();
+        probe.set_path("/_matrix/client/versions");
+        if client.get(probe).send().map(|r| r.status().is_success()).unwrap_or(false) {
+            base.set_fragment(Some(KEEP_MATRIX_PREFIX));
+        }
+    }
+    let (user_id, device_raw) = match (&session.user_id, &session.device_id) {
+        (Some(u), Some(d)) => (u.clone(), d.clone()),
+        _ => {
+            let url = request_url(&base, "/_matrix/client/v3/account/whoami", &[])?;
+            let resp = client.get(url).header(reqwest::header::AUTHORIZATION, format!("Bearer {}", session.token.as_str())).send().map_err(http)?;
+            let status = resp.status().as_u16();
+            let bytes = resp.bytes().map_err(http)?;
+            if !(200..300).contains(&status) {
+                return Err(ShellError::Register(register_failure(status, &bytes)));
+            }
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+            (v.get("user_id").and_then(|x| x.as_str()).unwrap_or("").to_string(), v.get("device_id").and_then(|x| x.as_str()).unwrap_or("").to_string())
+        }
+    };
+    if user_id.is_empty() || device_raw.is_empty() {
+        return Err(ShellError::Register("whoami missed an id".into()));
+    }
+    Ok(RegisteredSession { user_id, device_id: DeviceId::parse(&device_raw)?, bearer: session.token.clone(), nick: Some(session.nick), base_url: Some(base) })
 }
 
 fn register_session(config: &SessionConfig) -> Result<RegisteredSession, ShellError> {
+    if let Some(auth) = &config.identity {
+        return identity_session(config, auth);
+    }
     if let Some(auth) = &config.product {
         return product_session(config, auth);
     }
@@ -2376,6 +2485,8 @@ fn register_session(config: &SessionConfig) -> Result<RegisteredSession, ShellEr
         user_id,
         device_id,
         bearer,
+        nick: None,
+        base_url: None,
     })
 }
 
@@ -2433,6 +2544,11 @@ fn perform_http(
     Ok(HttpResponseDescriptor { status, body })
 }
 
+/// Marker (as the URL fragment of the base URL) that the server serves the Matrix paths under their
+/// spec prefix `/_matrix`. Without it the prefix is dropped, which is what our own mounts expect.
+/// The client decides by asking the server (`GET /_matrix/client/versions`), never by assuming.
+const KEEP_MATRIX_PREFIX: &str = "keep-matrix-prefix";
+
 /// `/_matrix/client/v3/...` becomes `/client/v3/...` on `base_url`. The
 /// server binary mounts the router at `/client/v3` and does not nest it
 /// under `/_matrix`. A path that is already unprefixed is left alone.
@@ -2441,11 +2557,15 @@ fn request_url(
     path: &str,
     query: &[(String, String)],
 ) -> Result<reqwest::Url, ShellError> {
-    let path = path.strip_prefix("/_matrix").unwrap_or(path);
+    // A server that serves the spec prefix is addressed with it kept (see `KEEP_MATRIX_PREFIX`).
+    let keep_prefix = base_url.fragment() == Some(KEEP_MATRIX_PREFIX);
+    let path = if keep_prefix { path } else { path.strip_prefix("/_matrix").unwrap_or(path) };
     if !path.starts_with('/') {
         return Err(ShellError::BaseUrl);
     }
-    let mut raw = base_url.as_str().trim_end_matches('/').to_string();
+    let mut base = base_url.clone();
+    base.set_fragment(None);
+    let mut raw = base.as_str().trim_end_matches('/').to_string();
     raw.push_str(path);
     if !query.is_empty() {
         raw.push('?');
@@ -3012,6 +3132,17 @@ mod tests {
                 || text.contains("invalidpeer"),
             "https did not reach a tls failure: {err}"
         );
+    }
+
+    #[test]
+    fn the_spec_prefix_is_kept_only_when_the_server_was_found_to_serve_it() {
+        let mut base = parse_base_url("http://127.0.0.1:9").expect("base");
+        let q = [("timeout".to_string(), "5".to_string())];
+        assert_eq!(request_url(&base, "/_matrix/client/v3/sync", &q).unwrap().as_str(), "http://127.0.0.1:9/client/v3/sync?timeout=5");
+        base.set_fragment(Some(KEEP_MATRIX_PREFIX));
+        assert_eq!(request_url(&base, "/_matrix/client/v3/sync", &q).unwrap().as_str(), "http://127.0.0.1:9/_matrix/client/v3/sync?timeout=5");
+        assert!(parse_base_url(base.as_str()).is_ok());
+        assert!(parse_base_url("http://127.0.0.1:9/#other").is_err());
     }
 
     #[test]
