@@ -101,6 +101,25 @@ impl<S: UserStore> UserService<S> {
         Ok(Session { token, cred_ref })
     }
 
+    /// A session whose access token expires after `access_ttl_ms`, with a refresh token valid for
+    /// `refresh_ttl_ms`. Needs a store with [`UserStore::supports_refresh`].
+    pub fn issue_refreshable_session(&self, user: &User, now_ms: i64, access_ttl_ms: i64, refresh_ttl_ms: i64) -> Result<(Session, String), ServiceError> {
+        let session = self.issue_session(user, now_ms)?;
+        let refresh = random_hex(32);
+        self.store.set_refresh(&session.cred_ref, &token_hash(&refresh), now_ms + access_ttl_ms, now_ms + refresh_ttl_ms)?;
+        Ok((session, refresh))
+    }
+
+    /// Exchanges a refresh token for a new access token and a new refresh token for the same
+    /// credential (so the messenger-side device is unchanged). `None`: unknown or expired.
+    pub fn refresh(&self, refresh_token: &str, now_ms: i64, access_ttl_ms: i64, refresh_ttl_ms: i64) -> Result<Option<(Session, String)>, ServiceError> {
+        let Some(cred_ref) = self.store.take_refresh(&token_hash(refresh_token), now_ms)? else { return Ok(None) };
+        let (token, refresh) = (random_hex(32), random_hex(32));
+        self.store.replace_token(&cred_ref, &token_hash(&token), now_ms + access_ttl_ms)?;
+        self.store.set_refresh(&cred_ref, &token_hash(&refresh), now_ms + access_ttl_ms, now_ms + refresh_ttl_ms)?;
+        Ok(Some((Session { token, cred_ref }, refresh)))
+    }
+
     /// Resolve a presented token to what the link asserts.
     pub fn authenticate(&self, token: &str) -> Result<Option<AuthUser>, ServiceError> {
         Ok(self.store.user_by_token_hash(&token_hash(token))?.map(|(u, cred_ref)| AuthUser { flag: self.tiers.flag(&u.tier), nick: u.nick, cred_ref }))

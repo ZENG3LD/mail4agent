@@ -8,6 +8,7 @@
 //! * [`model`] / [`service`]: the user store trait and the logic over it.
 //! * [`nick_rules`]: grammar, lists, placeholder nicks, cooldown.
 //! * [`tiers`]: tier -> opaque policy flag.
+//! * [`tokens`]: one-time login tokens (`login/get_token`); refresh tokens live in the store trait.
 //! * [`door`]: login doors; `matrix-address-door` is a real optional door.
 //! * [`edge_link`]: authenticate, sign, forward.
 //! * [`events`]: lifecycle event publisher (durable queue, retry/backoff) and startup reconcile.
@@ -29,10 +30,12 @@ pub mod nick_rules;
 pub mod push_relay;
 pub mod service;
 pub mod tiers;
+pub mod tokens;
 
 pub use edge_link::EdgeLink;
 pub use events::{send_reconcile, EventPublisher, MemoryOutbox, Outbox};
 #[cfg(feature = "sqlite-outbox")]
 pub use events::SqliteOutbox;
+pub use tokens::LoginTokens;
 pub use model::{StoreError, User, UserStore};
 pub use service::{AuthUser, ServiceError, Session, UserService};

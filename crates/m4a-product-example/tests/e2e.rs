@@ -85,6 +85,8 @@ async fn stack_with(unix_dir: Option<&std::path::Path>) -> Stack {
         admin_token: ADMIN.into(),
         doors: vec![Arc::new(FakeDoor)],
         anon_read: true,
+        tokens: Default::default(),
+        access_ttl_ms: 3_600_000,
     });
     let product = format!("http://{}", serve(router(app)).await);
     Stack { link, edge: edge_url, core, product, c: reqwest::Client::new() }
@@ -427,4 +429,89 @@ async fn push_sockets_close_when_the_credential_is_revoked_or_the_account_delete
     let snap = m4a_seam::Reconcile { id: "rp".into(), complete: false, nicks: vec![m4a_seam::LiveNick { nick: c_nick, creds: vec![] }] };
     m4a_product_kit::send_reconcile(&s.link, None, &snap, Duration::from_millis(20), 3).await.unwrap();
     assert_closes(&mut c).await;
+}
+
+#[tokio::test]
+async fn login_tokens_refresh_tokens_password_change_3pid_and_deactivation() {
+    let s = stack().await;
+    let (nick, _first) = s.register().await;
+    let login = |extra: Value| {
+        let mut b = json!({"type":"m.login.password","identifier":{"type":"m.id.user","user":nick},"password":"correct horse"});
+        for (k, v) in extra.as_object().unwrap() {
+            b[k] = v.clone();
+        }
+        b
+    };
+
+    let (_, flows) = s.send("GET", "/client/v3/login", None, None).await;
+    assert!(flows["flows"].as_array().unwrap().iter().any(|f| f["type"] == "m.login.token" && f["get_login_token"] == true), "{flows}");
+
+    // Login asking for a refresh token.
+    let (st, a) = s.post("/client/v3/login", None, login(json!({"refresh_token": true}))).await;
+    assert_eq!(st, 200, "{a}");
+    let (tok, refresh) = (a["access_token"].as_str().unwrap().to_string(), a["refresh_token"].as_str().unwrap().to_string());
+    assert_eq!(a["expires_in_ms"], 3_600_000);
+    let device = a["device_id"].clone();
+    let whoami = |t: String| {
+        let s = &s;
+        async move { s.send("GET", "/client/v3/account/whoami", Some(&t), None).await }
+    };
+    assert_eq!(whoami(tok.clone()).await.0, 200);
+
+    // Refresh: new tokens, the same device; the old access token and the used refresh token are dead.
+    let (st, r) = s.post("/client/v3/refresh", None, json!({"refresh_token": refresh})).await;
+    assert_eq!(st, 200, "{r}");
+    let (tok2, refresh2) = (r["access_token"].as_str().unwrap().to_string(), r["refresh_token"].as_str().unwrap().to_string());
+    assert_ne!(tok2, tok);
+    let (st, w) = whoami(tok2.clone()).await;
+    assert_eq!((st, &w["device_id"]), (200, &device), "{w}");
+    assert_eq!(whoami(tok.clone()).await.0, 401);
+    assert_eq!(s.post("/client/v3/refresh", None, json!({"refresh_token": refresh})).await.0, 401);
+    let (st, r3) = s.post("/client/v3/refresh", None, json!({"refresh_token": refresh2})).await;
+    assert_eq!(st, 200, "{r3}");
+    let tok3 = r3["access_token"].as_str().unwrap().to_string();
+
+    // Capabilities say what the product provides.
+    let (_, caps) = s.send("GET", "/client/v3/capabilities", Some(&tok3), None).await;
+    assert_eq!(caps["capabilities"]["m.get_login_token"]["enabled"], true, "{caps}");
+
+    // get_token needs the password again; the token logs another client in exactly once.
+    assert_eq!(s.post("/client/v1/login/get_token", Some(&tok3), json!({})).await.0, 401);
+    let bad = json!({"auth":{"type":"m.login.password","identifier":{"type":"m.id.user","user":nick},"password":"nope"}});
+    assert_eq!(s.post("/client/v1/login/get_token", Some(&tok3), bad).await.0, 401);
+    let good = json!({"auth":{"type":"m.login.password","identifier":{"type":"m.id.user","user":nick},"password":"correct horse"}});
+    let (st, t) = s.post("/client/v1/login/get_token", Some(&tok3), good.clone()).await;
+    assert_eq!(st, 200, "{t}");
+    let lt = t["login_token"].as_str().unwrap().to_string();
+    let (st, b) = s.post("/client/v3/login", None, json!({"type":"m.login.token","token":lt})).await;
+    assert_eq!(st, 200, "{b}");
+    let other = b["access_token"].as_str().unwrap().to_string();
+    assert_ne!(b["device_id"], device, "a new session is a new device");
+    assert_eq!(s.post("/client/v3/login", None, json!({"type":"m.login.token","token":lt})).await.0, 403, "one use");
+
+    // Password change: wrong re-auth refused; a short password refused; success signs the others out.
+    let change = |pw: &str, auth: &Value| json!({"new_password": pw, "auth": auth});
+    assert_eq!(s.post("/client/v3/account/password", Some(&tok3), json!({"new_password":"a better one"})).await.0, 401);
+    assert_eq!(s.post("/client/v3/account/password", Some(&tok3), change("short", &good["auth"])).await.0, 400);
+    let (st, v) = s.post("/client/v3/account/password", Some(&tok3), change("a much better one", &good["auth"])).await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(whoami(other.clone()).await.0, 401, "the other session is gone");
+    assert_eq!(whoami(tok3.clone()).await.0, 200, "this one stays");
+    assert_eq!(s.post("/client/v3/login", None, login(json!({}))).await.0, 403, "old password");
+    let (st, n) = s.post("/client/v3/login", None, login(json!({"password":"a much better one"}))).await;
+    assert_eq!(st, 200, "{n}");
+
+    // Third-party identifiers: none, and none can be added.
+    let (_, p) = s.send("GET", "/client/v3/account/3pid", Some(&tok3), None).await;
+    assert_eq!(p["threepids"], json!([]));
+    let (st, d) = s.post("/client/v3/account/3pid/add", Some(&tok3), json!({})).await;
+    assert_eq!((st, d["errcode"].as_str()), (403, Some("M_THREEPID_DENIED")));
+
+    // Deactivation re-authenticates, then the account and its sessions are gone.
+    let new_auth = json!({"auth":{"type":"m.login.password","identifier":{"type":"m.id.user","user":nick},"password":"a much better one"}});
+    assert_eq!(s.post("/client/v3/account/deactivate", Some(&tok3), json!({})).await.0, 401);
+    let (st, v) = s.post("/client/v3/account/deactivate", Some(&tok3), new_auth).await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(whoami(tok3).await.0, 401);
+    assert_eq!(s.post("/client/v3/login", None, login(json!({"password":"a much better one"}))).await.0, 403);
 }

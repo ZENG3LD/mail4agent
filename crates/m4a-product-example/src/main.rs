@@ -69,6 +69,9 @@ async fn run() -> Result<(), String> {
         admin_token: opt("M4A_PRODUCT_ADMIN_TOKEN").unwrap_or_default(),
         doors,
         anon_read: opt("M4A_PRODUCT_ANON_READ").is_some_and(|v| v.eq_ignore_ascii_case("on")),
+        tokens: Default::default(),
+        // Access tokens given out with refresh tokens last this long; 0 turns refresh tokens off.
+        access_ttl_ms: opt("M4A_PRODUCT_ACCESS_TTL_SECS").and_then(|v| v.parse::<i64>().ok()).unwrap_or(3600) * 1000,
     });
     // Startup reconciliation: tell the messenger which credentials are live, so revocations and
     // deletions it missed (outbox lost, messenger restored from a backup) are applied.

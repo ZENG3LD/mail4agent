@@ -43,6 +43,8 @@ async fn product() -> String {
         admin_token: String::new(),
         doors: vec![],
         anon_read: false,
+        tokens: Default::default(),
+        access_ttl_ms: 3_600_000,
     });
     format!("http://{}", serve(router(app)).await)
 }

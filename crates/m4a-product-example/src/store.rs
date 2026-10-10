@@ -35,7 +35,10 @@ CREATE TABLE IF NOT EXISTS credentials (
     cred_ref TEXT PRIMARY KEY,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     token_hash TEXT NOT NULL UNIQUE,
-    created_ms INTEGER NOT NULL
+    created_ms INTEGER NOT NULL,
+    access_expires_ms INTEGER,
+    refresh_hash TEXT,
+    refresh_expires_ms INTEGER
 );
 CREATE TABLE IF NOT EXISTS door_links (
     source TEXT NOT NULL,
@@ -54,7 +57,18 @@ fn user(r: &rusqlite::Row<'_>) -> rusqlite::Result<User> {
 impl SqliteStore {
     /// The product database in an opened store (shared with the event queue: one writer per file).
     pub fn new(db: Db) -> Result<Self, String> {
-        db.blocking(|c| c.execute_batch(SCHEMA)).map_err(|e| e.to_string())?;
+        db.blocking(|c| {
+            c.execute_batch(SCHEMA)?;
+            // Databases made before expiring sessions: add the columns.
+            for (col, ty) in [("access_expires_ms", "INTEGER"), ("refresh_hash", "TEXT"), ("refresh_expires_ms", "INTEGER")] {
+                let have: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('credentials') WHERE name = ?1", params![col], |r| r.get::<_, i64>(0)).map(|n| n > 0)?;
+                if !have {
+                    c.execute_batch(&format!("ALTER TABLE credentials ADD COLUMN {col} {ty}"))?;
+                }
+            }
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
         Ok(Self { db })
     }
     /// Opens the store described by `cfg` (see `m4a_product_kit::dbkey`).
@@ -126,7 +140,7 @@ impl UserStore for SqliteStore {
         self.with(|c| {
         c
             .query_row(
-                "SELECT u.id, u.nick, u.tier, u.nick_changes, u.nick_changed_ms, c.cred_ref FROM credentials c JOIN users u ON u.id = c.user_id WHERE c.token_hash = ?1",
+                "SELECT u.id, u.nick, u.tier, u.nick_changes, u.nick_changed_ms, c.cred_ref FROM credentials c JOIN users u ON u.id = c.user_id WHERE c.token_hash = ?1 AND (c.access_expires_ms IS NULL OR c.access_expires_ms > CAST(strftime('%s','now') AS INTEGER) * 1000)",
                 params![token_hash],
                 |r| Ok((user(r)?, r.get::<_, String>(5)?)),
             )
@@ -169,6 +183,34 @@ impl UserStore for SqliteStore {
             .query_row("SELECT u.id, u.nick, u.tier, u.nick_changes, u.nick_changed_ms FROM door_links d JOIN users u ON u.id = d.user_id WHERE d.source = ?1 AND d.subject = ?2", params![source, subject], user)
             .optional()
             .map_err(be)
+        })
+    }
+    fn set_secret_hash(&self, user_id: i64, hash: &str) -> StoreResult<()> {
+        self.with(|c| match c.execute("UPDATE users SET secret_hash = ?2 WHERE id = ?1", params![user_id, hash]).map_err(be)? {
+            0 => Err(StoreError::NotFound),
+            _ => Ok(()),
+        })
+    }
+    fn supports_refresh(&self) -> bool {
+        true
+    }
+    fn set_refresh(&self, cred_ref: &str, refresh_hash: &str, access_expires_ms: i64, refresh_expires_ms: i64) -> StoreResult<()> {
+        self.with(|c| {
+            c.execute("UPDATE credentials SET refresh_hash = ?2, access_expires_ms = ?3, refresh_expires_ms = ?4 WHERE cred_ref = ?1", params![cred_ref, refresh_hash, access_expires_ms, refresh_expires_ms]).map_err(be).map(|_| ())
+        })
+    }
+    fn take_refresh(&self, refresh_hash: &str, now_ms: i64) -> StoreResult<Option<String>> {
+        self.with(|c| {
+            let found: Option<String> = c.query_row("SELECT cred_ref FROM credentials WHERE refresh_hash = ?1 AND refresh_expires_ms > ?2", params![refresh_hash, now_ms], |r| r.get(0)).optional().map_err(be)?;
+            if let Some(cr) = &found {
+                c.execute("UPDATE credentials SET refresh_hash = NULL WHERE cred_ref = ?1", params![cr]).map_err(be)?;
+            }
+            Ok(found)
+        })
+    }
+    fn replace_token(&self, cred_ref: &str, token_hash: &str, access_expires_ms: i64) -> StoreResult<()> {
+        self.with(|c| {
+            c.execute("UPDATE credentials SET token_hash = ?2, access_expires_ms = ?3 WHERE cred_ref = ?1", params![cred_ref, token_hash, access_expires_ms]).map_err(be).map(|_| ())
         })
     }
     fn link_door(&self, user_id: i64, source: &str, subject: &str) -> StoreResult<()> {

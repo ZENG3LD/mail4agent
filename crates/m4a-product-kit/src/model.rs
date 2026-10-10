@@ -58,4 +58,30 @@ pub trait UserStore: Send + Sync {
     fn live_credentials(&self) -> StoreResult<Vec<(String, Vec<String>)>>;
     fn user_by_door(&self, source: &str, subject: &str) -> StoreResult<Option<User>>;
     fn link_door(&self, user_id: i64, source: &str, subject: &str) -> StoreResult<()>;
+
+    // ---- Optional: password change and expiring sessions with refresh tokens. A store that does
+    // ---- not implement them keeps the defaults; the product then does not offer these features.
+
+    /// Replaces the password hash (account/password).
+    fn set_secret_hash(&self, _user_id: i64, _hash: &str) -> StoreResult<()> {
+        Err(StoreError::Backend("this store does not support password changes".into()))
+    }
+    /// Does the store keep expiry and refresh tokens for credentials?
+    fn supports_refresh(&self) -> bool {
+        false
+    }
+    /// Gives a credential an access-token expiry and a refresh token (only its hash is kept).
+    /// `user_by_token_hash` must stop finding the credential once `access_expires_ms` has passed.
+    fn set_refresh(&self, _cred_ref: &str, _refresh_hash: &str, _access_expires_ms: i64, _refresh_expires_ms: i64) -> StoreResult<()> {
+        Err(StoreError::Backend("this store does not support refresh tokens".into()))
+    }
+    /// Consumes a refresh token (one use): the credential it belongs to, if valid at `now_ms`.
+    fn take_refresh(&self, _refresh_hash: &str, _now_ms: i64) -> StoreResult<Option<String>> {
+        Err(StoreError::Backend("this store does not support refresh tokens".into()))
+    }
+    /// Swaps a credential's access-token hash (the credential reference stays, so the messenger's
+    /// device stays) and sets its new expiry.
+    fn replace_token(&self, _cred_ref: &str, _token_hash: &str, _access_expires_ms: i64) -> StoreResult<()> {
+        Err(StoreError::Backend("this store does not support refresh tokens".into()))
+    }
 }
