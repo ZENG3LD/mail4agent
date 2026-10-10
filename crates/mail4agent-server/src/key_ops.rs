@@ -23,6 +23,9 @@ pub const SEND_TO_DEVICE_MAX_CONTENT_BYTES: usize = 64 * 1024;
 /// naming) — `m.megolm_backup.v1.curve25519-aes-sha2` (the PkEncryption
 /// backup) is refused outright, never even reaching storage.
 pub const BACKUP_ALGORITHM: &str = "m.megolm_backup.v1.aes-hmac-sha2";
+/// The spec's backup algorithm, which Element and other stock clients create. The server keeps the
+/// auth data as given and never reads the keys, so both are stored the same way.
+pub const BACKUP_ALGORITHM_SPEC: &str = "m.megolm_backup.v1.curve25519-aes-sha2";
 
 
 // ============================================================================
@@ -898,7 +901,7 @@ pub struct BackupVersionUpdateRequest {
 /// (plan P9 brief, MSC3270 naming) — `m.megolm_backup.v1.curve25519-aes-sha2`
 /// (the PkEncryption backup) is refused outright.
 pub fn validate_backup_algorithm(algorithm: &str) -> Result<(), MatrixError> {
-    if algorithm == BACKUP_ALGORITHM {
+    if algorithm == BACKUP_ALGORITHM || algorithm == BACKUP_ALGORITHM_SPEC {
         Ok(())
     } else {
         Err(MatrixError::invalid_param(format!("unsupported key-backup algorithm: {algorithm}")))

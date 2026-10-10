@@ -35,6 +35,8 @@ pub(super) fn routes() -> Router<Arc<Homeserver>> {
         .route("/client/v3/pushrules/{scope}/{kind}/{rule_id}", put(ok_empty).delete(ok_empty).get(ok_empty))
         .route("/client/v3/pushrules/{scope}/{kind}/{rule_id}/enabled", put(ok_empty).get(rule_enabled))
         .route("/client/v3/pushrules/{scope}/{kind}/{rule_id}/actions", put(ok_empty).get(rule_actions))
+        .route("/client/v3/thirdparty/protocols", get(no_protocols))
+        .route("/client/v3/voip/turnServer", get(no_turn_server))
         .route("/client/v3/pushers", get(pushers))
         .route("/client/v3/pushers/set", post(ok_empty))
         .route("/client/v3/notifications", get(notifications))
@@ -65,6 +67,17 @@ async fn well_known_server(State(state): State<Arc<Homeserver>>) -> Result<Json<
 }
 
 /// Login is the product server's; this server lists no flows and mints no sessions.
+/// No bridges: an empty protocol list, which is what clients read as "none".
+async fn no_protocols() -> Json<Value> {
+    Json(json!({}))
+}
+
+/// No TURN server configured: an empty answer (clients then place calls without relays).
+async fn no_turn_server(State(state): State<Arc<Homeserver>>, headers: HeaderMap) -> Result<Json<Value>, MatrixError> {
+    resolve_caller(&state, &headers, None).await?;
+    Ok(Json(json!({})))
+}
+
 async fn login_flows() -> Json<Value> {
     Json(json!({ "flows": [] }))
 }

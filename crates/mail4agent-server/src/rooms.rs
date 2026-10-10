@@ -62,7 +62,8 @@ pub struct KickBanBody {
 #[derive(serde::Deserialize, Default)]
 pub struct MembersQuery {
     pub membership: Option<String>,
-    pub at: Option<i64>,
+    /// A sync token (`next_batch`) or a bare stream position.
+    pub at: Option<String>,
 }
 
 

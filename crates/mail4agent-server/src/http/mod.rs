@@ -244,12 +244,28 @@ pub fn router(state: Arc<Homeserver>) -> Router {
         .merge(identity::routes())
         .fallback(unrecognized)
         .layer(axum::middleware::from_fn_with_state(state.clone(), identity::assertion_layer))
+        .layer(axum::middleware::from_fn(cors))
         .with_state(state)
 }
 
+/// Browser clients (Element, Cinny) call from another origin: answer preflights and allow it.
+pub async fn cors(req: axum::extract::Request, next: axum::middleware::Next) -> axum::response::Response {
+    use axum::http::{header, HeaderValue, Method, StatusCode};
+    let preflight = req.method() == Method::OPTIONS;
+    let mut resp = if preflight { axum::response::Response::builder().status(StatusCode::OK).body(axum::body::Body::empty()).unwrap() } else { next.run(req).await };
+    let h = resp.headers_mut();
+    h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    h.insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS"));
+    h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("X-Requested-With, Content-Type, Authorization, Date"));
+    resp
+}
+
+/// Every spec version up to the newest one supported (they are cumulative; clients test for the one a feature arrived in).
+const SPEC_VERSIONS: [&str; 19] = ["v1.1", "v1.2", "v1.3", "v1.4", "v1.5", "v1.6", "v1.7", "v1.8", "v1.9", "v1.10", "v1.11", "v1.12", "v1.13", "v1.14", "v1.15", "v1.16", "v1.17", "v1.18", "v1.19"];
+
 async fn versions() -> impl IntoResponse {
     Json(serde_json::json!({
-        "versions": ["v1.19"],
+        "versions": SPEC_VERSIONS,
         "unstable_features": {},
     }))
 }
@@ -293,7 +309,8 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
         let value: serde_json::Value = serde_json::from_slice(&body).expect("json");
-        assert_eq!(value, serde_json::json!({ "versions": ["v1.19"], "unstable_features": {} }));
+        assert_eq!(value["versions"].as_array().unwrap().last().unwrap(), "v1.19");
+        assert!(value["versions"].as_array().unwrap().iter().any(|v| v == "v1.1"));
     }
 
     #[tokio::test]

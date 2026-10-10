@@ -104,6 +104,8 @@ pub fn router(app: App) -> Router {
     Router::new()
         .route("/product/v1/register", post(register))
         .route("/product/v1/login", post(login))
+        .route("/client/v3/login", get(matrix_login_flows).post(matrix_login))
+        .route("/_matrix/client/v3/login", get(matrix_login_flows).post(matrix_login))
         .route("/product/v1/doors", get(doors))
         .route("/product/v1/login/door/{id}", post(door_login))
         .route("/product/v1/logout", post(logout))
@@ -115,7 +117,45 @@ pub fn router(app: App) -> Router {
         .route("/product/v1/admin/delete", post(admin_delete))
         .route("/product/v1/admin/tier", post(admin_tier))
         .fallback(any(proxy))
+        .layer(axum::middleware::from_fn(cors))
         .with_state(app)
+}
+
+/// Browser clients call from another origin: answer preflights and allow it.
+async fn cors(req: Request, next: axum::middleware::Next) -> Response {
+    use axum::http::{header, HeaderValue, Method};
+    let preflight = req.method() == Method::OPTIONS;
+    let mut resp = if preflight { Response::builder().status(StatusCode::OK).body(axum::body::Body::empty()).unwrap() } else { next.run(req).await };
+    let h = resp.headers_mut();
+    h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    h.insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS"));
+    h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("X-Requested-With, Content-Type, Authorization, Date"));
+    resp
+}
+
+/// The Matrix client login flow list: this product signs in with a nick and a password.
+async fn matrix_login_flows() -> Json<Value> {
+    Json(json!({ "flows": [{ "type": "m.login.password" }] }))
+}
+
+/// Matrix `m.login.password` on top of the product login: the nick is the user, the product session
+/// token is the access token, and the user and device ids come from the messenger's own answer.
+async fn matrix_login(State(app): State<App>, Json(body): Json<Value>) -> Result<Json<Value>, ApiError> {
+    let user = body.pointer("/identifier/user").or_else(|| body.get("user")).and_then(Value::as_str).unwrap_or("");
+    let user = user.strip_prefix('@').unwrap_or(user);
+    let nick = user.split(':').next().unwrap_or("").to_string();
+    let pw = body.get("password").and_then(Value::as_str).unwrap_or("").to_string();
+    let Json(sess) = login(State(app.clone()), Json(json!({ "nick": nick, "password": pw }))).await?;
+    let token = sess["token"].as_str().unwrap_or_default().to_string();
+    let t2 = token.clone();
+    let who = blk(&app, move |a| a.users.authenticate(&t2)).await??.ok_or_else(|| err(StatusCode::FORBIDDEN, "M_FORBIDDEN", "invalid credentials"))?;
+    let req = Request::builder().method("GET").uri("/client/v3/account/whoami").body(axum::body::Body::empty()).map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "M_UNKNOWN", "request"))?;
+    let resp = app.link.forward(Some(&who), req).await;
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16).await.map_err(|_| err(StatusCode::BAD_GATEWAY, "M_UNKNOWN", "messenger unavailable"))?;
+    let w: Value = serde_json::from_slice(&bytes).map_err(|_| err(StatusCode::BAD_GATEWAY, "M_UNKNOWN", "messenger unavailable"))?;
+    let user_id = w["user_id"].as_str().ok_or_else(|| err(StatusCode::BAD_GATEWAY, "M_UNKNOWN", "messenger refused the session"))?.to_string();
+    let home = user_id.split_once(':').map(|(_, d)| d.to_string()).unwrap_or_default();
+    Ok(Json(json!({ "user_id": user_id, "access_token": token, "device_id": w["device_id"], "home_server": home })))
 }
 
 async fn register(State(app): State<App>, Json(body): Json<Value>) -> Result<Json<Value>, ApiError> {

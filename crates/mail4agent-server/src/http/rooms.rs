@@ -510,7 +510,13 @@ async fn get_members(
         Some(raw) => Some(Membership::from_wire_name(raw).ok_or_else(|| MatrixError::invalid_param("unknown membership filter"))?),
         None => None,
     };
-    let at = query.at;
+    let at = match query.at.as_deref() {
+        Some(raw) => Some(match raw.parse::<i64>() {
+            Ok(n) => n,
+            Err(_) => crate::sync_token::parse(raw)?.stream_id,
+        }),
+        None => None,
+    };
     let events = with_conn(&state, move |conn| {
         let room = require_room(conn, &room_id)?;
         require_pub_read(conn, &room, caller.user_id)?;
