@@ -207,6 +207,9 @@ struct SessionFile {
     /// is in the record; the secret is in the file, which the owner places.
     #[serde(default)]
     routine_file: Option<String>,
+    /// `server` or `matrix`: the tier this session logs in on. Missing: `M4A_TIER`, else `server`.
+    #[serde(default)]
+    tier: Option<String>,
 }
 
 /// Reads `*.json` session records from `dir`. A file that carries anything
@@ -244,6 +247,11 @@ pub fn load_session_records(dir: &Path) -> Result<Vec<HostSession>, ShellError> 
             .agent_id
             .map(|id| id.trim().to_string())
             .filter(|id| !id.is_empty());
+        session.tier = match file.tier.or_else(|| std::env::var("M4A_TIER").ok()).as_deref().map(str::trim) {
+            None | Some("") | Some("server") => m4a_agent::BackendKind::Server,
+            Some("matrix") => m4a_agent::BackendKind::Matrix,
+            Some(other) => return Err(ShellError::SessionList(format!("tier {other:?} is not server or matrix"))),
+        };
         session.routine_file = file.routine_file.map(|p| PathBuf::from(p.trim())).filter(|p| !p.as_os_str().is_empty());
         out.push(session);
     }
