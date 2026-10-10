@@ -84,4 +84,31 @@ pub trait UserStore: Send + Sync {
     fn replace_token(&self, _cred_ref: &str, _token_hash: &str, _access_expires_ms: i64) -> StoreResult<()> {
         Err(StoreError::Backend("this store does not support refresh tokens".into()))
     }
+    // ---- Optional: login by proof of possession of a key (no password). An identity is invited
+    // ---- once (the nick is assigned then), enrolls its public key with the invite, and from then
+    // ---- on logs in by signing a challenge. A store that does not implement these keeps the
+    // ---- defaults; the product then does not offer key login.
+    fn supports_keys(&self) -> bool {
+        false
+    }
+    /// Remembers an invite (only the hash of its code) for an existing user, valid until `expires_ms`.
+    fn create_invite(&self, _code_hash: &str, _user_id: i64, _expires_ms: i64) -> StoreResult<()> {
+        Err(StoreError::Backend("this store does not support key login".into()))
+    }
+    /// Consumes an invite (one use): the user it was made for, if it exists and has not expired.
+    fn take_invite(&self, _code_hash: &str, _now_ms: i64) -> StoreResult<Option<User>> {
+        Err(StoreError::Backend("this store does not support key login".into()))
+    }
+    /// Binds a public key (base64url) to a user. `key_id` is also the key credential's reference.
+    fn add_key(&self, _user_id: i64, _key_id: &str, _public_key: &str, _label: &str, _now_ms: i64) -> StoreResult<()> {
+        Err(StoreError::Backend("this store does not support key login".into()))
+    }
+    /// The user and public key (base64url) behind a `key_id`.
+    fn user_by_key(&self, _key_id: &str) -> StoreResult<Option<(User, String)>> {
+        Err(StoreError::Backend("this store does not support key login".into()))
+    }
+    /// Removes a key (its login stops working); true when it existed.
+    fn delete_key(&self, _key_id: &str) -> StoreResult<bool> {
+        Ok(false)
+    }
 }

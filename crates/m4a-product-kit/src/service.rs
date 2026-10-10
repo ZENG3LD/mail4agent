@@ -164,6 +164,8 @@ impl<S: UserStore> UserService<S> {
 
     /// Log one credential out. Returns the event when it existed.
     pub fn revoke(&self, cred_ref: &str) -> Result<Vec<Event>, ServiceError> {
+        // A key credential goes together with its key: otherwise it would log in again.
+        let _ = self.store.delete_key(cred_ref);
         Ok(match self.store.delete_credential(cred_ref)? {
             Some(_) => vec![new_event(EventKind::CredentialRevoked { cred_ref: cred_ref.to_string() })],
             None => vec![],

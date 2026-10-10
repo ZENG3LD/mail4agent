@@ -25,6 +25,7 @@ pub mod dbkey;
 pub mod door;
 pub mod edge_link;
 pub mod events;
+pub mod keylogin;
 pub mod model;
 pub mod nick_rules;
 pub mod push_relay;
@@ -36,6 +37,7 @@ pub use edge_link::EdgeLink;
 pub use events::{send_reconcile, EventPublisher, MemoryOutbox, Outbox};
 #[cfg(feature = "sqlite-outbox")]
 pub use events::SqliteOutbox;
+pub use keylogin::ChallengeBook;
 pub use tokens::LoginTokens;
 pub use model::{StoreError, User, UserStore};
 pub use service::{AuthUser, ServiceError, Session, UserService};
