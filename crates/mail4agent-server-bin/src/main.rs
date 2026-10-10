@@ -15,9 +15,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Utc;
-use mail4agent_server::http::{hash_token, router, Homeserver};
-use mail4agent_server::keys::{self, CredentialKind};
-use mail4agent_server::nick;
+use mail4agent_server::http::{router, Homeserver};
 use mail4agent_server::store::{self, init_messenger_db};
 use rusqlite::Connection;
 use tokio::net::TcpListener;
@@ -277,6 +275,10 @@ fn validate_key_hex(raw: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use mail4agent_server::http::hash_token;
+    use mail4agent_server::keys::{self, CredentialKind};
+    use mail4agent_server::nick;
 
     struct Bootstrap {
         public_id: String,

@@ -5,6 +5,9 @@
 //! Opaque blobs stand in for Olm ciphertext: clients' key exchange is
 //! unchanged and runs on top of exactly these routes.
 
+#[path = "support_product.rs"]
+mod support_product;
+
 use std::io::Read;
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -12,19 +15,15 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use mail4agent_server::federation::enc;
-use mail4agent_server::http::hash_token;
-use mail4agent_server::keys::{self, CredentialKind};
-use mail4agent_server::nick;
-use mail4agent_server::store::init_messenger_db;
 use reqwest::blocking::Client;
 use serde_json::{json, Value};
-
-const NOW: &str = "2026-10-05T00:00:00+00:00";
 
 struct Srv {
     name: &'static str,
     addr: String,
-    token: &'static str,
+    token: String,
+    /// Product server in front of this core; clients talk to it.
+    purl: String,
     device: String,
     user: String,
     dir: PathBuf,
@@ -52,21 +51,10 @@ fn key_hex() -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-fn seed(name: &str, localpart: &str, nick_: &str, token: &str, dir: &std::path::Path, key: &str) -> (String, String) {
-    std::fs::create_dir_all(dir).unwrap();
-    let conn = init_messenger_db(dir.join("messenger.db").to_str().unwrap(), key).unwrap();
-    let mxid = format!("@{localpart}:{name}");
-    conn.execute("INSERT INTO matrix_users (user_id, mxid, created_at) VALUES (1, ?1, ?2)", rusqlite::params![mxid, NOW]).unwrap();
-    nick::set_nick(&conn, 1, nick_).unwrap();
-    let device = keys::create_device(&conn, 1, CredentialKind::Bearer, &hash_token(token), NOW).unwrap();
-    conn.execute_batch("PRAGMA wal_checkpoint(FULL);").unwrap();
-    (mxid, device)
-}
-
 impl Srv {
     fn call(&self, c: &Client, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
-        let url = format!("http://{}{}", self.addr, path);
-        let mut r = c.request(method.parse().unwrap(), url).bearer_auth(self.token);
+        let url = format!("{}{}", self.purl, path);
+        let mut r = c.request(method.parse().unwrap(), url).bearer_auth(&self.token);
         if let Some(b) = body {
             r = r.json(&b);
         }
@@ -101,8 +89,8 @@ fn send(a: &Srv, c: &Client, room: &str, ty: &str, txn: &str, content: Value) ->
 fn two_servers_federate_public_room_dm_keys_and_to_device() {
     // Each server needs the other's port for the staging override map, so reserve both first.
     let (ra, rb) = (free_port(), free_port());
-    let a = start_with_ports("a.example", "alice", "alice_nick", "tok-alice", ra, ("b.example", rb));
-    let b = start_with_ports("b.example", "bob", "bob_nick", "tok-bob", rb, ("a.example", ra));
+    let a = start_with_ports("a.example", "alice", ra, ("b.example", rb));
+    let b = start_with_ports("b.example", "bob", rb, ("a.example", ra));
     let c = Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
 
     // F0 over the wire.
@@ -190,10 +178,10 @@ fn two_servers_federate_public_room_dm_keys_and_to_device() {
     let _ = (a.name, b.name);
 }
 
-fn start_with_ports(name: &'static str, localpart: &str, nick_: &str, token: &'static str, port: u16, peer: (&str, u16)) -> Srv {
+fn start_with_ports(name: &'static str, localpart: &str, port: u16, peer: (&str, u16)) -> Srv {
     let dir = PathBuf::from(format!("/tmp/m4a-fed-{}-{}", name, std::process::id()));
     let key = key_hex();
-    let (user, device) = seed(name, localpart, nick_, token, &dir, &key);
+    std::fs::create_dir_all(&dir).unwrap();
     let addr = format!("127.0.0.1:{port}");
     let exe = std::env::var("CARGO_BIN_EXE_mail4agent_server_bin").or_else(|_| std::env::var("CARGO_BIN_EXE_mail4agent-server-bin")).expect("bin");
     let child = Command::new(exe)
@@ -201,7 +189,7 @@ fn start_with_ports(name: &'static str, localpart: &str, nick_: &str, token: &'s
         .env("M4A_DB_KEY_HEX", &key)
         .env("M4A_FEDERATION", "1")
         .env("M4A_FEDERATION_PEER_OVERRIDE", format!("{}=http://127.0.0.1:{}", peer.0, peer.1))
-        .env_remove("M4A_BOOTSTRAP_PUBLIC_ID")
+        .env("M4A_ASSERTION_SECRET", support_product::SEAM_SECRET)
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
         .spawn()
@@ -211,5 +199,11 @@ fn start_with_ports(name: &'static str, localpart: &str, nick_: &str, token: &'s
         assert!(t.elapsed() < Duration::from_secs(20), "server {name} did not start");
         std::thread::sleep(Duration::from_millis(50));
     }
-    Srv { name, addr, token, device, user, dir, child: Some(child) }
+    // The product server in front of this core; the user's first call is its first contact.
+    let product = support_product::start_product(&format!("http://{addr}"));
+    let token = support_product::product_user(&product, localpart);
+    let who: Value = Client::new().get(format!("{}/client/v3/account/whoami", product.url)).bearer_auth(&token).send().unwrap().json().unwrap();
+    let (user, device) = (who["user_id"].as_str().unwrap().to_string(), who["device_id"].as_str().unwrap().to_string());
+    assert_eq!(user, format!("@{localpart}:{name}"));
+    Srv { name, addr, token, purl: product.url, device, user, dir, child: Some(child) }
 }
