@@ -22,6 +22,8 @@ pub mod service;
 pub mod tiers;
 
 pub use edge_link::EdgeLink;
-pub use events::EventPublisher;
+pub use events::{send_reconcile, EventPublisher, MemoryOutbox, Outbox};
+#[cfg(feature = "sqlite-outbox")]
+pub use events::SqliteOutbox;
 pub use model::{StoreError, User, UserStore};
 pub use service::{AuthUser, ServiceError, Session, UserService};

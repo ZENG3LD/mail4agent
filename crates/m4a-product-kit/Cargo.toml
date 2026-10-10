@@ -7,11 +7,14 @@ publish = false
 description = "Building blocks of a product server in front of the messenger server: nick rules, user store trait and service, sessions, tiers, optional login doors, the signing link to the edge and the lifecycle event publisher."
 
 [features]
-default = []
+default = ["sqlite-outbox"]
+# Durable event queue in SQLite (survives restarts); without it only the in-memory queue exists.
+sqlite-outbox = ["dep:rusqlite"]
 # Real optional login door: a person proves a federated Matrix address by an OpenID token.
 matrix-address-door = []
 
 [dependencies]
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 m4a-seam = { path = "../m4a-seam" }
 axum = { version = "0.8", features = ["json", "ws"] }
 tokio-tungstenite = "0.29"

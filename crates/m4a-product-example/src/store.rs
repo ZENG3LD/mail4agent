@@ -121,6 +121,18 @@ impl UserStore for SqliteStore {
         let rows = st.query_map(params![user_id], |r| r.get(0)).map_err(be)?;
         rows.collect::<Result<_, _>>().map_err(be)
     }
+    fn live_credentials(&self) -> StoreResult<Vec<(String, Vec<String>)>> {
+        let c = self.c();
+        let mut out: Vec<(String, Vec<String>)> = Vec::new();
+        let mut users = c.prepare("SELECT id, nick FROM users ORDER BY id").map_err(be)?;
+        let rows: Vec<(i64, String)> = users.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).map_err(be)?.collect::<Result<_, _>>().map_err(be)?;
+        let mut creds = c.prepare("SELECT cred_ref FROM credentials WHERE user_id = ?1").map_err(be)?;
+        for (id, nick) in rows {
+            let list: Vec<String> = creds.query_map(params![id], |r| r.get(0)).map_err(be)?.collect::<Result<_, _>>().map_err(be)?;
+            out.push((nick, list));
+        }
+        Ok(out)
+    }
     fn user_by_door(&self, source: &str, subject: &str) -> StoreResult<Option<User>> {
         self.c()
             .query_row("SELECT u.id, u.nick, u.tier, u.nick_changes, u.nick_changed_ms FROM door_links d JOIN users u ON u.id = d.user_id WHERE d.source = ?1 AND d.subject = ?2", params![source, subject], user)

@@ -42,6 +42,7 @@ impl LoginDoor for FakeDoor {
 }
 
 struct Stack {
+    link: EdgeLink,
     edge: String,
     core: Arc<Homeserver>,
     product: String,
@@ -79,14 +80,14 @@ async fn stack_with(unix_dir: Option<&std::path::Path>) -> Stack {
     let link = EdgeLink::new(&edge_url, SEAM_SECRET.to_vec(), None).with_link_token(Some(LINK.into()));
     let app = Arc::new(ProductApp {
         users: UserService::new(Arc::new(SqliteStore::memory().unwrap()), NickRules::default(), TierTable::default()),
-        events: EventPublisher::spawn(link.clone(), None, Duration::from_millis(50)),
-        link,
+        events: EventPublisher::spawn_with(link.clone(), None, Duration::from_millis(50), Arc::new(m4a_product_kit::SqliteOutbox::memory().unwrap())),
+        link: link.clone(),
         admin_token: ADMIN.into(),
         doors: vec![Arc::new(FakeDoor)],
         anon_read: true,
     });
     let product = format!("http://{}", serve(router(app)).await);
-    Stack { edge: edge_url, core, product, c: reqwest::Client::new() }
+    Stack { link, edge: edge_url, core, product, c: reqwest::Client::new() }
 }
 
 impl Stack {
@@ -353,4 +354,32 @@ async fn anonymous_read_serves_public_rooms_only_and_never_writes() {
     // A user's token is not downgraded: an authenticated read still sees its own membership.
     let (st, b) = s.send("GET", &format!("/_matrix/client/v3/rooms/{closed}/messages?dir=b"), Some(&tok), None).await;
     assert_eq!(st, 200, "{b}");
+}
+
+#[tokio::test]
+async fn startup_reconcile_applies_revocations_and_deletions_the_messenger_never_heard_of() {
+    let s = stack().await;
+    let (a_nick, a_tok) = s.register().await;
+    let (b_nick, b_tok) = s.register().await;
+    for t in [&a_tok, &b_tok] {
+        assert_eq!(s.send("GET", "/_matrix/client/v3/account/whoami", Some(t), None).await.0, 200);
+    }
+    let count = |sql: &'static str| move |c: &Connection| c.query_row::<i64, _, _>(sql, [], |r| r.get(0)).unwrap();
+    assert_eq!(count("SELECT COUNT(*) FROM identities")(&s.core.conn.lock().unwrap()), 2);
+    // The product lost track of b entirely and of a's only credential, without any event having been sent.
+    let snap = m4a_seam::Reconcile { id: "r1".into(), complete: true, nicks: vec![m4a_seam::LiveNick { nick: a_nick.clone(), creds: vec![] }] };
+    m4a_product_kit::send_reconcile(&s.link, None, &snap, Duration::from_millis(20), 3).await.unwrap();
+    s.until("b retired and a's device gone", |c| count("SELECT COUNT(*) FROM identities")(c) == 1 && count("SELECT COUNT(*) FROM devices")(c) == 0).await;
+    let c = s.core.conn.lock().unwrap();
+    let left: String = c.query_row("SELECT nick FROM identities", [], |r| r.get(0)).unwrap();
+    assert_eq!(left, a_nick);
+    assert_ne!(left, b_nick);
+    drop(c);
+    // A partial snapshot never retires anyone.
+    let partial = m4a_seam::Reconcile { id: "r2".into(), complete: false, nicks: vec![] };
+    m4a_product_kit::send_reconcile(&s.link, None, &partial, Duration::from_millis(20), 3).await.unwrap();
+    assert_eq!(count("SELECT COUNT(*) FROM identities")(&s.core.conn.lock().unwrap()), 1);
+    // A forged snapshot is refused.
+    let forged = s.c.post(format!("{}/_matrix/account-source/v1/reconcile", s.edge)).header("x-m4a-link-token", LINK).header(m4a_seam::DEFAULT_EVENT_SIG_HEADER, "00").body("{\"id\":\"x\",\"complete\":true,\"nicks\":[]}").send().await.unwrap();
+    assert_eq!(forged.status().as_u16(), 401);
 }

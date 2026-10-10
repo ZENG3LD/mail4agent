@@ -131,6 +131,18 @@ impl<S: UserStore> UserService<S> {
         Ok((updated, vec![ev]))
     }
 
+    /// Snapshot(s) of every live credential for startup reconciliation. One complete snapshot
+    /// when the user count is at most `chunk`; otherwise partial chunks (credential-level only,
+    /// no retirement of unlisted identities, because no single message lists everyone).
+    pub fn reconcile_snapshots(&self, chunk: usize) -> Result<Vec<m4a_seam::Reconcile>, ServiceError> {
+        let all: Vec<m4a_seam::LiveNick> = self.store.live_credentials()?.into_iter().map(|(nick, creds)| m4a_seam::LiveNick { nick, creds }).collect();
+        let complete = all.len() <= chunk.max(1);
+        if complete {
+            return Ok(vec![m4a_seam::Reconcile { id: random_hex(8), complete: true, nicks: all }]);
+        }
+        Ok(all.chunks(chunk.max(1)).map(|c| m4a_seam::Reconcile { id: random_hex(8), complete: false, nicks: c.to_vec() }).collect())
+    }
+
     /// Log one credential out. Returns the event when it existed.
     pub fn revoke(&self, cred_ref: &str) -> Result<Vec<Event>, ServiceError> {
         Ok(match self.store.delete_credential(cred_ref)? {

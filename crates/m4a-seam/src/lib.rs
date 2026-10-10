@@ -50,6 +50,25 @@ pub const DEFAULT_EVENT_SIG_HEADER: &str = "x-m4a-event-sig";
 /// Lifetime of an assertion the signer makes, in seconds.
 pub const ASSERTION_TTL_S: i64 = 60;
 
+/// Startup reconciliation: the product's snapshot of live credentials, so the messenger can
+/// catch up on `credential.revoked` / `account.deleted` events it never received.
+/// Posted to `/account-source/v1/reconcile` with the same body signature as events.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Reconcile {
+    pub id: String,
+    /// True when `nicks` lists EVERY live account: identities absent from it are retired.
+    /// False for a partial chunk: only the listed nicks are reconciled.
+    pub complete: bool,
+    pub nicks: Vec<LiveNick>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LiveNick {
+    pub nick: String,
+    /// Every credential reference that is still valid for this nick.
+    pub creds: Vec<String>,
+}
+
 /// Header carrying the barrier token on private links (product -> edge, product -> core).
 /// Every receiver of a link checks it inside, on top of the transport (WireGuard or a
 /// unix socket) that already protects the link.

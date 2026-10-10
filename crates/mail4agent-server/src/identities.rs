@@ -194,6 +194,48 @@ pub fn apply_credential_revoked(conn: &mut Connection, cred_ref: &str) -> Result
     Ok(hit.map(|(u, _)| u))
 }
 
+/// What a reconcile pass changed.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ReconcileOutcome {
+    pub devices_removed: usize,
+    pub identities_retired: usize,
+    pub wake: Vec<i64>,
+}
+
+/// Apply the product's snapshot of live credentials. Devices of a listed nick whose
+/// credential is not in its list are removed; with `complete`, identities whose nick is not
+/// listed at all are retired exactly as `account.deleted` would.
+pub fn reconcile(conn: &mut Connection, snap: &m4a_seam::Reconcile, now_ms: i64) -> Result<ReconcileOutcome, MatrixError> {
+    let mut out = ReconcileOutcome::default();
+    let mut listed = std::collections::HashSet::new();
+    for live in &snap.nicks {
+        listed.insert(live.nick.to_ascii_lowercase());
+        let Some(idn) = identity_by_nick(conn, &live.nick)? else { continue };
+        for d in crate::keys::list_devices(conn, idn.id)? {
+            if d.credential_kind == CredentialKind::Web && !live.creds.iter().any(|c| *c == d.credential_ref) {
+                crate::keys::delete_device(conn, idn.id, &d.device_id, &chrono::Utc::now().to_rfc3339())?;
+                out.devices_removed += 1;
+                if !out.wake.contains(&idn.id) {
+                    out.wake.push(idn.id);
+                }
+            }
+        }
+    }
+    if snap.complete {
+        let all: Vec<String> = {
+            let mut st = conn.prepare("SELECT nick FROM identities")?;
+            let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        for nick in all.into_iter().filter(|n| !listed.contains(&n.to_ascii_lowercase())) {
+            if apply_account_deleted(conn, &nick, now_ms)? {
+                out.identities_retired += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Current nick of an identity, for display labels.
 pub fn nick_of_user(conn: &Connection, user_id: i64) -> rusqlite::Result<Option<String>> {
     conn.query_row("SELECT nick FROM identities WHERE id = ?1", params![user_id], |r| r.get(0)).optional()

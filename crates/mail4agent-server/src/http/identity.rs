@@ -74,7 +74,7 @@ impl Seam {
 }
 
 pub(super) fn routes() -> Router<Arc<Homeserver>> {
-    Router::new().route("/account-source/v1/events", post(lifecycle_event))
+    Router::new().route("/account-source/v1/events", post(lifecycle_event)).route("/account-source/v1/reconcile", post(reconcile_snapshot))
 }
 
 fn now_ms() -> i64 {
@@ -159,6 +159,19 @@ fn restamp(conn: &mut rusqlite::Connection, id: i64) -> Result<Vec<i64>, MatrixE
 
 /// Product -> messenger lifecycle events. Body is a [`m4a_seam::Event`]; the
 /// signature header carries the hex HMAC of the raw body.
+/// Product's startup snapshot of live credentials; see [`m4a_seam::Reconcile`].
+async fn reconcile_snapshot(State(state): State<Arc<Homeserver>>, headers: HeaderMap, body: Bytes) -> Result<Json<Value>, MatrixError> {
+    let seam = state.seam.get().cloned().ok_or_else(MatrixError::unrecognized)?;
+    let sig = headers.get(seam.event_sig_header.as_str()).and_then(|v| v.to_str().ok()).unwrap_or("");
+    if !m4a_seam::verify_body(&seam.secrets, &body, sig) {
+        return Err(MatrixError::unauthorized("bad event signature"));
+    }
+    let snap: m4a_seam::Reconcile = serde_json::from_slice(&body).map_err(|_| MatrixError::bad_json("malformed reconcile body"))?;
+    let out = super::with_conn_pub(&state, move |conn| identities::reconcile(conn, &snap, now_ms())).await?;
+    wake_users(&state, out.wake.clone());
+    Ok(Json(json!({ "ok": true, "devices_removed": out.devices_removed, "identities_retired": out.identities_retired })))
+}
+
 async fn lifecycle_event(State(state): State<Arc<Homeserver>>, headers: HeaderMap, body: Bytes) -> Result<Json<Value>, MatrixError> {
     let seam = state.seam.get().cloned().ok_or_else(MatrixError::unrecognized)?;
     let sig = headers.get(seam.event_sig_header.as_str()).and_then(|v| v.to_str().ok()).unwrap_or("");

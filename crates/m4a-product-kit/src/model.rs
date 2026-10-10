@@ -54,6 +54,8 @@ pub trait UserStore: Send + Sync {
     /// Removes one credential; returns the owner's id when it existed.
     fn delete_credential(&self, cred_ref: &str) -> StoreResult<Option<i64>>;
     fn credentials_of(&self, user_id: i64) -> StoreResult<Vec<String>>;
+    /// Every user with the references of all its live credentials (users without any are included).
+    fn live_credentials(&self) -> StoreResult<Vec<(String, Vec<String>)>>;
     fn user_by_door(&self, source: &str, subject: &str) -> StoreResult<Option<User>>;
     fn link_door(&self, user_id: i64, source: &str, subject: &str) -> StoreResult<()>;
 }
