@@ -118,12 +118,20 @@ pub fn compute_event_id(rules: &RoomVersionRules, json: &CanonicalJsonObject) ->
 }
 
 /// Checks the content hash and the origin signature (needs the signing server's public key).
+/// A skeleton (an event whose content was erased and which is already in its redacted form) is
+/// accepted: its signature verifies, its content hash cannot match any more.
 pub fn verify_wire(rules: &RoomVersionRules, json: &CanonicalJsonObject, keys: &PublicKeyMap) -> Result<(), Reject> {
     match verify_event(keys, json, rules) {
         Ok(Verified::All) => Ok(()),
+        Ok(Verified::Signatures) if is_skeleton(rules, json) => Ok(()),
         Ok(Verified::Signatures) => Err(Reject::BadContentHash),
         Err(e) => Err(Reject::BadSignature(e.to_string())),
     }
+}
+
+/// The event is already in its redacted form (content erased down to what redaction keeps).
+pub fn is_skeleton(rules: &RoomVersionRules, json: &CanonicalJsonObject) -> bool {
+    skeleton(rules, json).map(|s| s == *json).unwrap_or(false)
 }
 
 /// The skeleton of an event: redacted form (content erased, ids, edges, hashes and signatures kept).
@@ -189,6 +197,77 @@ pub fn accept(rules: &RoomVersionRules, db: &dyn DagRead, event_id: OwnedEventId
     let forked = ext.len() > 1;
     let current_state = resolve_over(rules, &WithNew { db, pdu: &pdu }, &ext, Some((&event_id, &state_after)))?;
     Ok(Accepted { event_id, pdu, json, state_after, soft_failed: false, extremities: ext, current_state, forked })
+}
+
+/// An event of the past (fetched by get_missing_events or backfill, or part of an auth chain):
+/// checked against its own auth events and the state before it, never against the current state,
+/// and it does not touch the forward extremities. Its `prev_events` must already have a state.
+pub struct Historic {
+    pub event_id: OwnedEventId,
+    pub pdu: Pdu,
+    pub json: CanonicalJsonObject,
+    pub state_after: StateMap<OwnedEventId>,
+}
+
+pub fn accept_historic(rules: &RoomVersionRules, db: &dyn DagRead, event_id: OwnedEventId, json: CanonicalJsonObject) -> Result<Historic, Reject> {
+    let pdu = Pdu::from_wire(event_id.clone(), &json).map_err(Reject::Malformed)?;
+    let fetch = |id: &EventId| -> Option<Pdu> { if id == pdu.event_id { Some(pdu.clone()) } else { db.pdu(id) } };
+    for a in &pdu.auth_events {
+        if db.pdu(a).is_none() {
+            return Err(Reject::MissingAuth(a.to_string()));
+        }
+    }
+    check_state_independent_auth_rules(&rules.authorization, &pdu, &fetch).map_err(Reject::Auth)?;
+    let mut auth_state: std::collections::HashMap<(StateEventType, String), Pdu> = Default::default();
+    for a in &pdu.auth_events {
+        if let Some(p) = db.pdu(a) {
+            if let Some(sk) = &p.state_key {
+                auth_state.insert((skey(&p.kind), sk.clone()), p);
+            }
+        }
+    }
+    check_state_dependent_auth_rules(&rules.authorization, &pdu, |t: &StateEventType, k: &str| auth_state.get(&(t.clone(), k.to_owned())).cloned()).map_err(Reject::Auth)?;
+    let before = resolve_over(rules, db, &pdu.prev_events, None)?;
+    let by_state = |t: &StateEventType, k: &str| before.get(&(t.clone(), k.to_owned())).and_then(|id| db.pdu(id));
+    check_state_dependent_auth_rules(&rules.authorization, &pdu, by_state).map_err(Reject::Auth)?;
+    let mut state_after = before;
+    if let Some(sk) = &pdu.state_key {
+        state_after.insert((skey(&pdu.kind), sk.clone()), event_id.clone());
+    }
+    Ok(Historic { event_id, pdu, json, state_after })
+}
+
+/// Re-verifies an auth chain received from a peer: every event's signature and content hash (or
+/// skeleton form), its id, that every `auth_events` entry is in the set, and the auth rules of each
+/// event against the state its own auth events describe. Returns the ids in verified order.
+pub fn verify_auth_chain(rules: &RoomVersionRules, events: &[CanonicalJsonObject], keys: &PublicKeyMap) -> Result<Vec<OwnedEventId>, Reject> {
+    let mut pdus: std::collections::HashMap<OwnedEventId, Pdu> = Default::default();
+    for j in events {
+        verify_wire(rules, j, keys)?;
+        let id = compute_event_id(rules, j)?;
+        let p = Pdu::from_wire(id.clone(), j).map_err(Reject::Malformed)?;
+        pdus.insert(id, p);
+    }
+    let mut order: Vec<&Pdu> = pdus.values().collect();
+    order.sort_by_key(|p| (p.depth, p.event_id.clone()));
+    for p in &order {
+        for a in &p.auth_events {
+            if !pdus.contains_key(a) {
+                return Err(Reject::MissingAuth(a.to_string()));
+            }
+        }
+        let fetch = |id: &EventId| pdus.get(id).cloned();
+        check_state_independent_auth_rules(&rules.authorization, *p, &fetch).map_err(Reject::Auth)?;
+        let mut st: std::collections::HashMap<(StateEventType, String), Pdu> = Default::default();
+        for a in &p.auth_events {
+            let ap = &pdus[a];
+            if let Some(sk) = &ap.state_key {
+                st.insert((skey(&ap.kind), sk.clone()), ap.clone());
+            }
+        }
+        check_state_dependent_auth_rules(&rules.authorization, *p, |t: &StateEventType, k: &str| st.get(&(t.clone(), k.to_owned())).cloned()).map_err(Reject::Auth)?;
+    }
+    Ok(order.iter().map(|p| p.event_id.clone()).collect())
 }
 
 /// A peer's event: check the origin signature and content hash, derive the id, accept.

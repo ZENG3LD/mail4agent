@@ -194,5 +194,46 @@ fn skeleton_keeps_the_event_id_and_signatures_but_drops_content() {
     assert!(sk.contains_key("signatures") && sk.contains_key("hashes") && sk.contains_key("prev_events"));
     assert_eq!(dag::compute_event_id(&rules(), &sk).unwrap(), m.event_id, "the id is a hash of the redacted form, so it survives");
     // The skeleton still verifies as a signature, but its content hash no longer matches: a peer sees a redacted event.
-    assert!(matches!(dag::verify_wire(&rules(), &sk, &keys()), Err(dag::Reject::BadContentHash) | Ok(())));
+    assert!(dag::verify_wire(&rules(), &sk, &keys()).is_ok(), "a skeleton verifies as a skeleton");
+    // A half-erased event is not a skeleton: the content hash must match or the form must be the redacted one.
+    let mut fake = m.json.clone();
+    fake.insert("content".into(), serde_json::from_value(json!({"body": "edited"})).unwrap());
+    assert!(dag::verify_wire(&rules(), &fake, &keys()).is_err());
+}
+
+fn all_json(m: &Mem) -> Vec<CanonicalJsonObject> {
+    let mut v: Vec<_> = m.json.borrow().values().cloned().collect();
+    v.sort_by_key(|o| format!("{:?}", o.get("depth")));
+    v
+}
+
+#[test]
+fn an_auth_chain_is_reverified_and_a_missing_or_altered_link_is_caught() {
+    let (a, _, _, _) = base();
+    let chain = all_json(&a);
+    assert_eq!(dag::verify_auth_chain(&rules(), &chain, &keys()).unwrap().len(), chain.len());
+    let mut cut = chain.clone();
+    cut.retain(|o| o.get("type").map(|t| serde_json::to_value(t).unwrap()) != Some(json!("m.room.join_rules")));
+    assert!(dag::verify_auth_chain(&rules(), &cut, &keys()).is_err(), "bob's join cites the join rules");
+    let mut bad = chain.clone();
+    let last = bad.len() - 1;
+    bad[last].insert("origin_server_ts".into(), ruma_common::CanonicalJsonValue::Integer(1u32.into()));
+    assert!(dag::verify_auth_chain(&rules(), &bad, &keys()).is_err());
+}
+
+#[test]
+fn historic_events_rebuild_the_same_state_without_touching_extremities() {
+    let (a, _, sa, _) = base();
+    a.local(&sa, 1_700_000_050_000, ALICE, "m.room.name", Some(""), json!({"name": "n"}));
+    let c = Mem::default();
+    for j in all_json(&a) {
+        let id = dag::compute_event_id(&rules(), &j).unwrap();
+        let h = dag::accept_historic(&rules(), &c, id.clone(), j.clone()).unwrap();
+        c.pdus.borrow_mut().insert(id.clone(), h.pdu);
+        c.json.borrow_mut().insert(id.clone(), j);
+        c.state.borrow_mut().insert(id, h.state_after);
+    }
+    assert!(c.extremities().is_empty());
+    let tip = a.extremities()[0].clone();
+    assert_eq!(c.state.borrow()[&tip], a.state.borrow()[&tip]);
 }
