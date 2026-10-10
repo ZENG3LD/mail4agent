@@ -1,9 +1,12 @@
 [package]
 name = "m4a-seam"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
-publish = false
+repository = "https://github.com/ZENG3LD/mail4agent"
+readme = "README.md"
+keywords = ["matrix","messenger","assertion","signing"]
+categories = ["network-programming"]
 description = "The seam between a product server and the messenger server: signed assertion v1, lifecycle event bodies and their signatures, replay cache, shared test vectors. No I/O."
 
 [dependencies]

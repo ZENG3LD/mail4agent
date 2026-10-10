@@ -1,9 +1,12 @@
 [package]
 name = "m4a-edge"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
-publish = false
+repository = "https://github.com/ZENG3LD/mail4agent"
+readme = "README.md"
+keywords = ["matrix","messenger","proxy","edge"]
+categories = ["network-programming"]
 description = "Edge role of the mail4agent messenger: terminates client connections behind a TLS proxy, keeps only light rebuildable state, forwards to the core over a private tunnel."
 
 [lib]
@@ -15,7 +18,7 @@ name = "m4a-edge"
 path = "src/main.rs"
 
 [dependencies]
-m4a-seam = { path = "../m4a-seam" }
+m4a-seam = { path = "../m4a-seam", version = "0.2.0" }
 axum = { version = "0.8", features = ["json", "ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
@@ -24,7 +27,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std", "
 serde_json = "1"
 
 [dev-dependencies]
-mail4agent-server = { path = "../mail4agent-server", version = "0.1.0" }
+mail4agent-server = { path = "../mail4agent-server", version = "0.2.0" }
 rusqlite = "0.32"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 serde_json = "1"

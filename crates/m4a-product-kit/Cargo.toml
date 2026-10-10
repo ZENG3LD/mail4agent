@@ -1,9 +1,12 @@
 [package]
 name = "m4a-product-kit"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
-publish = false
+repository = "https://github.com/ZENG3LD/mail4agent"
+readme = "README.md"
+keywords = ["matrix","messenger","product-server","sqlcipher"]
+categories = ["network-programming"]
 description = "Building blocks of a product server in front of the messenger server: nick rules, user store trait and service, sessions, tiers, optional login doors, the signing link to the edge and the lifecycle event publisher."
 
 [features]
@@ -16,7 +19,7 @@ matrix-address-door = []
 [dependencies]
 # Storage engine (published crate): SQLCipher via `cipher-native`, one writer, WAL, batched writes.
 tesserax-store = { version = "0.1.1", features = ["cipher-native"], optional = true }
-m4a-seam = { path = "../m4a-seam" }
+m4a-seam = { path = "../m4a-seam", version = "0.2.0" }
 axum = { version = "0.8", features = ["json", "ws"] }
 tokio-tungstenite = "0.29"
 futures-util = "0.3"

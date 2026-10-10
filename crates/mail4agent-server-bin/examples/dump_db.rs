@@ -112,7 +112,7 @@ fn dump(conn: &rusqlite::Connection) {
         println!("{u}\t{d}");
     }
     println!("=== rooms ===");
-    let mut stmt = conn.prepare("SELECT room_id, room_version, is_direct FROM rooms").unwrap_or_else(|_| {
+    let stmt = conn.prepare("SELECT room_id, room_version, is_direct FROM rooms").unwrap_or_else(|_| {
         conn.prepare("SELECT room_id FROM rooms").unwrap()
     });
     // fallback handled below via raw

@@ -146,7 +146,9 @@ mod sqlite {
             self.db.read(|c| c.query_row("SELECT COUNT(*) FROM event_outbox WHERE state = 'dead'", [], |r| r.get::<_, i64>(0))).await.unwrap_or(0) as usize
         }
         fn done(&self) {
-            let _ = self.pending.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+            if self.pending.load(Ordering::Acquire) > 0 {
+                self.pending.fetch_sub(1, Ordering::AcqRel);
+            }
         }
     }
 

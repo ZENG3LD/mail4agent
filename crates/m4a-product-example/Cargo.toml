@@ -1,9 +1,12 @@
 [package]
 name = "m4a-product-example"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
-publish = false
+repository = "https://github.com/ZENG3LD/mail4agent"
+readme = "README.md"
+keywords = ["matrix","messenger","product-server","example"]
+categories = ["network-programming"]
 description = "A complete, minimal product server on m4a-product-kit: its own SQLite users, register/login/nick/logout, optional login doors, and the signing proxy to the messenger edge. Meant to be run as is or replaced piece by piece by a real product."
 
 [lib]
@@ -20,8 +23,8 @@ default = ["matrix-address-door"]
 matrix-address-door = ["m4a-product-kit/matrix-address-door"]
 
 [dependencies]
-m4a-product-kit = { path = "../m4a-product-kit" }
-m4a-seam = { path = "../m4a-seam" }
+m4a-product-kit = { path = "../m4a-product-kit", version = "0.2.0" }
+m4a-seam = { path = "../m4a-seam", version = "0.2.0" }
 axum = { version = "0.8", features = ["json"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal"] }
 tesserax-store = { version = "0.1.1", features = ["cipher-native"] }
@@ -33,9 +36,8 @@ hex = "0.4"
 tracing = "0.1"
 
 [dev-dependencies]
-mail4agent-server = { path = "../mail4agent-server", version = "0.1.0", default-features = false }
-m4a-edge = { path = "../m4a-edge" }
-tesserax-store = { version = "0.1.1", features = ["cipher-native"] }
+mail4agent-server = { path = "../mail4agent-server", version = "0.2.0", default-features = false }
+m4a-edge = { path = "../m4a-edge", version = "0.2.0" }
 tokio-tungstenite = "0.29"
 futures-util = "0.3"
 mail4agent-messenger-shell = { path = "../mail4agent-messenger-shell" }

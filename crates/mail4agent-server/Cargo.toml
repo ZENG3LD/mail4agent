@@ -1,9 +1,12 @@
 [package]
 name = "mail4agent-server"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
-publish = false
+repository = "https://github.com/ZENG3LD/mail4agent"
+readme = "README.md"
+keywords = ["matrix","homeserver","messenger","e2ee"]
+categories = ["network-programming"]
 description = "Matrix-subset homeserver: protocol decisions plus the Client-Server HTTP routes. No users database, logins, registration or tariffs: identities are nick + domain; a product server vouches for callers through the signed-assertion seam (m4a-seam), lifecycle events and the policy hook."
 
 [lib]
@@ -33,7 +36,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std", "
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 sha2 = "0.10"
 hex = "0.4"
-m4a-seam = { path = "../m4a-seam" }
+m4a-seam = { path = "../m4a-seam", version = "0.2.0" }
 hmac = "0.12"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 

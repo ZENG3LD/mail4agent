@@ -1286,7 +1286,7 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
 name = "m4a-edge"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "futures-util",
@@ -1301,7 +1301,7 @@ dependencies = [
 
 [[package]]
 name = "m4a-product-example"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "argon2",
  "axum",
@@ -1324,7 +1324,7 @@ dependencies = [
 
 [[package]]
 name = "m4a-product-kit"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "futures-util",
@@ -1343,7 +1343,7 @@ dependencies = [
 
 [[package]]
 name = "m4a-seam"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "hex",
@@ -1485,7 +1485,7 @@ dependencies = [
 
 [[package]]
 name = "mail4agent-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "base64",
