@@ -29,6 +29,10 @@ pub trait KeyVault: Send + Sync {
     fn get(&self, label: &str) -> Result<Option<Zeroizing<Vec<u8>>>>;
     fn put(&self, label: &str, value: &[u8]) -> Result<()>;
     fn delete(&self, label: &str) -> Result<bool>;
+    /// Every label held (for backup). A vault that cannot list says so.
+    fn labels(&self) -> Result<Vec<String>> {
+        Err(AgentError::Vault("this vault cannot list its labels".into()))
+    }
     /// A short name for logs ("memory", "file+keychain", "file+keyfile").
     fn kind(&self) -> &'static str;
 }
@@ -53,6 +57,11 @@ impl KeyVault for MemoryVault {
     }
     fn delete(&self, label: &str) -> Result<bool> {
         Ok(self.0.lock().unwrap_or_else(|e| e.into_inner()).remove(label).is_some())
+    }
+    fn labels(&self) -> Result<Vec<String>> {
+        let mut v: Vec<String> = self.0.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect();
+        v.sort();
+        Ok(v)
     }
     fn kind(&self) -> &'static str {
         "memory"
@@ -84,6 +93,35 @@ impl MasterKeySource for FileMasterKey {
     }
     fn name(&self) -> &'static str {
         "keyfile"
+    }
+}
+
+/// The name of the environment variable that holds the vault's key material. When this variable
+/// (the one named here, not its value) is set in the process environment, the vault's master key
+/// comes from the variable it names (for example a secret of the box), not from a file next to the
+/// vault; the vault file alone then opens nowhere.
+pub const VAULT_KEY_ENV: &str = "M4A_VAULT_KEY_ENV";
+
+/// The master key derived from a secret the host injects into the environment. It is never
+/// created here: a missing or short value is an error, not a fresh vault under a new key.
+pub struct EnvMasterKey {
+    pub var: String,
+}
+
+impl MasterKeySource for EnvMasterKey {
+    fn load_or_create(&self) -> Result<Zeroizing<Vec<u8>>> {
+        use sha2::{Digest, Sha256};
+        let value = Zeroizing::new(std::env::var(&self.var).map_err(|_| AgentError::Vault(format!("the vault key variable {} is not set", self.var)))?);
+        if value.trim().len() < 16 {
+            return Err(AgentError::Vault(format!("the vault key variable {} must hold at least 16 characters", self.var)));
+        }
+        let mut h = Sha256::new();
+        h.update(b"m4a-vault-master-v1\0");
+        h.update(value.trim().as_bytes());
+        Ok(Zeroizing::new(h.finalize().to_vec()))
+    }
+    fn name(&self) -> &'static str {
+        "envkey"
     }
 }
 
@@ -153,7 +191,11 @@ pub struct FileVault {
 
 impl FileVault {
     pub fn open(path: impl Into<PathBuf>, master: Box<dyn MasterKeySource>) -> Result<Self> {
-        let kind = if master.name() == "keychain" { "file+keychain" } else { "file+keyfile" };
+        let kind = match master.name() {
+            "keychain" => "file+keychain",
+            "envkey" => "file+envkey",
+            _ => "file+keyfile",
+        };
         let v = Self { path: path.into(), master, kind, lock: Mutex::new(()) };
         v.load()?; // fails now when the key does not open the file
         Ok(v)
@@ -168,6 +210,23 @@ impl FileVault {
         #[cfg(feature = "vault-keychain")]
         let keychain = || -> Box<dyn MasterKeySource> { Box::new(KeychainMasterKey { service: service.to_string(), account: format!("vault:{}", dir.display()) }) };
         let path = dir.join("vault.enc");
+        // The vault's key may come from a secret the host injects: the variable names which one.
+        let env_var = std::env::var(VAULT_KEY_ENV).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        if want.as_deref() == Some("envkey") && env_var.is_none() {
+            return Err(AgentError::Vault(format!("this vault's key comes from the environment: set {VAULT_KEY_ENV} to the name of the secret that holds it")));
+        }
+        if let Some(var) = env_var {
+            match want.as_deref() {
+                None | Some("envkey") => {
+                    let v = Self::open(&path, Box::new(EnvMasterKey { var }))?;
+                    if want.is_none() {
+                        write_private(&marker, b"envkey")?;
+                    }
+                    return Ok(v);
+                }
+                Some(other) => return Err(AgentError::Vault(format!("this vault lives under {other}; to move it under {VAULT_KEY_ENV} make a backup, start a new vault and restore the backup"))),
+            }
+        }
         let (v, home) = match want.as_deref() {
             Some("keyfile") => (Self::open(&path, file())?, "keyfile"),
             #[cfg(feature = "vault-keychain")]
@@ -247,6 +306,10 @@ impl KeyVault for FileVault {
         }
         Ok(had)
     }
+    fn labels(&self) -> Result<Vec<String>> {
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(self.load()?.keys().cloned().collect())
+    }
     fn kind(&self) -> &'static str {
         self.kind
     }
@@ -255,6 +318,9 @@ impl KeyVault for FileVault {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tests that open a vault by default read the process environment; the one that sets it runs alone.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn file_vault_round_trips_and_never_writes_plaintext() {
@@ -295,6 +361,7 @@ mod tests {
 
     #[test]
     fn open_default_remembers_where_the_master_key_lives() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
         // The keychain may or may not work on the machine running the tests; either way the second
         // open must find the same vault.
@@ -304,5 +371,39 @@ mod tests {
         let v = FileVault::open_default(d.path(), "m4a-agent-test").unwrap();
         assert_eq!(v.kind(), kind);
         assert_eq!(&v.get("a").unwrap().unwrap()[..], b"1");
+    }
+
+    #[test]
+    fn the_master_key_can_come_from_the_environment_and_never_from_a_file_beside_the_vault() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        // One process, one test touching these variables: names are unique to this test.
+        std::env::set_var("M4A_TEST_VAULT_SECRET_A", "a-long-enough-secret-value-1");
+        std::env::set_var(VAULT_KEY_ENV, "M4A_TEST_VAULT_SECRET_A");
+        let v = FileVault::open_default(d.path(), "svc").unwrap();
+        v.put("x", b"1").unwrap();
+        assert_eq!(v.kind(), "file+envkey");
+        assert!(!d.path().join("vault.key").exists(), "no key file");
+        drop(v);
+        // Same secret: opens. Another secret: an error, not an empty vault. No variable: named error.
+        assert!(FileVault::open_default(d.path(), "svc").unwrap().get("x").unwrap().is_some());
+        std::env::set_var("M4A_TEST_VAULT_SECRET_B", "another-long-secret-value-22");
+        std::env::set_var(VAULT_KEY_ENV, "M4A_TEST_VAULT_SECRET_B");
+        assert!(FileVault::open_default(d.path(), "svc").is_err());
+        std::env::remove_var(VAULT_KEY_ENV);
+        let e = FileVault::open_default(d.path(), "svc").err().unwrap().to_string();
+        assert!(e.contains(VAULT_KEY_ENV), "{e}");
+        // A vault made under a key file does not switch to the environment by itself.
+        let d2 = tempfile::tempdir().unwrap();
+        FileVault::open_default(d2.path(), "svc").unwrap().put("y", b"2").unwrap();
+        std::env::set_var(VAULT_KEY_ENV, "M4A_TEST_VAULT_SECRET_A");
+        assert!(FileVault::open_default(d2.path(), "svc").is_err());
+        std::env::remove_var(VAULT_KEY_ENV);
+        // A short secret is refused.
+        std::env::set_var("M4A_TEST_VAULT_SHORT", "short");
+        std::env::set_var(VAULT_KEY_ENV, "M4A_TEST_VAULT_SHORT");
+        let d3 = tempfile::tempdir().unwrap();
+        assert!(FileVault::open_default(d3.path(), "svc").is_err());
+        std::env::remove_var(VAULT_KEY_ENV);
     }
 }

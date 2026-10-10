@@ -9,7 +9,7 @@ description = "The agent-side client of the messenger: one session = one identit
 [features]
 # The full pack is the default; a light build turns features off.
 default = ["full"]
-full = ["tier-server", "tier-matrix", "engine", "vault-keychain", "bridges"]
+full = ["tier-server", "tier-matrix", "engine", "vault-keychain", "vault-backup", "bridges"]
 # The engine driver: runs the sans-I/O messenger core against a backend (HTTP execution, sync worker,
 # push socket). Needs a tier to talk to.
 engine = ["dep:mail4agent-messenger", "dep:tungstenite", "dep:reqwest"]
@@ -22,6 +22,8 @@ tier-matrix = ["dep:reqwest"]
 # not part of `full`.
 bridges = []
 bridge-loopback = ["bridges"]
+# Encrypted export and import of the whole vault under a passphrase (argon2id + AES-256-GCM).
+vault-backup = ["dep:argon2"]
 # Keep the vault's master key in the OS keychain when there is one.
 vault-keychain = ["dep:keyring"]
 
@@ -38,6 +40,7 @@ sha2 = "0.10"
 base64 = "0.22"
 zeroize = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"], optional = true }
+argon2 = { version = "0.5", optional = true }
 keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "vendored"], optional = true }
 
 [dev-dependencies]

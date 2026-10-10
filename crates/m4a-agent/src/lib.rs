@@ -16,6 +16,8 @@ pub mod identity;
 pub mod keyauth;
 pub mod resolver;
 pub mod vault;
+#[cfg(feature = "vault-backup")]
+pub mod vault_backup;
 
 pub use backend::{Backend, BackendKind, Capabilities, Session};
 pub use error::{AgentError, Result};
