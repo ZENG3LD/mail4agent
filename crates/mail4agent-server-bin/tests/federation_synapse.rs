@@ -334,3 +334,65 @@ fn synapse_invites_our_user_to_a_closed_room_and_keys_device_lists_and_directori
     let doc: Value = env.plain.post(format!("http://127.0.0.1:{}/_matrix/key/v2/query", env.ours.addr.rsplit(':').next().unwrap())).json(&json!({"server_keys": {syn_name.as_str(): {}}})).send().unwrap().json().unwrap();
     assert!(doc["server_keys"][0]["signatures"][our_name].is_object() && doc["server_keys"][0]["signatures"][syn_name.as_str()].is_object(), "notary doc: {doc}");
 }
+
+#[test]
+fn media_presence_and_user_lookup_work_with_synapse() {
+    let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(env) = setup() else { return };
+    let Env { ours, plain, syn_name, our_name, .. } = &env;
+    let our_name = *our_name;
+    let (alice, syn_user) = (ours.user.clone(), format!("@syn:{syn_name}"));
+
+    // A shared room (so presence is visible): Synapse creates it, invites us, we join.
+    let (st, v) = env.syn("POST", "/createRoom", Some(json!({"preset":"private_chat","name":"shared","room_version":"11","invite":[alice]})));
+    assert_eq!(st, 200, "{v}\n{}", env.log_tail());
+    let room = v["room_id"].as_str().unwrap().to_string();
+    poll("we have the invite", || ours.call(plain, "GET", "/client/v3/sync?timeout=0", None).1["rooms"]["invite"].get(&room).cloned());
+    assert_eq!(ours.call(plain, "POST", &format!("/client/v3/join/{}", enc(&room)), Some(json!({}))).0, 200, "{}", env.log_tail());
+    poll("synapse sees us joined", || env.syn("GET", &format!("/rooms/{}/joined_members", enc(&room)), None).1["joined"].get(&alice).map(|_| ()));
+
+    // Presence, Synapse -> us: Synapse's user goes online with a status; our sync and GET show it.
+    let (st, v) = env.syn("PUT", &format!("/presence/{}/status", enc(&syn_user)), Some(json!({"presence":"online","status_msg":"on synapse"})));
+    assert_eq!(st, 200, "{v}");
+    poll("our server learns synapse's presence", || {
+        let (st, v) = ours.call(plain, "GET", &format!("/client/v3/presence/{}/status", enc(&syn_user)), None);
+        (st == 200 && v["presence"] == "online" && v["status_msg"] == "on synapse").then_some(())
+    });
+    // Presence, us -> Synapse.
+    let (st, v) = ours.call(plain, "PUT", &format!("/client/v3/presence/{}/status", enc(&alice)), Some(json!({"presence":"unavailable","status_msg":"on ours"})));
+    assert_eq!(st, 200, "{v}");
+    // Synapse batches incoming presence before applying it.
+    std::thread::sleep(Duration::from_secs(3));
+    poll("synapse learns our presence", || {
+        let (st, v) = env.syn("GET", &format!("/presence/{}/status", enc(&alice)), None);
+        (st == 200 && v["presence"] == "unavailable" && v["status_msg"] == "on ours").then_some(())
+    });
+
+    // Media, ours -> Synapse: Synapse's user downloads our file through Synapse (authenticated media).
+    let blob: Vec<u8> = (0..20_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8).collect();
+    let up = plain.post(format!("{}/media/v3/upload", ours.purl)).bearer_auth(&ours.token).header("content-type", "application/octet-stream").body(blob.clone()).send().unwrap();
+    let mxc = up.json::<Value>().unwrap()["content_uri"].as_str().unwrap().to_string();
+    let path = mxc.strip_prefix("mxc://").unwrap().to_string();
+    poll("synapse fetches our media", || {
+        let r = plain.get(format!("http://127.0.0.1:{}/_matrix/client/v1/media/download/{path}", env.syn_port)).bearer_auth(&env.tok).send().ok()?;
+        (r.status().as_u16() == 200 && r.bytes().ok()?.to_vec() == blob).then_some(())
+    });
+    // Media, Synapse -> ours: we download Synapse's file (federation media fetch, cached).
+    let sblob = b"synapse's file, as opaque bytes".to_vec();
+    let up = plain.post(format!("http://127.0.0.1:{}/_matrix/media/v3/upload", env.syn_port)).bearer_auth(&env.tok).header("content-type", "application/octet-stream").body(sblob.clone()).send().unwrap();
+    let smxc = up.json::<Value>().unwrap()["content_uri"].as_str().unwrap().to_string();
+    let sid = smxc.rsplit('/').next().unwrap();
+    for _ in 0..2 {
+        let r = plain.get(format!("{}/client/v1/media/download/{syn_name}/{sid}", ours.purl)).bearer_auth(&ours.token).send().unwrap();
+        assert_eq!(r.status().as_u16(), 200, "{}", env.log_tail());
+        assert_eq!(r.bytes().unwrap().to_vec(), sblob);
+    }
+
+    // Federated user lookup: Synapse's user, found by full id, with the profile Synapse holds.
+    let (st, v) = env.syn("PUT", &format!("/profile/{}/displayname", enc(&syn_user)), Some(json!({"displayname":"Syn Display"})));
+    assert_eq!(st, 200, "{v}");
+    let (st, v) = ours.call(plain, "POST", "/client/v3/user_directory/search", Some(json!({"search_term": syn_user})));
+    assert_eq!(st, 200, "{v}");
+    assert_eq!((v["results"][0]["user_id"].as_str(), v["results"][0]["display_name"].as_str()), (Some(syn_user.as_str()), Some("Syn Display")), "{v}");
+    let _ = our_name;
+}
