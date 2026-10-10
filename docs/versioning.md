@@ -13,3 +13,5 @@ Order of publication: `mail4agent-api`, `-attest`, `-core`, `-store-sqlite`, `-c
 Since 0.4.3 the workspace dependency on `m4a-agent` is declared with `default-features = false`; a crate that needs the full pack asks for `features = ["full"]` explicitly (the shell has its own `full` feature that does).
 
 Only the patch component moves on its own: 0.4.0 -> 0.4.1 -> 0.4.2 and so on, without limit, for any change including new features. The minor (second) digit, and anything above it, moves ONLY with the owner's explicit approval. Do not pick 0.5.0 (or 1.0.0) on your own.
+
+Publish order note (0.4.4): the dev-dependency cycle means `mail4agent-messenger-shell` is published before `m4a-product-example`, and `mail4agent-server-bin` last.
