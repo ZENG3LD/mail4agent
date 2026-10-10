@@ -746,7 +746,7 @@ mod tests {
 
     fn create(c: &mut Connection, public: bool) -> String {
         let mxid = store::mxid_of(c, 1).unwrap().unwrap();
-        match apply_create_room(c, RoomCreate { creator_user_id: 1, creator_mxid: &mxid, creator_displayname: "alice", is_direct: false, invitees: &[], visibility_public: public, power_level_content_override: None, name: Some("t"), topic: None, room_type: None }, NOW, TS).unwrap() {
+        match apply_create_room(c, RoomCreate { creator_user_id: 1, creator_mxid: &mxid, creator_displayname: "alice", is_direct: false, invitees: &[], visibility_public: public, power_level_content_override: None, name: Some("t"), topic: None, room_type: None, predecessor: None }, NOW, TS).unwrap() {
             RoomCreation::Created { room_id, .. } => room_id,
             RoomCreation::Reused(_) => unreachable!(),
         }

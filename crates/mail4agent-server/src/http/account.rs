@@ -242,7 +242,8 @@ async fn get_profile(
     headers: HeaderMap,
     Path(user_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, MatrixError> {
-    profile_response(state, headers, user_id).await
+    super::resolve_caller(&state, &headers, None).await?;
+    Ok(Json(super::extras::profile_of(&state, &user_id).await?))
 }
 
 async fn get_profile_displayname(
@@ -250,24 +251,12 @@ async fn get_profile_displayname(
     headers: HeaderMap,
     Path(user_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, MatrixError> {
-    profile_response(state, headers, user_id).await
-}
-
-async fn profile_response(
-    state: Arc<Homeserver>,
-    headers: HeaderMap,
-    mxid: String,
-) -> Result<Json<serde_json::Value>, MatrixError> {
     super::resolve_caller(&state, &headers, None).await?;
-    let displayname = tokio::task::spawn_blocking(move || -> Result<String, MatrixError> {
-        state.conn_scope(|conn: &mut rusqlite::Connection| {
-        let user_id = crate::store::user_id_of(&conn, &mxid)?.ok_or_else(|| MatrixError::not_found("unknown user"))?;
-        Ok(crate::nick::effective_label(&conn, user_id)?)
-        })
-    })
-    .await
-    .map_err(|_| MatrixError::internal())??;
-    Ok(Json(serde_json::json!({ "displayname": displayname })))
+    let p = super::extras::profile_of(&state, &user_id).await?;
+    Ok(Json(match p.get("displayname") {
+        Some(d) => serde_json::json!({ "displayname": d }),
+        None => serde_json::json!({}),
+    }))
 }
 
 async fn put_displayname(

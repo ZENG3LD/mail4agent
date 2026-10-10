@@ -23,6 +23,7 @@ use crate::live::{ClaimRateLimiter, LiveRegistry};
 use crate::typing::TypingRegistry;
 
 mod account;
+pub(crate) mod extras;
 mod compat;
 pub mod edge_auth;
 mod ephemeral;
@@ -236,6 +237,7 @@ pub fn router(state: Arc<Homeserver>) -> Router {
         .merge(messaging::routes())
         .merge(ephemeral::routes())
         .merge(account::routes())
+        .merge(extras::routes())
                 .merge(keys::routes())
         .merge(sync::routes())
         .merge(push::routes())

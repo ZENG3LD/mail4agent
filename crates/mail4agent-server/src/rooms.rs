@@ -657,6 +657,8 @@ pub struct RoomCreate<'a> {
     pub topic: Option<&'a str>,
     /// `creation_content.type`; only `m.space` is accepted (a domain).
     pub room_type: Option<&'a str>,
+    /// The room this one replaces (`room_id`, last `event_id`): written into the create event.
+    pub predecessor: Option<(&'a str, &'a str)>,
 }
 
 pub enum RoomCreation {
@@ -697,9 +699,15 @@ pub fn apply_create_room(
         "m.room.create",
         "",
         req.creator_user_id,
-        match req.room_type {
-            Some(t) => serde_json::json!({ "room_version": crate::store::MATRIX_ROOM_VERSION, "type": t }),
-            None => serde_json::json!({ "room_version": crate::store::MATRIX_ROOM_VERSION }),
+        {
+            let mut create = serde_json::json!({ "room_version": crate::store::MATRIX_ROOM_VERSION });
+            if let Some(t) = req.room_type {
+                create["type"] = serde_json::json!(t);
+            }
+            if let Some((room, event)) = req.predecessor {
+                create["predecessor"] = serde_json::json!({ "room_id": room, "event_id": event });
+            }
+            create
         },
     )];
     state_events.extend(bootstrap_member_events(
@@ -765,6 +773,88 @@ pub fn apply_create_room(
     let mut notify_user_ids: HashSet<i64> = req.invitees.iter().map(|invitee| invitee.user_id).collect();
     notify_user_ids.insert(req.creator_user_id);
     Ok(RoomCreation::Created { room_id, notify_user_ids })
+}
+
+/// Replace a room by a new one (the way a legacy room moves to the current room version, hash ids
+/// included when the server makes them): the new room gets the old one's kind, name, topic, type,
+/// avatar, join rules, history visibility, power levels and (for a space) its children, its create
+/// event names the old room as `predecessor`, and the old room gets a tombstone. Direct rooms are
+/// not upgraded (a pair has one direct room). Needs power 100 or the room's creator.
+pub fn apply_upgrade(conn: &mut Connection, old_room: &str, caller_user_id: i64, caller_mxid: &str, caller_label: &str, now: &str, origin_ts: i64) -> Result<(String, HashSet<i64>), MatrixError> {
+    let room = crate::store::get_room(conn, old_room)?.ok_or_else(|| MatrixError::not_found("no such room"))?;
+    let member = crate::store::room_member(conn, old_room, caller_user_id)?;
+    require_member(member.as_ref().map(|m| m.membership))?;
+    let powerful = room.creator_user_id == caller_user_id || member.and_then(|m| m.power_level).unwrap_or(0) >= 100;
+    if !powerful {
+        return Err(MatrixError::forbidden("only the room's creator or an admin can upgrade it"));
+    }
+    if room.kind == RoomKind::Dm {
+        return Err(MatrixError::forbidden("a direct room is not upgraded"));
+    }
+    if crate::store::current_state_event(conn, old_room, "m.room.tombstone", "")?.is_some() {
+        return Err(MatrixError::forbidden("this room has already been upgraded"));
+    }
+    let content_of = |conn: &Connection, ty: &str| -> Result<Option<serde_json::Value>, MatrixError> {
+        Ok(match crate::store::current_state_event(conn, old_room, ty, "")? {
+            Some(e) => Some(serde_json::from_str(&e.content)?),
+            None => None,
+        })
+    };
+    let name = content_of(conn, "m.room.name")?.and_then(|c| c.get("name").and_then(|v| v.as_str()).map(str::to_string));
+    let topic = content_of(conn, "m.room.topic")?.and_then(|c| c.get("topic").and_then(|v| v.as_str()).map(str::to_string));
+    let room_type = content_of(conn, "m.room.create")?.and_then(|c| c.get("type").and_then(|v| v.as_str()).map(str::to_string)).filter(|t| t == "m.space");
+    let last: String = conn
+        .query_row("SELECT event_id FROM events WHERE room_id = ?1 ORDER BY stream_id DESC LIMIT 1", [old_room], |r| r.get(0))
+        .map_err(|_| MatrixError::internal())?;
+    let creation = apply_create_room(
+        conn,
+        RoomCreate {
+            creator_user_id: caller_user_id,
+            creator_mxid: caller_mxid,
+            creator_displayname: caller_label,
+            is_direct: false,
+            invitees: &[],
+            visibility_public: room.kind == RoomKind::Channel,
+            power_level_content_override: None,
+            name: name.as_deref(),
+            topic: topic.as_deref(),
+            room_type: room_type.as_deref(),
+            predecessor: Some((old_room, &last)),
+        },
+        now,
+        origin_ts,
+    )?;
+    let RoomCreation::Created { room_id: new_room, mut notify_user_ids } = creation else { return Err(MatrixError::internal()) };
+    // State that carries over. A failure to copy an optional piece does not undo the upgrade.
+    for ty in ["m.room.avatar", "m.room.guest_access", "m.room.join_rules", "m.room.power_levels"] {
+        if let Some(c) = content_of(conn, ty)? {
+            let _ = apply_put_state(conn, &new_room, caller_user_id, caller_mxid, ty, "", &c.to_string(), now, origin_ts);
+        }
+    }
+    if room_type.is_some() {
+        for e in crate::store::current_state_all(conn, old_room)? {
+            if e.event_type == "m.space.child" {
+                if let Some(k) = &e.state_key {
+                    let _ = apply_put_state(conn, &new_room, caller_user_id, caller_mxid, "m.space.child", k, &e.content, now, origin_ts);
+                }
+            }
+        }
+    }
+    // Aliases move to the new room.
+    let _ = conn.execute("UPDATE room_aliases SET room_id = ?1 WHERE room_id = ?2", rusqlite::params![new_room, old_room]);
+    let (_, wake) = apply_put_state(
+        conn,
+        old_room,
+        caller_user_id,
+        caller_mxid,
+        "m.room.tombstone",
+        "",
+        &serde_json::json!({ "body": "This room has been replaced", "replacement_room": new_room }).to_string(),
+        now,
+        origin_ts,
+    )?;
+    notify_user_ids.extend(wake);
+    Ok((new_room, notify_user_ids))
 }
 
 pub enum JoinDecision {

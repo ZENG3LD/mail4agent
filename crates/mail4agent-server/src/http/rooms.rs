@@ -180,6 +180,7 @@ async fn create_room(
                 name: req.name.as_deref(),
                 topic: req.topic.as_deref(),
                 room_type,
+                predecessor: None,
             },
             &now,
             origin_ts,
@@ -204,6 +205,7 @@ async fn join_room(
 ) -> Result<Json<serde_json::Value>, MatrixError> {
     let caller = resolve_caller(&state, &headers, None).await?;
     state.check_policy(&caller, crate::policy::Action::JoinRoom, None)?;
+    let room_id = if room_id.starts_with('#') { super::extras::resolve_alias(&state, &room_id).await?.0 } else { room_id };
     if state.federation_enabled.get().is_some() && super::fed_net::room_domain_is_remote(&room_id) {
         let ids = super::fed_net::federated_join(&state, &caller, &room_id).await?;
         wake_users(&state, ids);

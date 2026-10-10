@@ -245,6 +245,7 @@ mod tests {
                 name: Some(name),
                 topic: None,
                 room_type,
+                predecessor: None,
             },
             NOW,
             1,

@@ -30,6 +30,8 @@ pub(super) fn routes() -> Router<Arc<Homeserver>> {
         .route("/federation/v2/invite/{room_id}/{event_id}", put(invite))
         .route("/federation/v1/backfill/{room_id}", get(backfill))
         .route("/federation/v1/get_missing_events/{room_id}", post(get_missing_events))
+        .route("/federation/v1/query/directory", get(query_directory))
+        .route("/federation/v1/openid/userinfo", get(openid_userinfo))
         .route("/federation/v1/user/keys/query", post(keys_query))
         .route("/federation/v1/user/keys/claim", post(keys_claim))
         .route("/federation/v1/user/devices/{user_id}", get(user_devices))
@@ -65,6 +67,7 @@ async fn profile(
     require_enabled(&state)?;
     authenticate(&state, "GET", &uri, &headers, &[]).await?;
     let user_id = q.get("user_id").cloned().ok_or_else(|| MatrixError::invalid_param("user_id required"))?;
+    let user_id2 = user_id.clone();
     let known = with_conn_pub(&state, move |c| {
         let n: i64 = c
             .query_row("SELECT COUNT(*) FROM matrix_users WHERE mxid = ?1", [&user_id], |r| r.get(0))
@@ -73,7 +76,9 @@ async fn profile(
     })
     .await?;
     if known {
-        Ok(Json(json!({})))
+        let m = user_id2.clone();
+        let p = with_conn_pub(&state, move |c| super::extras::local_profile(c, &m)).await?;
+        Ok(Json(p.unwrap_or_else(|| json!({}))))
     } else {
         Err(MatrixError::not_found("user not found"))
     }
@@ -462,6 +467,30 @@ async fn get_missing_events(
         let _ = (v, room_id, origin);
         Err(MatrixError::unrecognized())
     }
+}
+
+/// `GET query/directory`: the room behind a local alias.
+async fn query_directory(State(state): State<Arc<Homeserver>>, OriginalUri(uri): OriginalUri, headers: HeaderMap, Query(q): Query<HashMap<String, String>>) -> Result<Json<Value>, MatrixError> {
+    require_enabled(&state)?;
+    authenticate(&state, "GET", &uri, &headers, &[]).await?;
+    let alias = q.get("room_alias").cloned().ok_or_else(|| MatrixError::invalid_param("room_alias required"))?;
+    let local = crate::store::matrix_server_name().to_string();
+    with_conn_pub(&state, move |c| {
+        let room = super::extras::resolve_local_alias(c, &alias).ok_or_else(|| MatrixError::not_found("no such alias"))?;
+        Ok(Json(json!({ "room_id": room, "servers": [local] })))
+    })
+    .await
+}
+
+/// `GET openid/userinfo`: who an OpenID token (issued here) belongs to. Unauthenticated by design.
+async fn openid_userinfo(State(state): State<Arc<Homeserver>>, Query(q): Query<HashMap<String, String>>) -> Result<Json<Value>, MatrixError> {
+    require_enabled(&state)?;
+    let token = q.get("access_token").cloned().unwrap_or_default();
+    with_conn_pub(&state, move |c| match super::extras::openid_subject(c, &token) {
+        Some(sub) => Ok(Json(json!({ "sub": sub }))),
+        None => Err(MatrixError::new(401, "M_UNKNOWN_TOKEN", "unknown or expired token")),
+    })
+    .await
 }
 
 async fn keys_query(State(state): State<Arc<Homeserver>>, OriginalUri(uri): OriginalUri, headers: HeaderMap, body: Bytes) -> Result<Json<Value>, MatrixError> {

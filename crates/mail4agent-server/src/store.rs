@@ -561,6 +561,7 @@ pub fn create_matrix_schema(conn: &Connection) -> rusqlite::Result<()> {
     crate::media::create_media_schema(conn)?;
     crate::fed_rooms::create_fed_schema(conn)?;
     crate::dag_schema::create_dag_schema(conn)?;
+    crate::http::extras::create_schema(conn)?;
     crate::identities::create_identities_schema(conn)
 }
 
