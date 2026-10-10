@@ -12,6 +12,7 @@ use crate::identity::{token_label, IdentityStore, SessionIdentity};
 pub const CHALLENGE_PATH: &str = "/product/v1/login/key/challenge";
 pub const ENROLL_PATH: &str = "/product/v1/enroll";
 pub const LOGIN_PATH: &str = "/product/v1/login/key";
+pub const LOGIN_TOKEN_PATH: &str = "/product/v1/login/key/token";
 
 pub fn refused_or(status: u16, what: &str) -> AgentError {
     match status {
@@ -73,6 +74,19 @@ pub fn login(wire: &dyn Wire, ids: &IdentityStore, id: &SessionIdentity) -> Resu
     let (nick, token) = (field(&v, "nick")?, field(&v, "token")?);
     ids.vault().put(&token_label(&id.session_id), token.as_bytes())?;
     Ok((nick, token))
+}
+
+/// Proves possession of the key at the product door and gets a one-time Matrix login token
+/// (`m.login.token`, short lived, single use) back. No session of this identity is touched. The
+/// caller must not print or keep the token.
+pub fn login_token(wire: &dyn Wire, ids: &IdentityStore, id: &SessionIdentity) -> Result<String> {
+    let c = fetch_challenge(wire, id)?;
+    let signature = id.sign_login(ids.vault(), &c)?;
+    let (st, v) = wire.post(LOGIN_TOKEN_PATH, &json!({ "key_id": id.key_id, "challenge_id": c.challenge_id, "signature": signature }), None)?;
+    if st != 200 {
+        return Err(refused_or(st, "login token"));
+    }
+    field(&v, "login_token")
 }
 
 /// The token stored for this session, if any.
