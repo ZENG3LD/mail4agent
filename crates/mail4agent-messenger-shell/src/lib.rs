@@ -179,6 +179,8 @@ pub const TIER_ENV: &str = "M4A_TIER";
 struct IdentityAuth {
     tier: m4a_agent::BackendKind,
     invite: Option<Zeroizing<String>>,
+    /// The nick to ask for at the first enrollment: the session name as a nick.
+    nick_request: Option<String>,
 }
 
 /// Directory for `session_id` under `root`.
@@ -369,8 +371,16 @@ impl SessionConfig {
             homeserver_url,
             session_id,
             store_root,
-            identity: IdentityAuth { tier, invite: invite.map(Zeroizing::new) },
+            identity: IdentityAuth { tier, invite: invite.map(Zeroizing::new), nick_request: None },
         })
+    }
+
+    /// Asks the server, at the first enrollment, for the nick of this session's name
+    /// ([`nick_from_display_name`] of `name`; a name that makes no nick asks for nothing). The
+    /// operator's invite still decides, and a nick the invite reserved wins.
+    pub fn with_nick_request(mut self, name: &str) -> Self {
+        self.identity.nick_request = nick_from_display_name(name.trim()).ok();
+        self
     }
 
     /// A session on `url`: the tier from [`TIER_ENV`] and the operator's invite from the invite
@@ -414,7 +424,12 @@ impl SessionConfig {
         };
         let session_id = get(SESSION_ID_ENV).ok_or(ShellError::EmptySession)?;
         let store_root = get(STORE_ROOT_ENV).ok_or(ShellError::StoreRoot)?;
-        Self::new_identity(url, tier, session_id, store_root, get(PRODUCT_INVITE_ENV))
+        // A nick is asked for only when the host named the session; a bare session id is not a name.
+        let config = Self::new_identity(url, tier, session_id, store_root, get(PRODUCT_INVITE_ENV))?;
+        Ok(match get(BOT_NAME_ENV) {
+            Some(name) => config.with_nick_request(&name),
+            None => config,
+        })
     }
 
     /// Homeserver (or product) origin this session logs in at.
@@ -2024,6 +2039,9 @@ fn identity_session(config: &SessionConfig, auth: &IdentityAuth) -> Result<Regis
         _ => return Err(ShellError::Register("this build does not include that tier".into())),
     };
     let mut id = ids.resolve(&config.session_id, auth.tier, backend.server_ref()).map_err(fail)?;
+    if !id.enrolled && id.requested_nick != auth.nick_request {
+        id.requested_nick = auth.nick_request.clone();
+    }
     let session = backend.ensure_session(&ids, &mut id, auth.invite.as_ref().map(|i| i.as_str())).map_err(fail)?;
     // The invite is spent; the file the operator left is not kept.
     let _ = std::fs::remove_file(invite_path(&config.store_root, &config.session_id));

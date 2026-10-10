@@ -548,7 +548,7 @@ async fn an_agent_client_enrolls_once_and_then_logs_in_by_signature_only() {
 
     let (ids2, url2, inv) = (ids.clone(), url.clone(), invite.clone());
     let (first, again, relog, key_id, pubkey) = off(move || {
-        let mut b = ServerBackend::new(&url2).unwrap();
+        let b = ServerBackend::new(&url2).unwrap();
         let mut id = ids2.resolve("agent-1", BackendKind::Server, b.server_ref()).unwrap();
         // Not enrolled and no invite: the client says so, it does not invent anything.
         assert!(matches!(b.ensure_session(&ids2, &mut id, None), Err(AgentError::NeedsInvite)));
@@ -616,7 +616,7 @@ async fn an_agent_client_logs_in_over_the_matrix_api_with_the_custom_login_type(
     let url = s.product.clone();
     let (ids2, inv) = (ids.clone(), invite.clone());
     let (sess, again) = off(move || {
-        let mut b = MatrixBackend::new(&url).unwrap();
+        let b = MatrixBackend::new(&url).unwrap();
         let mut id = ids2.resolve("agent-m", BackendKind::Matrix, b.server_ref()).unwrap();
         let sess = b.ensure_session(&ids2, &mut id, Some(&inv)).unwrap();
         let again = b.ensure_session(&ids2, &mut id, None).unwrap();
@@ -640,4 +640,91 @@ async fn an_agent_client_logs_in_over_the_matrix_api_with_the_custom_login_type(
     // Password users are unaffected and cannot be reached by a key.
     let (st, _) = s.post("/_matrix/client/v3/login", None, json!({ "type": "m.login.password", "user": nick, "password": "whatever-long" })).await;
     assert_eq!(st, 403, "an invited identity has no password");
+}
+
+// ---- The client asks for the nick of its session name; the invite (operator) still decides.
+
+async fn enroll_as(s: &Stack, ids: &Arc<IdentityStore>, session: &str, invite: &str, ask: Option<&str>) -> Result<m4a_agent::Session, AgentError> {
+    let (ids, url, session, invite, ask) = (ids.clone(), s.product.clone(), session.to_string(), invite.to_string(), ask.map(str::to_string));
+    off(move || {
+        let b = ServerBackend::new(&url).unwrap();
+        let mut id = ids.resolve(&session, BackendKind::Server, b.server_ref()).unwrap();
+        id.requested_nick = ask;
+        b.ensure_session(&ids, &mut id, Some(&invite))
+    })
+    .await
+}
+
+#[tokio::test]
+async fn a_requested_nick_replaces_a_placeholder_but_never_a_reserved_nick_and_never_burns_the_invite() {
+    let s = stack().await;
+    let ids = Arc::new(IdentityStore::new(Arc::new(MemoryVault::new())));
+
+    // Placeholder invite: the nick asked for is taken, the operator's approval is the invite itself.
+    let (inv, placeholder) = s.invite(None).await;
+    let got = enroll_as(&s, &ids, "scribe-1", &inv, Some("scribe")).await.unwrap();
+    assert_eq!(got.nick, "scribe");
+    assert_ne!(got.nick, placeholder);
+    assert_eq!(s.send("GET", "/product/v1/me", Some(&got.token), None).await.1["nick"], json!("scribe"));
+
+    // Taken, and against the grammar: refused with the invite left usable; without the request it works.
+    let (inv, placeholder) = s.invite(None).await;
+    let r = enroll_as(&s, &ids, "scribe-2", &inv, Some("Scribe")).await;
+    assert!(matches!(r, Err(AgentError::Refused(ref m)) if m.contains("requested nick")), "taken: {r:?}");
+    let r = enroll_as(&s, &ids, "scribe-2", &inv, Some("not a nick!")).await;
+    assert!(matches!(r, Err(AgentError::Refused(_))), "grammar: {r:?}");
+    assert_eq!(enroll_as(&s, &ids, "scribe-2", &inv, None).await.unwrap().nick, placeholder);
+
+    // Reserved by the operator: a different request is refused and the invite stays good; the same
+    // nick (any case) or no request is accepted.
+    let (inv, reserved) = s.invite(Some("keeper")).await;
+    assert_eq!(reserved, "keeper");
+    let r = enroll_as(&s, &ids, "keeper-1", &inv, Some("other")).await;
+    assert!(matches!(r, Err(AgentError::Refused(_))), "reserved: {r:?}");
+    assert_eq!(enroll_as(&s, &ids, "keeper-1", &inv, Some("KEEPER")).await.unwrap().nick, "keeper");
+
+    // No invite, no nick: the request alone enrolls nobody.
+    let (_, b) = s.post("/product/v1/enroll", None, json!({ "invite": "forged", "public_key": "AAAA", "signature": "AAAA", "nick": "intruder" })).await;
+    assert!(b.get("token").is_none(), "{b}");
+}
+
+async fn fresh_challenge(s: &Stack, kid: &str) -> keyproof::Challenge {
+    let (_, c) = s.post("/product/v1/login/key/challenge", None, json!({ "key_id": kid })).await;
+    keyproof::Challenge { challenge_id: c["challenge_id"].as_str().unwrap().into(), nonce: c["nonce"].as_str().unwrap().into(), expires_ms: c["expires_ms"].as_i64().unwrap(), audience: c["audience"].as_str().unwrap().into() }
+}
+
+// ---- A Matrix login token from a key signature (Element Web: #/login?loginToken=).
+
+#[tokio::test]
+async fn a_key_signature_gives_a_one_time_matrix_login_token_without_touching_the_keys_session() {
+    let s = stack().await;
+    let (inv, _) = s.invite(Some("opener")).await;
+    let ids = Arc::new(IdentityStore::new(Arc::new(MemoryVault::new())));
+    let sess = enroll_as(&s, &ids, "opener-1", &inv, None).await.unwrap();
+    let id = ids.resolve("opener-1", BackendKind::Server, &s.product).unwrap();
+
+    let ch = fresh_challenge(&s, &id.key_id).await;
+    let sig = id.sign_login(ids.vault(), &ch).unwrap();
+    let body = json!({ "key_id": id.key_id, "challenge_id": ch.challenge_id, "signature": sig });
+    let (st, t) = s.post("/product/v1/login/key/token", None, body.clone()).await;
+    assert_eq!(st, 200, "{t}");
+    let token = t["login_token"].as_str().unwrap().to_string();
+    assert!(t["expires_in_ms"].as_i64().unwrap() <= 300_000, "short lived: {t}");
+    // The key's own session is untouched: the proof alone issued the token.
+    assert_eq!(s.send("GET", "/product/v1/me", Some(&sess.token), None).await.0, 200);
+    // The challenge is spent.
+    assert_eq!(s.post("/product/v1/login/key/token", None, body).await.0, 401);
+
+    // The token logs a Matrix client in, once, as the same user.
+    let (st, l) = s.post("/_matrix/client/v3/login", None, json!({ "type": "m.login.token", "token": token })).await;
+    assert_eq!(st, 200, "{l}");
+    assert!(l["user_id"].as_str().unwrap().starts_with("@opener:"), "{l}");
+    let access = l["access_token"].as_str().unwrap().to_string();
+    assert_eq!(s.send("GET", "/_matrix/client/v3/account/whoami", Some(&access), None).await.0, 200);
+    assert_eq!(s.post("/_matrix/client/v3/login", None, json!({ "type": "m.login.token", "token": token })).await.0, 403, "single use");
+
+    // A wrong signature and an unknown key get no token.
+    let ch = fresh_challenge(&s, &id.key_id).await;
+    assert_eq!(s.post("/product/v1/login/key/token", None, json!({ "key_id": id.key_id, "challenge_id": ch.challenge_id, "signature": "AAAA" })).await.0, 401);
+    assert_eq!(s.post("/product/v1/login/key/token", None, json!({ "key_id": "kunknown", "challenge_id": "x", "signature": "y" })).await.0, 401);
 }

@@ -41,7 +41,16 @@ pub fn enroll(wire: &dyn Wire, ids: &IdentityStore, id: &mut SessionIdentity, in
     let aud = fetch_challenge(wire, id)?.audience;
     let signature = id.sign_enroll(ids.vault(), &aud, invite)?;
     let label = format!("m4a-agent:{}", id.session_id);
-    let (st, v) = wire.post(ENROLL_PATH, &json!({ "invite": invite, "public_key": id.public_key, "signature": signature, "label": label }), None)?;
+    let mut body = json!({ "invite": invite, "public_key": id.public_key, "signature": signature, "label": label });
+    if let Some(nick) = id.requested_nick.as_deref().filter(|n| !n.is_empty()) {
+        body["nick"] = json!(nick);
+    }
+    let (st, v) = wire.post(ENROLL_PATH, &body, None)?;
+    if st == 400 || st == 409 || st == 429 {
+        // The nick request was refused (rules, taken, cooldown, or the invite reserves another): say so.
+        let code = v.get("errcode").and_then(|c| c.as_str()).unwrap_or("");
+        return Err(AgentError::Refused(format!("enroll: the server refused the requested nick ({st} {code}); the invite is still good")));
+    }
     if st != 200 {
         return Err(refused_or(st, "enroll"));
     }

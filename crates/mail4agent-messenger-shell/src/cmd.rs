@@ -139,6 +139,12 @@ impl OpenedStore {
             },
             None => None,
         };
+        // Refuse here, not at the server: a send into a room this session is not in only earns a refusal
+        // that would be stored as a failed row.
+        let me = self.driver.core.user_id().as_str().to_string();
+        if !self.member_joined(room.as_str(), &me) {
+            return CmdReply::failed("this session has not joined that room (join it first)");
+        }
         let before = self.texts().len();
         if let Err(e) = self.dispatch(
             MessengerCommand::SendMessage {

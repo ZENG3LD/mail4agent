@@ -1,7 +1,7 @@
 //! `m4a-agent enroll`: enroll one identity from the process environment, then exit.
 //!
 //! Required: `M4A_PRODUCT_URL` (or `M4A_HOMESERVER_URL`), `M4A_SESSION_ID`,
-//! `M4A_STORE_ROOT`. The one-time invite is `M4A_PRODUCT_INVITE`, and only
+//! `M4A_STORE_ROOT`. Optional `M4A_BOT_NAME` (the name the nick is asked from). The one-time invite is `M4A_PRODUCT_INVITE`, and only
 //! until this identity is enrolled. `M4A_TIER` is `server` (the default) or
 //! `matrix`. This command does not read an agents directory, a gateway file,
 //! or an env file. It prints the nick.

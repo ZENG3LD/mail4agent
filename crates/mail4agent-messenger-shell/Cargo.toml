@@ -11,7 +11,7 @@ description = "Client shell that opens the sealed messenger store for one sessio
 
 [features]
 default = ["full"]
-full = ["tier-server", "tier-matrix", "local-bus", "wake-grok", "wake-claude", "wake-codex", "wake-kimi", "wake-cursor", "wake-routine", "wake-spawn"]
+full = ["tier-server", "tier-matrix", "vault-keychain", "local-bus", "wake-grok", "wake-claude", "wake-codex", "wake-kimi", "wake-cursor", "wake-routine", "wake-spawn"]
 # Wake providers. A provider whose feature is off is not compiled (codex, kimi, claude channel,
 # spawn) or refuses to wake with a named reason (grok, cursor, routine); see provider.rs.
 wake-grok = ["dep:mail4agent-grok"]
@@ -21,6 +21,8 @@ wake-kimi = []
 wake-cursor = []
 wake-routine = []
 wake-spawn = []
+# The OS keychain for the vault master key (a headless machine falls back to an owner-only key file).
+vault-keychain = ["m4a-agent/vault-keychain"]
 tier-server = ["m4a-agent/tier-server"]
 tier-matrix = ["m4a-agent/tier-matrix"]
 # The in-process homeserver that lets bots on one machine reach each other without a network.
@@ -29,7 +31,7 @@ local-bus = ["dep:mail4agent-server"]
 
 [dependencies]
 m4a-seam = { workspace = true }
-m4a-agent = { workspace = true, default-features = false, features = ["engine"] }
+m4a-agent = { workspace = true, features = ["engine"] }
 mail4agent-messenger = { workspace = true  }
 mail4agent-server = { workspace = true, optional = true }
 mail4agent-grok = { workspace = true, optional = true }

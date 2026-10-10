@@ -118,6 +118,7 @@ pub fn router(app: App) -> Router {
         .route("/product/v1/enroll", post(key_enroll))
         .route("/product/v1/login/key/challenge", post(key_challenge))
         .route("/product/v1/login/key", post(key_login))
+        .route("/product/v1/login/key/token", post(key_login_token))
         .route("/product/v1/admin/invite", post(admin_invite))
         .route("/client/v3/login", get(matrix_login_flows).post(matrix_login))
         .route("/_matrix/client/v3/login", get(matrix_login_flows).post(matrix_login))
@@ -598,8 +599,10 @@ async fn admin_invite(State(app): State<App>, headers: HeaderMap, Json(b): Json<
 async fn key_enroll(State(app): State<App>, Json(b): Json<Value>) -> Result<Json<Value>, ApiError> {
     let s = |k: &str| b.get(k).and_then(Value::as_str).unwrap_or("").to_string();
     let (code, pk, sig, label) = (s("invite"), s("public_key"), s("signature"), s("label"));
+    // The nick the client asks for (its session name). Optional; the invite decides whether it is honoured.
+    let want = s("nick");
     let ttl = key_ttl(&app);
-    let (user, session, key_id) = blk(&app, move |a| a.users.enroll(a.challenges.audience(), &code, &pk, &sig, &label, now_ms(), ttl)).await?.map_err(|e| match e {
+    let (user, session, key_id) = blk(&app, move |a| a.users.enroll_with_nick(a.challenges.audience(), &code, &pk, &sig, &label, Some(&want), now_ms(), ttl)).await?.map_err(|e| match e {
         ServiceError::Unauthorized => unauthorized_key(),
         other => other.into(),
     })?;
@@ -625,6 +628,21 @@ async fn key_login(State(app): State<App>, Json(b): Json<Value>) -> Result<Json<
     let s = |k: &str| b.get(k).and_then(Value::as_str).unwrap_or("").to_string();
     let (user, session) = key_session_for(&app, s("key_id"), s("challenge_id"), s("signature")).await?;
     Ok(session_json(&user.nick, &session.token))
+}
+
+/// `POST /product/v1/login/key/token {key_id, challenge_id, signature}`: the same proof as the key
+/// login, answered with a one-time Matrix login token (`m.login.token`, short lifetime) instead of a
+/// session, so a Matrix client such as Element Web can open with `#/login?loginToken=`. The proof
+/// replaces the password that `login/get_token` asks for; no session of the key is touched.
+async fn key_login_token(State(app): State<App>, Json(b): Json<Value>) -> Result<Json<Value>, ApiError> {
+    let s = |k: &str| b.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let (kid, cid, sig) = (s("key_id"), s("challenge_id"), s("signature"));
+    let user = blk(&app, move |a| a.users.key_proof(&a.challenges, &kid, &cid, &sig, now_ms())).await?.map_err(|e| match e {
+        ServiceError::Unauthorized => unauthorized_key(),
+        other => other.into(),
+    })?;
+    let t = app.tokens.issue(&user.nick, now_ms(), LOGIN_TOKEN_TTL_MS);
+    Ok(Json(json!({ "login_token": t, "expires_in_ms": LOGIN_TOKEN_TTL_MS })))
 }
 
 /// The Matrix carriage of the same login: type `org.m4a.login.signature`. With only `key_id` the

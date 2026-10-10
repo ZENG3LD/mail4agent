@@ -41,6 +41,6 @@ m4a-edge = { workspace = true  }
 tokio-tungstenite = "0.29"
 futures-util = "0.3"
 mail4agent-messenger-shell = { workspace = true  }
-m4a-agent = { workspace = true }
+m4a-agent = { workspace = true, features = ["full"] }
 mail4agent-messenger = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }

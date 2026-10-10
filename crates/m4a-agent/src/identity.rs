@@ -33,6 +33,10 @@ pub struct SessionIdentity {
     /// here and only here; it is one-to-one (see [`IdentityStore::bind_local`]).
     #[serde(default)]
     pub local_session: Option<String>,
+    /// The nick this client asks the server for when it enrolls (its session name, as a nick). The
+    /// operator's invite still decides: a reserved nick that differs refuses the enrollment.
+    #[serde(default)]
+    pub requested_nick: Option<String>,
 }
 
 fn seed_label(sid: &str) -> String {
@@ -107,7 +111,7 @@ impl IdentityStore {
         let seed = random_bytes(32);
         let sk = SigningKey::from_bytes(<&[u8; 32]>::try_from(&seed[..]).map_err(|_| AgentError::Identity("seed".into()))?);
         let pk = sk.verifying_key();
-        let id = SessionIdentity { session_id: session_id.to_string(), tier, server_ref, key_id: keyproof::key_id_of(pk.as_bytes()), public_key: keyproof::encode(pk.as_bytes()), nick: None, enrolled: false, local_session: None };
+        let id = SessionIdentity { session_id: session_id.to_string(), tier, server_ref, key_id: keyproof::key_id_of(pk.as_bytes()), public_key: keyproof::encode(pk.as_bytes()), nick: None, enrolled: false, local_session: None, requested_nick: None };
         // The seed goes first: a record without its key would be a dead identity.
         self.vault.put(&seed_label(session_id), &seed)?;
         self.save(&id)?;
