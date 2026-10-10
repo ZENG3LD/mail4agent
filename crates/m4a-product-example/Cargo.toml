@@ -36,4 +36,5 @@ tracing = "0.1"
 mail4agent-server = { path = "../mail4agent-server", version = "0.1.0", default-features = false }
 m4a-edge = { path = "../m4a-edge" }
 rusqlite = "0.32"
+mail4agent-messenger-shell = { path = "../mail4agent-messenger-shell" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }

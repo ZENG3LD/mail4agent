@@ -158,6 +158,29 @@ pub const SESSION_ID_ENV: &str = "M4A_SESSION_ID";
 /// it, once, into process memory. Never a file.
 pub const DEVICE_TOKEN_ENV: &str = "M4A_DEVICE_TOKEN";
 
+/// Product-session mode: base URL of the product server. Every Client-Server
+/// call goes through its proxy with the product session token as bearer.
+pub const PRODUCT_URL_ENV: &str = "M4A_PRODUCT_URL";
+/// Product-session mode: the product nick to log in as.
+pub const PRODUCT_NICK_ENV: &str = "M4A_PRODUCT_NICK";
+/// Product-session mode: password for `POST /product/v1/login` (not logged).
+pub const PRODUCT_PASSWORD_ENV: &str = "M4A_PRODUCT_PASSWORD";
+/// Product-session mode: an existing product session token instead of a password.
+pub const PRODUCT_TOKEN_ENV: &str = "M4A_PRODUCT_TOKEN";
+
+/// How a session proves itself to the product server.
+#[derive(Clone)]
+pub enum ProductSecret {
+    Password(Zeroizing<String>),
+    Token(Zeroizing<String>),
+}
+
+#[derive(Clone)]
+struct ProductAuth {
+    nick: String,
+    secret: ProductSecret,
+}
+
 /// Directory for `session_id` under `root`.
 ///
 /// The final component is the lowercase hex of [`store_seal_key`]. Different
@@ -326,6 +349,7 @@ pub struct SessionConfig {
     session_id: String,
     store_root: PathBuf,
     device_token: Option<Zeroizing<String>>,
+    product: Option<ProductAuth>,
 }
 
 impl SessionConfig {
@@ -353,6 +377,35 @@ impl SessionConfig {
             session_id,
             store_root: store_root.into(),
             device_token: device_token.map(Zeroizing::new),
+            product: None,
+        })
+    }
+
+    /// Product-session mode: log in at the product server `product_url` as
+    /// `nick` and talk to the messenger only through its proxy. The nick is
+    /// the product nick; the session id still names the local store.
+    pub fn new_product(
+        product_url: impl Into<String>,
+        nick: &str,
+        secret: ProductSecret,
+        session_id: impl Into<String>,
+        store_root: impl Into<PathBuf>,
+    ) -> Result<Self, ShellError> {
+        let homeserver_url = product_url.into();
+        parse_base_url(&homeserver_url)?;
+        let session_id = session_id.into();
+        validate_session_id(&session_id)?;
+        if nick.is_empty() || nick.len() > 64 {
+            return Err(ShellError::Register("product nick is empty or too long".into()));
+        }
+        Ok(Self {
+            homeserver_url,
+            public_id: nick.to_string(),
+            nick: nick.to_string(),
+            session_id,
+            store_root: store_root.into(),
+            device_token: None,
+            product: Some(ProductAuth { nick: nick.to_string(), secret }),
         })
     }
 
@@ -374,6 +427,17 @@ impl SessionConfig {
         mut get: impl FnMut(&str) -> Option<String>,
         toml_text: Option<&str>,
     ) -> Result<Self, ShellError> {
+        if let Some(product_url) = get(PRODUCT_URL_ENV) {
+            let nick = get(PRODUCT_NICK_ENV).ok_or_else(|| ShellError::Register(format!("{PRODUCT_NICK_ENV} is required with {PRODUCT_URL_ENV}")))?;
+            let secret = match (get(PRODUCT_TOKEN_ENV), get(PRODUCT_PASSWORD_ENV)) {
+                (Some(t), _) => ProductSecret::Token(Zeroizing::new(t)),
+                (None, Some(p)) => ProductSecret::Password(Zeroizing::new(p)),
+                _ => return Err(ShellError::Register(format!("{PRODUCT_TOKEN_ENV} or {PRODUCT_PASSWORD_ENV} is required"))),
+            };
+            let session_id = get(SESSION_ID_ENV).ok_or(ShellError::EmptySession)?;
+            let store_root = get(STORE_ROOT_ENV).ok_or(ShellError::StoreRoot)?;
+            return Self::new_product(product_url, &nick, secret, session_id, store_root);
+        }
         let from_toml = match toml_text {
             Some(text) => homeserver_url_from_toml(text)?,
             None => None,
@@ -428,6 +492,7 @@ impl std::fmt::Debug for SessionConfig {
                 "device_token",
                 &self.device_token.as_ref().map(|_| "[redacted]"),
             )
+            .field("product_nick", &self.product.as_ref().map(|p| p.nick.as_str()))
             .finish()
     }
 }
@@ -2194,7 +2259,56 @@ struct RegisteredSession {
     bearer: Zeroizing<String>,
 }
 
+/// Product session: login (or reuse the token), then `whoami` through the
+/// product proxy gives the mxid and the device the messenger assigned.
+fn product_session(config: &SessionConfig, auth: &ProductAuth) -> Result<RegisteredSession, ShellError> {
+    let http = |e: reqwest::Error| ShellError::Http(clip_public(e.to_string()));
+    let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(10)).http1_only().build().map_err(http)?;
+    let base = parse_base_url(&config.homeserver_url)?;
+    let token: Zeroizing<String> = match &auth.secret {
+        ProductSecret::Token(t) => t.clone(),
+        ProductSecret::Password(pw) => {
+            let mut url = base.clone();
+            url.set_path("/product/v1/login");
+            let resp = client
+                .post(url)
+                .json(&serde_json::json!({ "nick": auth.nick, "password": pw.as_str() }))
+                .send()
+                .map_err(http)?;
+            let status = resp.status().as_u16();
+            let bytes = resp.bytes().map_err(http)?;
+            if !(200..300).contains(&status) {
+                return Err(ShellError::Register(register_failure(status, &bytes)));
+            }
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+            let t = v.get("token").and_then(|t| t.as_str()).unwrap_or("");
+            if t.is_empty() {
+                return Err(ShellError::Register("product login returned no token".into()));
+            }
+            Zeroizing::new(t.to_string())
+        }
+    };
+    let mut url = base;
+    url.set_path("/client/v3/account/whoami");
+    let resp = client.get(url).header(reqwest::header::AUTHORIZATION, format!("Bearer {}", token.as_str())).send().map_err(http)?;
+    let status = resp.status().as_u16();
+    let bytes = resp.bytes().map_err(http)?;
+    if !(200..300).contains(&status) {
+        return Err(ShellError::Register(register_failure(status, &bytes)));
+    }
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+    let user_id = v.get("user_id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let device_raw = v.get("device_id").and_then(|x| x.as_str()).unwrap_or("");
+    if user_id.is_empty() || device_raw.is_empty() {
+        return Err(ShellError::Register("whoami missed an id".into()));
+    }
+    Ok(RegisteredSession { user_id, device_id: DeviceId::parse(device_raw)?, bearer: token })
+}
+
 fn register_session(config: &SessionConfig) -> Result<RegisteredSession, ShellError> {
+    if let Some(auth) = &config.product {
+        return product_session(config, auth);
+    }
     let base = parse_base_url(&config.homeserver_url)?;
     let mut url = base;
     url.set_path("/client/v3/register");

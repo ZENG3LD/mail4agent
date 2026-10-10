@@ -50,7 +50,9 @@ impl EdgeLink {
     pub async fn forward(&self, who: Option<&AuthUser>, req: Request) -> Response {
         let (parts, body) = req.into_parts();
         let Ok(bytes) = to_bytes(body, MAX_BODY).await else { return plain(StatusCode::PAYLOAD_TOO_LARGE, "body too large") };
-        let pq = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/").to_string();
+        let raw = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/").to_string();
+        // Clients may speak bare `/client/..` or `/media/..` to the product; the edge wants `/_matrix`.
+        let pq = if raw.starts_with(MATRIX_PREFIX) { raw.clone() } else { format!("{MATRIX_PREFIX}{raw}") };
         let core_path = pq.strip_prefix(MATRIX_PREFIX).unwrap_or(&pq).to_string();
         let mut rb = self.client.request(parts.method.clone(), format!("{}{}", self.base, pq));
         for (k, v) in forwardable(&parts.headers, &self.assertion_header) {
