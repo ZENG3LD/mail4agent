@@ -429,6 +429,7 @@ fn hook(kind: SessionKind, flavor: HookFlavor, inbox: &Option<PathBuf>) -> Box<d
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "wake-claude")]
     use crate::provider::inbox;
     use crate::provider::tests::{letter, session};
 
@@ -516,6 +517,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "wake-claude")]
     #[test]
     fn chain_falls_through_to_durable_queue_without_spawning() {
         let dir = std::env::temp_dir().join(format!("m4a-chain-{}", std::process::id()));
