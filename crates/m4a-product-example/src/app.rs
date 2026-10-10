@@ -585,12 +585,19 @@ fn unauthorized_key() -> ApiError {
     err(StatusCode::UNAUTHORIZED, "M_FORBIDDEN", "key proof refused")
 }
 
-/// `POST /product/v1/admin/invite {nick?, tier?}`: the operator approves one identity. The nick is
+/// `POST /product/v1/admin/invite {nick?, tier?, existing?}`: the operator approves one identity. With
+/// `existing: true` and the nick of an account that exists, the invite adds a key to that account. The nick is
 /// assigned now. The invite code is returned once and is given to the client, never to the agent.
 async fn admin_invite(State(app): State<App>, headers: HeaderMap, Json(b): Json<Value>) -> Result<Json<Value>, ApiError> {
     admin(&app, &headers)?;
     let nick = b.get("nick").and_then(Value::as_str).map(str::to_string);
     let tier = b.get("tier").and_then(Value::as_str).map(str::to_string);
+    if b.get("existing").and_then(Value::as_bool) == Some(true) {
+        // A new key for an account that exists (lost key, second device); the nick is required and must exist.
+        let Some(n) = nick else { return Err(err(StatusCode::BAD_REQUEST, "M_BAD_JSON", "existing needs the nick of the account")) };
+        let (code, user) = blk(&app, move |a| a.users.invite_existing(&n, now_ms())).await??;
+        return Ok(Json(json!({ "invite": code, "nick": user.nick, "existing": true, "audience": app.challenges.audience() })));
+    }
     let (code, user) = blk(&app, move |a| a.users.invite(nick.as_deref(), tier.as_deref(), now_ms())).await??;
     Ok(Json(json!({ "invite": code, "nick": user.nick, "audience": app.challenges.audience() })))
 }
