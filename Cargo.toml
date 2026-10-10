@@ -71,6 +71,7 @@ tower = { version = "0.5", features = ["util"] }
 [workspace]
 members = [
     "crates/mail4agent-api",
+    "crates/m4a-agent",
     "crates/mail4agent-attest",
     "crates/mail4agent-core",
     "crates/mail4agent-store-sqlite",
