@@ -1648,6 +1648,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hmac",
+ "m4a-matrix-core",
  "m4a-seam",
  "rand 0.8.8",
  "reqwest",

@@ -760,6 +760,13 @@ pub fn apply_create_room(
         dm_pair_key: dm_pair.as_deref(),
         legacy_dm_id: None,
     };
+    // F3 spike: a NEW room gets signed v11 events with computed ids. Any failure keeps the legacy
+    // events, so the flag can never make room creation fail.
+    #[cfg(feature = "f3-hash-ids")]
+    let state_events = match crate::f3::hash_bootstrap(conn, &room_id, req.creator_mxid, &state_events, origin_ts) {
+        Ok(events) => events,
+        Err(_) => state_events,
+    };
     crate::store::create_room_with_state(conn, bootstrap, &state_events, origin_ts)?;
     let mut notify_user_ids: HashSet<i64> = req.invitees.iter().map(|invitee| invitee.user_id).collect();
     notify_user_ids.insert(req.creator_user_id);

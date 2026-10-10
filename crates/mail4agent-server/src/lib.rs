@@ -14,6 +14,8 @@ pub mod policy;
 pub mod ephemeral;
 pub mod error;
 pub mod events;
+#[cfg(feature = "f3-hash-ids")]
+pub mod f3;
 pub mod fed_rooms;
 pub mod federation;
 pub mod http;

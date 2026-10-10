@@ -18,8 +18,12 @@ default = []
 # Device-bearer credentials resolve to a caller. Only the client shell's in-process local
 # bus enables it (its own private bus, no network); the server binary never does.
 local-bearer = []
+# F3 spike: NEW rooms get signed room-version-11 events with reference-hash ids (see f3.rs).
+# Off by default; legacy rooms are untouched.
+f3-hash-ids = ["dep:m4a-matrix-core"]
 
 [dependencies]
+m4a-matrix-core = { path = "../m4a-matrix-core", version = "0.0.1", optional = true }
 # Storage engine: one writer, bounded parallel readers, SQLCipher (the published crate; its
 # `cipher-native` feature selects the SQLCipher build of rusqlite, there is no plaintext build here).
 tesserax-store = { version = "0.1.1", features = ["cipher-native"] }

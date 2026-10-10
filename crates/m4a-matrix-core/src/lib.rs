@@ -20,6 +20,7 @@ pub use pdu::Pdu;
 pub use resolve::{auth_chain, resolve_state, ResolveError};
 pub use signer::Signer;
 
+pub use ruma_common::IdParseError as IdError;
 pub use ruma_common::{OwnedEventId, OwnedRoomId, OwnedUserId, RoomVersionId};
 pub use ruma_state_res::StateMap;
 
