@@ -10,9 +10,11 @@ pub mod backend;
 pub mod error;
 pub mod identity;
 pub mod keyauth;
+pub mod resolver;
 pub mod vault;
 
 pub use backend::{Backend, BackendKind, Capabilities, Session};
 pub use error::{AgentError, Result};
 pub use identity::{IdentityStore, SessionIdentity};
+pub use resolver::{ResolvedSession, ResolverChain, SessionResolver};
 pub use vault::{FileVault, KeyVault, MemoryVault};

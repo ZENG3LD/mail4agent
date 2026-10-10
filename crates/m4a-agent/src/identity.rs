@@ -29,6 +29,10 @@ pub struct SessionIdentity {
     /// Learned when the operator's invite is redeemed; the nick is the operator's choice.
     pub nick: Option<String>,
     pub enrolled: bool,
+    /// The tier-1 (local mail node) session id of the same session, when known. The link is kept
+    /// here and only here; it is one-to-one (see [`IdentityStore::bind_local`]).
+    #[serde(default)]
+    pub local_session: Option<String>,
 }
 
 fn seed_label(sid: &str) -> String {
@@ -102,7 +106,7 @@ impl IdentityStore {
         let seed = random_bytes(32);
         let sk = SigningKey::from_bytes(<&[u8; 32]>::try_from(&seed[..]).map_err(|_| AgentError::Identity("seed".into()))?);
         let pk = sk.verifying_key();
-        let id = SessionIdentity { session_id: session_id.to_string(), tier, server_ref, key_id: keyproof::key_id_of(pk.as_bytes()), public_key: keyproof::encode(pk.as_bytes()), nick: None, enrolled: false };
+        let id = SessionIdentity { session_id: session_id.to_string(), tier, server_ref, key_id: keyproof::key_id_of(pk.as_bytes()), public_key: keyproof::encode(pk.as_bytes()), nick: None, enrolled: false, local_session: None };
         // The seed goes first: a record without its key would be a dead identity.
         self.vault.put(&seed_label(session_id), &seed)?;
         self.save(&id)?;
@@ -111,6 +115,39 @@ impl IdentityStore {
 
     pub fn save(&self, id: &SessionIdentity) -> Result<()> {
         self.vault.put(&record_label(&id.session_id), &serde_json::to_vec(id).map_err(|e| AgentError::Identity(e.to_string()))?)
+    }
+
+    /// Links the session to its tier-1 session id. One session has one local id and one local id
+    /// belongs to one session; a second, different link is an error (never a quiet overwrite).
+    pub fn bind_local(&self, id: &mut SessionIdentity, local_id: &str) -> Result<()> {
+        if !valid_session_id(local_id) {
+            return Err(AgentError::Identity("local session id is not a valid id".into()));
+        }
+        if let Some(have) = &id.local_session {
+            return if have == local_id { Ok(()) } else { Err(AgentError::Identity("this session is already linked to another local session".into())) };
+        }
+        let label = format!("local-link/{local_id}");
+        if let Some(owner) = self.vault.get(&label)? {
+            if owner[..] != *id.session_id.as_bytes() {
+                return Err(AgentError::Identity("that local session belongs to another identity".into()));
+            }
+        }
+        self.vault.put(&label, id.session_id.as_bytes())?;
+        id.local_session = Some(local_id.to_string());
+        self.save(id)
+    }
+
+    /// Records the nick the operator assigned. It is frozen after the first call: a different nick
+    /// for the same identity is an error, the only way to another nick is a new identity.
+    pub fn adopt_nick(&self, id: &mut SessionIdentity, nick: &str) -> Result<()> {
+        match &id.nick {
+            Some(n) if n == nick => Ok(()),
+            Some(_) => Err(AgentError::Identity("this identity already has a different nick".into())),
+            None => {
+                id.nick = Some(nick.to_string());
+                self.save(id)
+            }
+        }
     }
 
     /// A random 32-byte key for the session's local store (created on first ask).
@@ -127,6 +164,13 @@ impl IdentityStore {
     /// Forgets the session entirely: key pair, record, token, store key. A later `resolve` makes a
     /// NEW identity (which the operator must approve again).
     pub fn forget(&self, session_id: &str) -> Result<()> {
+        if let Some(raw) = self.vault.get(&record_label(session_id))? {
+            if let Ok(id) = serde_json::from_slice::<SessionIdentity>(&raw) {
+                if let Some(l) = id.local_session {
+                    self.vault.delete(&format!("local-link/{l}"))?;
+                }
+            }
+        }
         for l in [seed_label(session_id), record_label(session_id), token_label(session_id), format!("store-key/{session_id}")] {
             self.vault.delete(&l)?;
         }
@@ -178,6 +222,24 @@ mod tests {
         assert!(id.sign(s.vault(), b"x").is_err(), "the key is gone");
         let again = s.resolve("s1", BackendKind::Matrix, "https://p.example").unwrap();
         assert_ne!(again.key_id, id.key_id);
+    }
+
+    #[test]
+    fn links_and_nicks_are_one_to_one_and_frozen() {
+        let s = store();
+        let mut a = s.resolve("s1", BackendKind::Server, "https://p.example").unwrap();
+        let mut b = s.resolve("s2", BackendKind::Server, "https://p.example").unwrap();
+        s.bind_local(&mut a, "local-1").unwrap();
+        s.bind_local(&mut a, "local-1").unwrap();
+        assert!(s.bind_local(&mut a, "local-2").is_err(), "one session, one local id");
+        assert!(s.bind_local(&mut b, "local-1").is_err(), "one local id, one session");
+        assert_eq!(s.resolve("s1", BackendKind::Server, "https://p.example").unwrap().local_session.as_deref(), Some("local-1"));
+        s.adopt_nick(&mut a, "kestrel").unwrap();
+        s.adopt_nick(&mut a, "kestrel").unwrap();
+        assert!(s.adopt_nick(&mut a, "other").is_err());
+        s.forget("s1").unwrap();
+        let mut c = s.resolve("s3", BackendKind::Server, "https://p.example").unwrap();
+        s.bind_local(&mut c, "local-1").unwrap(); // the link was released with the identity
     }
 
     #[test]
