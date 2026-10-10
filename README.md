@@ -335,3 +335,5 @@ published. Wire shapes may still move.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+See also `docs/wake-and-vault.md` (wake control, vault key from the environment, Element login).
