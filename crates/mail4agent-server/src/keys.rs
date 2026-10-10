@@ -775,6 +775,7 @@ fn log_device_list_change_tx(tx: &Transaction, user_id: i64, now: &str) -> rusql
         "INSERT INTO device_list_changes (stream_id, user_id, changed_at) VALUES (?1, ?2, ?3)",
         params![stream_id, user_id, now],
     )?;
+    crate::fed_edus::enqueue_device_list(tx, user_id, stream_id);
     Ok(stream_id)
 }
 

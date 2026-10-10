@@ -568,6 +568,60 @@ pub fn snapshot_json(conn: &Connection, room: &str, at: &str) -> Result<Value, M
     Ok(serde_json::json!({ "state": state, "extremities": extremities, "auth_chain": chain }))
 }
 
+/// Auth chain (events not in `seeds` themselves) of the given events, as stored wire JSON.
+pub fn auth_chain_of(conn: &Connection, seeds: &[String]) -> Vec<Value> {
+    let get = |id: &str| -> Option<Value> { conn.query_row("SELECT pdu FROM dag_events WHERE event_id = ?1", [id], |r| r.get::<_, String>(0)).ok().and_then(|s| serde_json::from_str(&s).ok()) };
+    let mut have: HashSet<String> = seeds.iter().cloned().collect();
+    let mut todo: Vec<String> = seeds.to_vec();
+    let mut chain = Vec::new();
+    while let Some(id) = todo.pop() {
+        let ids: Vec<String> = conn
+            .prepare("SELECT auth_event_id FROM dag_auth WHERE event_id = ?1")
+            .and_then(|mut st| st.query_map([&id], |r| r.get::<_, String>(0)).map(|r| r.flatten().collect()))
+            .unwrap_or_default();
+        for a in ids {
+            if have.insert(a.clone()) {
+                if let Some(p) = get(&a) {
+                    chain.push(p);
+                }
+                todo.push(a);
+            }
+        }
+    }
+    chain
+}
+
+/// `event_auth`: the auth chain of one event.
+pub fn event_auth_json(conn: &Connection, room: &str, event_id: &str) -> Result<Value, MatrixError> {
+    let known: Option<i64> = conn.query_row("SELECT 1 FROM dag_events WHERE event_id = ?1", [event_id], |r| r.get(0)).optional().ok().flatten();
+    if known.is_none() {
+        return Err(MatrixError::not_found("unknown event"));
+    }
+    let _ = room;
+    Ok(serde_json::json!({ "auth_chain": auth_chain_of(conn, &[event_id.to_string()]) }))
+}
+
+/// `state_ids` (ids only) or `state` (events): the room's state right after `at`, and the auth chain.
+pub fn state_at_json(conn: &Connection, room: &str, at: &str, ids_only: bool) -> Result<Value, MatrixError> {
+    let db = ConnDag { conn, room };
+    let id = OwnedEventId::try_from(at).map_err(|_| MatrixError::bad_json("event id"))?;
+    let after = dag::DagRead::state_after(&db, &id).ok_or_else(|| MatrixError::not_found("unknown event"))?;
+    let ids: Vec<String> = after.values().map(|i| i.to_string()).collect();
+    let chain = auth_chain_of(conn, &ids);
+    if ids_only {
+        let chain_ids: Vec<String> = chain.iter().filter_map(|p| pdu_event_id(p)).collect();
+        return Ok(serde_json::json!({ "pdu_ids": ids, "auth_chain_ids": chain_ids }));
+    }
+    let get = |id: &str| -> Option<Value> { conn.query_row("SELECT pdu FROM dag_events WHERE event_id = ?1", [id], |r| r.get::<_, String>(0)).ok().and_then(|s| serde_json::from_str(&s).ok()) };
+    let pdus: Vec<Value> = ids.iter().filter_map(|i| get(i)).collect();
+    Ok(serde_json::json!({ "pdus": pdus, "auth_chain": chain }))
+}
+
+fn pdu_event_id(p: &Value) -> Option<String> {
+    let obj = json_obj(p).ok()?;
+    dag::compute_event_id(&rules(), &obj).ok().map(|i| i.to_string())
+}
+
 /// Start (or complete) a replica of a DAG room from a peer's snapshot: every event is checked for
 /// its signature and content hash, stored as an outlier, the state events are projected, and the
 /// snapshot's extremities become this replica's forward extremities.

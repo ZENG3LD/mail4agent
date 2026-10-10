@@ -31,6 +31,12 @@ pub(super) fn routes() -> Router<Arc<Homeserver>> {
         .route("/federation/v1/backfill/{room_id}", get(backfill))
         .route("/federation/v1/get_missing_events/{room_id}", post(get_missing_events))
         .route("/federation/v1/query/directory", get(query_directory))
+        .route("/federation/v1/event_auth/{room_id}/{event_id}", get(event_auth))
+        .route("/federation/v1/state_ids/{room_id}", get(state_ids))
+        .route("/federation/v1/state/{room_id}", get(state_events))
+        .route("/federation/v1/publicRooms", get(fed_public_rooms).post(fed_public_rooms_post))
+        .route("/key/v2/query/{server_name}", get(notary_get))
+        .route("/key/v2/query", post(notary_post))
         .route("/federation/v1/openid/userinfo", get(openid_userinfo))
         .route("/federation/v1/user/keys/query", post(keys_query))
         .route("/federation/v1/user/keys/claim", post(keys_claim))
@@ -157,6 +163,13 @@ async fn send_txn(
         }
     }
     for edu in edus {
+        if matches!(edu.get("edu_type").and_then(Value::as_str), Some("m.typing" | "m.receipt" | "m.device_list_update" | "m.presence")) {
+            let (o, e, st) = (origin.clone(), edu.clone(), Arc::clone(&state));
+            if let Ok(ids) = with_conn_pub(&state, move |c| Ok(crate::fed_edus::apply_inbound(c, &st.typing, &o, &e))).await {
+                wake_all.extend(ids);
+            }
+            continue;
+        }
         if edu.get("edu_type").and_then(Value::as_str) == Some("m.direct_to_device") {
             let content = edu.get("content").cloned().unwrap_or(Value::Null);
             let origin2 = origin.clone();
@@ -493,6 +506,121 @@ async fn openid_userinfo(State(state): State<Arc<Homeserver>>, Query(q): Query<H
     .await
 }
 
+#[derive(serde::Deserialize)]
+#[cfg(feature = "f3-hash-ids")]
+struct AtQuery {
+    event_id: Option<String>,
+}
+
+/// A DAG room's history may be read by servers that have a member in it.
+#[cfg(feature = "f3-hash-ids")]
+async fn dag_room_access(state: &Arc<Homeserver>, origin: String, room_id: String) -> Result<(), MatrixError> {
+    with_conn_pub(state, move |c| {
+        if !crate::f3::is_f3_room(c, &room_id) {
+            return Err(MatrixError::new(404, "M_UNRECOGNIZED", "only hash-id rooms offer this"));
+        }
+        if !crate::f3::origin_in_room(c, &room_id, &origin) {
+            return Err(MatrixError::forbidden("server has no member in this room"));
+        }
+        Ok(())
+    })
+    .await
+}
+
+#[cfg(feature = "f3-hash-ids")]
+async fn event_auth(State(state): State<Arc<Homeserver>>, OriginalUri(uri): OriginalUri, headers: HeaderMap, Path((room_id, event_id)): Path<(String, String)>) -> Result<Json<Value>, MatrixError> {
+    require_enabled(&state)?;
+    let origin = authenticate(&state, "GET", &uri, &headers, &[]).await?;
+    dag_room_access(&state, origin, room_id.clone()).await?;
+    with_conn_pub(&state, move |c| crate::f3::event_auth_json(c, &room_id, &event_id).map(Json)).await
+}
+
+#[cfg(feature = "f3-hash-ids")]
+async fn state_at(state: Arc<Homeserver>, uri: Uri, headers: HeaderMap, room_id: String, q: AtQuery, ids_only: bool) -> Result<Json<Value>, MatrixError> {
+    require_enabled(&state)?;
+    let origin = authenticate(&state, "GET", &uri, &headers, &[]).await?;
+    dag_room_access(&state, origin, room_id.clone()).await?;
+    let at = q.event_id.ok_or_else(|| MatrixError::invalid_param("event_id required"))?;
+    with_conn_pub(&state, move |c| crate::f3::state_at_json(c, &room_id, &at, ids_only).map(Json)).await
+}
+
+#[cfg(feature = "f3-hash-ids")]
+async fn state_ids(State(state): State<Arc<Homeserver>>, OriginalUri(uri): OriginalUri, headers: HeaderMap, Path(room_id): Path<String>, Query(q): Query<AtQuery>) -> Result<Json<Value>, MatrixError> {
+    state_at(state, uri, headers, room_id, q, true).await
+}
+
+#[cfg(feature = "f3-hash-ids")]
+async fn state_events(State(state): State<Arc<Homeserver>>, OriginalUri(uri): OriginalUri, headers: HeaderMap, Path(room_id): Path<String>, Query(q): Query<AtQuery>) -> Result<Json<Value>, MatrixError> {
+    state_at(state, uri, headers, room_id, q, false).await
+}
+
+#[cfg(not(feature = "f3-hash-ids"))]
+async fn event_auth() -> Result<Json<Value>, MatrixError> {
+    Err(MatrixError::new(404, "M_UNRECOGNIZED", "hash-id rooms are not enabled"))
+}
+#[cfg(not(feature = "f3-hash-ids"))]
+async fn state_ids() -> Result<Json<Value>, MatrixError> {
+    Err(MatrixError::new(404, "M_UNRECOGNIZED", "hash-id rooms are not enabled"))
+}
+#[cfg(not(feature = "f3-hash-ids"))]
+async fn state_events() -> Result<Json<Value>, MatrixError> {
+    Err(MatrixError::new(404, "M_UNRECOGNIZED", "hash-id rooms are not enabled"))
+}
+
+/// `GET publicRooms`: the public channels of this server, for another server's room directory.
+async fn fed_public_rooms(State(state): State<Arc<Homeserver>>, OriginalUri(uri): OriginalUri, headers: HeaderMap, Query(q): Query<HashMap<String, String>>) -> Result<Json<Value>, MatrixError> {
+    require_enabled(&state)?;
+    authenticate(&state, "GET", &uri, &headers, &[]).await?;
+    let (limit, since) = (q.get("limit").and_then(|l| l.parse().ok()), q.get("since").cloned());
+    with_conn_pub(&state, move |c| crate::account::list_public_rooms(c, since.as_deref(), limit, None).map(Json)).await
+}
+
+async fn fed_public_rooms_post(State(state): State<Arc<Homeserver>>, OriginalUri(uri): OriginalUri, headers: HeaderMap, body: Bytes) -> Result<Json<Value>, MatrixError> {
+    require_enabled(&state)?;
+    authenticate(&state, "POST", &uri, &headers, &body).await?;
+    let v = parse_body(&body)?;
+    let limit = v.get("limit").and_then(Value::as_i64);
+    let since = v.get("since").and_then(Value::as_str).map(str::to_string);
+    let term = v.pointer("/filter/generic_search_term").and_then(Value::as_str).map(str::to_string);
+    with_conn_pub(&state, move |c| crate::account::list_public_rooms(c, since.as_deref(), limit, term.as_deref()).map(Json)).await
+}
+
+/// One server's key document, as a notary: our own, or a peer's fetched, checked, and counter-signed.
+async fn notary_doc(state: &Arc<Homeserver>, server: &str) -> Result<Value, MatrixError> {
+    let local = crate::store::matrix_server_name().to_string();
+    if server == local {
+        return with_conn_pub(state, move |c| fed::server_keys_response(c, &local, fed::now_ms()).map_err(|_| MatrixError::internal())).await;
+    }
+    let (status, doc) = super::fed_net::fed_request(state, server, "GET", "/key/v2/server", None).await?;
+    if status != 200 {
+        return Err(MatrixError::unknown("could not fetch that server's keys"));
+    }
+    fed::parse_server_keys(&doc, server, fed::now_ms()).map_err(|_| MatrixError::unknown("that server's keys do not check out"))?;
+    let mut obj = doc.as_object().cloned().ok_or_else(MatrixError::internal)?;
+    with_conn_pub(state, move |c| {
+        let (key_id, key) = fed::active_signing_key(c, fed::now_ms()).map_err(|_| MatrixError::internal())?;
+        fed::sign_json(&mut obj, &local, &key_id, &key);
+        Ok(Value::Object(obj))
+    })
+    .await
+}
+
+async fn notary_get(State(state): State<Arc<Homeserver>>, Path(server): Path<String>) -> Result<Json<Value>, MatrixError> {
+    require_enabled(&state)?;
+    Ok(Json(json!({ "server_keys": [notary_doc(&state, &server).await?] })))
+}
+
+async fn notary_post(State(state): State<Arc<Homeserver>>, Json(body): Json<Value>) -> Result<Json<Value>, MatrixError> {
+    require_enabled(&state)?;
+    let mut out = Vec::new();
+    for server in body.get("server_keys").and_then(Value::as_object).map(|m| m.keys().cloned().collect::<Vec<_>>()).unwrap_or_default().into_iter().take(20) {
+        if let Ok(d) = notary_doc(&state, &server).await {
+            out.push(d);
+        }
+    }
+    Ok(Json(json!({ "server_keys": out })))
+}
+
 async fn keys_query(State(state): State<Arc<Homeserver>>, OriginalUri(uri): OriginalUri, headers: HeaderMap, body: Bytes) -> Result<Json<Value>, MatrixError> {
     require_enabled(&state)?;
     let origin = authenticate(&state, "POST", &uri, &headers, &body).await?;
@@ -536,7 +664,7 @@ async fn user_devices(
         let q = crate::key_ops::build_keys_query_visible(c, &visible, None, &one)?;
         let devices: Vec<Value> = q["device_keys"][&user_id].as_object().map(|m| m.iter().map(|(id, keys)| json!({ "device_id": id, "keys": keys })).collect()).unwrap_or_default();
         Ok(Json(json!({
-            "user_id": user_id, "stream_id": 0, "devices": devices,
+            "user_id": user_id, "stream_id": crate::fed_edus::device_list_stream(c, uid), "devices": devices,
             "master_key": q["master_keys"].get(&user_id).cloned().unwrap_or(Value::Null),
             "self_signing_key": q["self_signing_keys"].get(&user_id).cloned().unwrap_or(Value::Null),
         })))

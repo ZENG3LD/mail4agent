@@ -53,6 +53,7 @@ pub fn apply_typing(
     if !changed {
         return Ok(None);
     }
+    crate::fed_edus::enqueue_typing(conn, room_id, caller_user_id, typing);
     Ok(Some(crate::rooms::member_and_invited_ids(conn, room_id)?))
 }
 
@@ -93,6 +94,9 @@ pub fn apply_receipt(
     let new_stream_id = crate::store::upsert_receipt(conn, &room.id, caller_user_id, receipt_type, event_id, now_ms)?;
     if before.as_ref().map(|r| r.stream_id) == Some(new_stream_id) {
         return Ok(None);
+    }
+    if receipt_type == ReceiptType::Read {
+        crate::fed_edus::enqueue_receipt(conn, &room.id, caller_user_id, event_id, now_ms);
     }
 
     let wake_ids = match receipt_type {
