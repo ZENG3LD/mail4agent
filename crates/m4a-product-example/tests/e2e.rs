@@ -234,7 +234,7 @@ async fn login_password_doors_and_tier_flag() {
 
 #[tokio::test]
 async fn push_socket_is_signed_by_the_product_relayed_through_the_edge_and_registered_by_identity() {
-    use futures_util::{SinkExt, StreamExt};
+    use futures_util::StreamExt;
     use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
     let s = stack().await;
     let (_, a_tok) = s.register().await;

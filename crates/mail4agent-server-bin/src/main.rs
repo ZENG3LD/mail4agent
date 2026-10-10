@@ -276,35 +276,6 @@ fn validate_key_hex(raw: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    use mail4agent_server::http::hash_token;
-    use mail4agent_server::keys::{self, CredentialKind};
-    use mail4agent_server::nick;
-
-    struct Bootstrap {
-        public_id: String,
-        nick: String,
-        token: String,
-    }
-
-    fn seed_user(conn: &Connection, boot: &Bootstrap) -> Result<(), String> {
-        let now = Utc::now().to_rfc3339();
-        const USER_ID: i64 = 1;
-        store::ensure_matrix_user(conn, USER_ID, &boot.public_id, &now)
-            .map_err(|err| format!("user: {err:?}"))?;
-        nick::set_nick(conn, USER_ID, &boot.nick).map_err(|err| format!("nick: {err:?}"))?;
-        let hash = hash_token(&boot.token);
-        match keys::device_for_credential(conn, CredentialKind::Bearer, &hash)
-            .map_err(|err| format!("device lookup: {err}"))?
-        {
-            Some(device) if device.user_id == USER_ID => Ok(()),
-            Some(_) => Err("bootstrap token already belongs to another user".into()),
-            None => {
-                keys::create_device(conn, USER_ID, CredentialKind::Bearer, &hash, &now)
-                    .map_err(|err| format!("device: {err}"))?;
-                Ok(())
-            }
-        }
-    }
 
     use std::io::Read;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -343,17 +314,10 @@ mod tests {
             std::process::id()
         )));
         let conn = open_messenger("localhost", &db.0, &random_key_hex()).expect("open");
-        let token = "fake-sync-token";
-        seed_user(
-            &conn,
-            &Bootstrap {
-                public_id: "syncuser".to_string(),
-                nick: "sync_user".to_string(),
-                token: token.to_string(),
-            },
-        )
-        .expect("seed");
-        let app = router(Arc::new(Homeserver::new(conn)));
+        let hs = Arc::new(Homeserver::new(conn));
+        let secret = b"0123456789abcdef0123".to_vec();
+        let _ = hs.seam.set(Arc::new(mail4agent_server::http::identity::Seam::new(vec![secret.clone()], 30, None, None)));
+        let app = router(hs);
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
         assert!(is_loopback(addr), "{addr}");
@@ -362,8 +326,11 @@ mod tests {
         });
 
         let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let now = chrono::Utc::now().timestamp();
+        let assertion = m4a_seam::sign_assertion(&secret, "GET", "/client/v3/sync?timeout=0", &m4a_seam::Assertion { nick: "sync_user".into(), cred_ref: "c1".into(), authenticated: 1, paid: 0, iat: now, exp: now + 60, nonce: "n1".into() });
         let request = format!(
-            "GET /client/v3/sync?timeout=0 HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+            "GET /client/v3/sync?timeout=0 HTTP/1.1\r\nHost: 127.0.0.1\r\n{}: {assertion}\r\nConnection: close\r\n\r\n",
+            m4a_seam::DEFAULT_ASSERTION_HEADER
         );
         stream.write_all(request.as_bytes()).await.expect("write");
         let mut buf = Vec::new();

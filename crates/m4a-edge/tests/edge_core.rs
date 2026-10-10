@@ -4,13 +4,12 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use futures_util::{SinkExt, StreamExt};
-use mail4agent_server::http::{edge_auth::require_edge_secret, hash_token, router, Homeserver};
+use futures_util::StreamExt;
+use mail4agent_server::http::{edge_auth::require_edge_secret, router, Homeserver};
 use rusqlite::Connection;
 use serde_json::{json, Value};
 
 const SECRET: &str = "0123456789abcdef0123456789abcdef-test-secret";
-const NOW: &str = "2026-10-09T00:00:00+00:00";
 
 async fn serve(app: axum::Router) -> SocketAddr {
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -19,16 +18,24 @@ async fn serve(app: axum::Router) -> SocketAddr {
     a
 }
 
+const SEAM: &[u8] = b"0123456789abcdef0123";
+
 fn core() -> axum::Router {
     let conn = Connection::open_in_memory().unwrap();
     mail4agent_server::store::create_matrix_schema(&conn).unwrap();
     mail4agent_server::keys::create_matrix_keys_schema(&conn).unwrap();
-    for (uid, pid, tok, nick) in [(1, "alice000000000000000000000000a1", "tok-alice", "alice"), (2, "bob0000000000000000000000000b2", "tok-bob", "bob")] {
-        mail4agent_server::store::ensure_matrix_user(&conn, uid, pid, NOW).unwrap();
-        mail4agent_server::keys::create_device(&conn, uid, mail4agent_server::keys::CredentialKind::Bearer, &hash_token(tok), NOW).unwrap();
-        mail4agent_server::nick::set_nick(&conn, uid, nick).unwrap();
-    }
-    require_edge_secret(router(Arc::new(Homeserver::new(conn))), SECRET.to_string())
+    let hs = Arc::new(Homeserver::new(conn));
+    let _ = hs.seam.set(Arc::new(mail4agent_server::http::identity::Seam::new(vec![SEAM.to_vec()], 30, None, None)));
+    require_edge_secret(router(hs), SECRET.to_string())
+}
+
+/// What a product server does: sign the request over the core-side path for `nick`.
+fn signed(rb: reqwest::RequestBuilder, nick: &str, method: &str, core_path: &str) -> reqwest::RequestBuilder {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let now = chrono_now();
+    let a = m4a_seam::Assertion { nick: nick.into(), cred_ref: format!("cred-{nick}"), authenticated: 1, paid: 0, iat: now, exp: now + 60, nonce: format!("n{}", N.fetch_add(1, Ordering::Relaxed)) };
+    rb.header(m4a_seam::DEFAULT_ASSERTION_HEADER, m4a_seam::sign_assertion(SEAM, method, core_path, &a))
 }
 
 #[tokio::test]
@@ -45,29 +52,30 @@ async fn edge_forwards_cs_api_push_and_media_and_core_refuses_direct_access() {
     assert!(c.get(format!("{edge}/edge/healthz")).send().await.unwrap().status().is_success());
 
     // Contract unchanged through the edge: create room, send, GET /messages.
-    let a = |rb: reqwest::RequestBuilder| rb.header("authorization", "Bearer tok-alice");
-    let b = |rb: reqwest::RequestBuilder| rb.header("authorization", "Bearer tok-bob");
-    let room: Value = a(c.post(format!("{edge}/_matrix/client/v3/createRoom"))).json(&json!({"name":"edge-chan","visibility":"public"})).send().await.unwrap().json().await.unwrap();
+    let room: Value = signed(c.post(format!("{edge}/_matrix/client/v3/createRoom")), "alice", "POST", "/client/v3/createRoom").json(&json!({"name":"edge-chan","visibility":"public"})).send().await.unwrap().json().await.unwrap();
     let room_id = room["room_id"].as_str().unwrap().to_string();
-    assert_eq!(b(c.post(format!("{edge}/_matrix/client/v3/rooms/{room_id}/join"))).json(&json!({})).send().await.unwrap().status(), 200);
+    assert_eq!(signed(c.post(format!("{edge}/_matrix/client/v3/rooms/{room_id}/join")), "bob", "POST", &format!("/client/v3/rooms/{room_id}/join")).json(&json!({})).send().await.unwrap().status(), 200);
 
     // Push v1 relay: bob's socket is held at the edge, then alice's message arrives on it.
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{edge_addr}/_matrix/client/v3/push")).await.unwrap();
-    ws.send(tokio_tungstenite::tungstenite::Message::text(json!({"type":"register","tokens":["tok-bob"]}).to_string())).await.unwrap();
+    let mut req = tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(format!("ws://{edge_addr}/_matrix/client/v3/push")).unwrap();
+    let now = chrono_now();
+    let hs = m4a_seam::sign_assertion(SEAM, "GET", "/client/v3/push", &m4a_seam::Assertion { nick: "bob".into(), cred_ref: "cred-bob".into(), authenticated: 1, paid: 0, iat: now, exp: now + 60, nonce: "ws-bob".into() });
+    req.headers_mut().insert(m4a_seam::DEFAULT_ASSERTION_HEADER, hs.parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
     let first = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next()).await.unwrap().unwrap().unwrap();
     assert!(first.to_text().unwrap().contains("registered"), "registered ack relayed: {first:?}");
 
-    let sent = a(c.put(format!("{edge}/_matrix/client/v3/rooms/{room_id}/send/m.room.message/t1"))).json(&json!({"msgtype":"m.text","body":"through the edge"})).send().await.unwrap();
+    let sent = signed(c.put(format!("{edge}/_matrix/client/v3/rooms/{room_id}/send/m.room.message/t1")), "alice", "PUT", &format!("/client/v3/rooms/{room_id}/send/m.room.message/t1")).json(&json!({"msgtype":"m.text","body":"through the edge"})).send().await.unwrap();
     assert_eq!(sent.status(), 200);
-    let msgs: Value = b(c.get(format!("{edge}/_matrix/client/v3/rooms/{room_id}/messages?dir=b&limit=5"))).send().await.unwrap().json().await.unwrap();
+    let msgs: Value = signed(c.get(format!("{edge}/_matrix/client/v3/rooms/{room_id}/messages?dir=b&limit=5")), "bob", "GET", &format!("/client/v3/rooms/{room_id}/messages?dir=b&limit=5")).send().await.unwrap().json().await.unwrap();
     assert!(msgs["chunk"].as_array().unwrap().iter().any(|e| e["content"]["body"] == "through the edge"), "{msgs}");
     let pushed = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next()).await.expect("push frame").unwrap().unwrap();
     assert!(!pushed.to_text().unwrap().is_empty());
 
     // Media (binary body, auth) and well-known pass through.
-    let up: Value = a(c.post(format!("{edge}/_matrix/media/v3/upload"))).body(vec![9u8; 4096]).send().await.unwrap().json().await.unwrap();
+    let up: Value = signed(c.post(format!("{edge}/_matrix/media/v3/upload")), "alice", "POST", "/media/v3/upload").body(vec![9u8; 4096]).send().await.unwrap().json().await.unwrap();
     let path = up["content_uri"].as_str().unwrap().strip_prefix("mxc://").unwrap().to_string();
-    let got = b(c.get(format!("{edge}/_matrix/client/v1/media/download/{path}"))).send().await.unwrap().bytes().await.unwrap();
+    let got = signed(c.get(format!("{edge}/_matrix/client/v1/media/download/{path}")), "bob", "GET", &format!("/client/v1/media/download/{path}")).send().await.unwrap().bytes().await.unwrap();
     assert_eq!(got.len(), 4096);
     assert_eq!(c.get(format!("{edge}/.well-known/matrix/client")).send().await.unwrap().status(), 404, "config-driven on the core");
 }

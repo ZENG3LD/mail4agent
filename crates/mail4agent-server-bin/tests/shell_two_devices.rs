@@ -20,7 +20,7 @@ use mail4agent_messenger_shell::{
     session_store_dir, CreateRoomKind, DeviceId, MessageKind, MessengerCommand, OpenedStore,
     OutgoingMessage, RoomId, SessionWake,
 };
-use mail4agent_server::store::{self, init_messenger_db};
+use mail4agent_server::store::init_messenger_db;
 
 const TEXT: &str = "shell-two-device-hello";
 const GROUP_TEXT: &str = "shell-group-hello";

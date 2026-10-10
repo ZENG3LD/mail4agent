@@ -11,10 +11,10 @@ name = "mail4agent_server"
 path = "src/lib.rs"
 
 [features]
-# Device-bearer credentials resolve to a caller. Meant for test fixtures that seed
-# devices directly; a product server vouches for callers by signed assertion instead.
 default = []
-test-bearer = []
+# Device-bearer credentials resolve to a caller. Only the client shell's in-process local
+# bus enables it (its own private bus, no network); the server binary never does.
+local-bearer = []
 # Turns `PRAGMA key` into real SQLCipher. Off by default so a workspace
 # build of the mailbox daemon does not link OpenSSL. The builder enables
 # this on the binary that opens `init_messenger_db`.

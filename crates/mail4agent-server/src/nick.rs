@@ -38,27 +38,6 @@ pub(crate) fn legacy_session_id(user_id: i64) -> String {
     format!("legacy-user-{user_id}")
 }
 
-pub(crate) fn session_by_id(
-    conn: &Connection,
-    session_id: &str,
-) -> Result<Option<MessengerSession>, MatrixError> {
-    let found = conn
-        .query_row(
-            "SELECT session_id, user_id, device_id, nick FROM messenger_sessions WHERE session_id = ?1",
-            params![session_id],
-            |row| {
-                Ok(MessengerSession {
-                    session_id: row.get(0)?,
-                    user_id: row.get(1)?,
-                    device_id: row.get(2)?,
-                    nick: row.get(3)?,
-                })
-            },
-        )
-        .optional()?;
-    Ok(found)
-}
-
 /// True when some other session already has this nick, case-insensitively.
 pub(crate) fn nick_taken(
     conn: &Connection,
@@ -75,35 +54,6 @@ pub(crate) fn nick_taken(
         .optional()?
         .is_some();
     Ok(taken)
-}
-
-/// Insert the client session, or adopt the placeholder [`set_nick`] left
-/// behind for this user. The placeholder's nick is replaced.
-pub(crate) fn save_session(
-    conn: &Connection,
-    session_id: &str,
-    user_id: i64,
-    device_id: &str,
-    nick: &str,
-    replace_legacy: bool,
-) -> Result<(), MatrixError> {
-    if replace_legacy {
-        let legacy = legacy_session_id(user_id);
-        let updated = conn.execute(
-            "UPDATE messenger_sessions
-             SET session_id = ?1, device_id = ?2, nick = ?3
-             WHERE session_id = ?4 AND user_id = ?5",
-            params![session_id, device_id, nick, legacy, user_id],
-        )?;
-        if updated > 0 {
-            return Ok(());
-        }
-    }
-    conn.execute(
-        "INSERT INTO messenger_sessions (session_id, user_id, device_id, nick) VALUES (?1, ?2, ?3, ?4)",
-        params![session_id, user_id, device_id, nick],
-    )?;
-    Ok(())
 }
 
 pub fn set_nick(conn: &Connection, user_id: i64, nick: &str) -> Result<(), MatrixError> {
