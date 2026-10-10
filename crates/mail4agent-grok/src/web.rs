@@ -145,7 +145,7 @@ fn normalize_bearer(raw: &str) -> Result<Option<String>, WebhookError> {
 }
 
 fn bearer_is_header_safe(token: &str) -> bool {
-    !token.is_empty() && !token.chars().any(|c| c.is_control() || c.is_whitespace())
+    !token.is_empty() && token.is_ascii() && !token.chars().any(|c| c.is_control() || c.is_whitespace())
 }
 
 pub fn parse_webhooks(toml_text: &str) -> Result<BTreeMap<String, WebhookBinding>, WebhookError> {
@@ -260,7 +260,7 @@ pub fn validate_webhook_url(url: &str) -> Result<(), WebhookError> {
 
 /// Blank stays unset. Anything that cannot be a single header field is refused
 /// before the POST, and the token is not copied into the error.
-fn bearer_token(bearer: Option<&str>) -> Result<Option<&str>, WebPostError> {
+pub fn bearer_token(bearer: Option<&str>) -> Result<Option<&str>, WebPostError> {
     let Some(raw) = bearer else {
         return Ok(None);
     };

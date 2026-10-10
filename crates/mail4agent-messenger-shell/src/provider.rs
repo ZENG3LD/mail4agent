@@ -33,13 +33,27 @@
 //! the plaintext or a credential.
 
 pub mod chain;
+#[cfg(feature = "wake-claude")]
 pub mod claude_channel;
+#[cfg(not(feature = "wake-claude"))]
+pub use off::claude_channel;
+#[cfg(feature = "wake-codex")]
 pub mod codex;
+#[cfg(not(feature = "wake-codex"))]
+pub use off::codex;
 pub mod hook;
 pub mod inbox;
+#[cfg(feature = "wake-kimi")]
 pub mod kimi;
+#[cfg(not(feature = "wake-kimi"))]
+pub use off::kimi;
 pub mod registry;
+#[cfg(not(all(feature = "wake-claude", feature = "wake-codex", feature = "wake-kimi", feature = "wake-spawn")))]
+mod off;
+#[cfg(feature = "wake-spawn")]
 pub mod spawn;
+#[cfg(not(feature = "wake-spawn"))]
+pub use off::spawn;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -447,19 +461,28 @@ impl WakeAdapter for GrokLeaderAdapter {
         session: &ProviderSession,
         letter: &WakeLetter<'_>,
     ) -> Result<WakeOutcome, WakeError> {
+        let _ = (&session, &letter);
+        #[cfg(not(feature = "wake-grok"))]
+        return Err(WakeError::Unavailable("this build was made without feature wake-grok".into()));
+        #[cfg(feature = "wake-grok")]
         self.probe(session)?;
+        #[cfg(feature = "wake-grok")]
         let Some(sock) = self.leader_sock.as_deref() else {
             return Err(WakeError::Unavailable("leader socket unset".into()));
         };
+        #[cfg(feature = "wake-grok")]
         let cwd = session_cwd(session)?;
-        mail4agent_grok::wake_decrypted_room_blocking(
-            sock,
-            &session.session_id,
-            &cwd,
-            &wake_prompt(session, letter),
-        )
-        .map(|()| WakeOutcome::Delivered)
-        .map_err(|err| WakeError::Transport(err.to_string()))
+        #[cfg(feature = "wake-grok")]
+        {
+            mail4agent_grok::wake_decrypted_room_blocking(
+                sock,
+                &session.session_id,
+                &cwd,
+                &wake_prompt(session, letter),
+            )
+            .map(|()| WakeOutcome::Delivered)
+            .map_err(|err| WakeError::Transport(err.to_string()))
+        }
     }
 }
 
@@ -488,6 +511,9 @@ impl WakeAdapter for CursorAgentAdapter {
         session: &ProviderSession,
         letter: &WakeLetter<'_>,
     ) -> Result<WakeOutcome, WakeError> {
+        if !cfg!(feature = "wake-cursor") {
+            return Err(WakeError::Unavailable("this build was made without feature wake-cursor".into()));
+        }
         InboxHookAdapter::new(self.kind(), HookFlavor::CursorStop, self.inbox_dir.clone())
             .wake(session, letter)
     }
@@ -524,6 +550,9 @@ impl WakeAdapter for RoutineWebhookAdapter {
         session: &ProviderSession,
         letter: &WakeLetter<'_>,
     ) -> Result<WakeOutcome, WakeError> {
+        if !cfg!(feature = "wake-routine") {
+            return Err(WakeError::Unavailable("this build was made without feature wake-routine".into()));
+        }
         self.probe(session)?;
         let url = self.url.as_deref().unwrap_or_default();
         let reply = reply_hint(&session.nick, letter.from_nick);
@@ -587,6 +616,9 @@ impl WakeAdapter for ClaudeRoutineFireAdapter {
         session: &ProviderSession,
         letter: &WakeLetter<'_>,
     ) -> Result<WakeOutcome, WakeError> {
+        if !cfg!(feature = "wake-claude") {
+            return Err(WakeError::Unavailable("this build was made without feature wake-claude".into()));
+        }
         self.probe(session)?;
         let url = self.url.as_deref().unwrap_or_default();
         let token = self.bearer.as_deref().unwrap_or_default();
@@ -674,6 +706,7 @@ refuse_adapter!(
     NoInboundTrigger
 );
 
+#[cfg_attr(not(feature = "wake-grok"), allow(dead_code))]
 pub(crate) fn session_cwd(session: &ProviderSession) -> Result<String, WakeError> {
     session
         .cwd

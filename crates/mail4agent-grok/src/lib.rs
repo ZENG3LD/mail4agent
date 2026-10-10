@@ -37,7 +37,7 @@ pub use index::{
 pub use leader::{push_into_session, wake_decrypted_room, wake_decrypted_room_blocking};
 pub use pipe::{grok_home, leader_is_listening, leader_pipe_name, leader_socket, PushError};
 pub use web::{
-    choose_route, effective_bearer, parse_webhooks, post_letter, validate_webhook_url, webhook_for,
+    bearer_token, choose_route, effective_bearer, parse_webhooks, post_letter, validate_webhook_url, webhook_for,
     webhooks_path, DeliveryRoute, WebPostError, WebhookBinding, WebhookError, WEBHOOKS_FILE,
     WEBHOOK_BEARER_ENV,
 };

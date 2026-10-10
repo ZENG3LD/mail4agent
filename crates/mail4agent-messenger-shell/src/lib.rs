@@ -780,12 +780,8 @@ fn routine_json(wake: &DecryptedWake<'_>) -> Result<Vec<u8>, ShellError> {
 }
 
 fn bearer_header(token: &str) -> Result<reqwest::header::HeaderValue, ShellError> {
-    if token
-        .bytes()
-        .any(|byte| byte.is_ascii_whitespace() || !byte.is_ascii())
-    {
-        return Err(ShellError::RoutineBearer);
-    }
+    // One rule for both delivery paths (the Grok doorbell's and the routine POST): the Grok crate's.
+    let token = mail4agent_grok::bearer_token(Some(token)).map_err(|_| ShellError::RoutineBearer)?.ok_or(ShellError::RoutineBearer)?;
     let mut header = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
         .map_err(|_| ShellError::RoutineBearer)?;
     header.set_sensitive(true);
@@ -819,6 +815,8 @@ fn public_reqwest(err: &reqwest::Error) -> String {
 }
 
 fn parse_routine_url(url: &str) -> Result<reqwest::Url, ShellError> {
+    // One rule for both delivery paths: the Grok crate's operator-URL check runs first.
+    mail4agent_grok::validate_webhook_url(url).map_err(|_| ShellError::RoutineUrl)?;
     let parsed = reqwest::Url::parse(url).map_err(|_| ShellError::RoutineUrl)?;
     match parsed.scheme() {
         "http" | "https" => {}
