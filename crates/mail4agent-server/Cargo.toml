@@ -21,9 +21,6 @@ presence = []
 media-federation = []
 # Real thumbnails (scale/crop) for image uploads; without it the original is served. Env: none (cheap).
 media-thumbnails = ["dep:image"]
-# Device-bearer credentials resolve to a caller. Only the client shell's in-process local
-# bus enables it (its own private bus, no network); the server binary never does.
-local-bearer = []
 # F3 spike: NEW rooms get signed room-version-11 events with reference-hash ids (see f3.rs).
 # Off by default; legacy rooms are untouched.
 f3-hash-ids = ["dep:m4a-matrix-core"]

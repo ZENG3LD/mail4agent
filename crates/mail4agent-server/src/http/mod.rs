@@ -17,7 +17,7 @@ use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
 use crate::error::MatrixError;
-#[cfg(any(test, feature = "local-bearer"))]
+#[cfg(test)]
 use crate::keys::CredentialKind;
 use crate::live::{ClaimRateLimiter, LiveRegistry};
 use crate::typing::TypingRegistry;
@@ -177,16 +177,16 @@ pub async fn resolve_caller(
         .await
         .map_err(|_| MatrixError::internal())?;
     }
-    #[cfg(not(any(test, feature = "local-bearer")))]
+    #[cfg(not(test))]
     {
         let _ = query_token;
         return Err(MatrixError::missing_token());
     }
-    #[cfg(any(test, feature = "local-bearer"))]
+    #[cfg(test)]
     resolve_bearer(state, headers, query_token).await
 }
 
-#[cfg(any(test, feature = "local-bearer"))]
+#[cfg(test)]
 async fn resolve_bearer(state: &Arc<Homeserver>, headers: &HeaderMap, query_token: Option<&str>) -> Result<Caller, MatrixError> {
     let Some(raw) = raw_token(headers, query_token) else {
         return Err(MatrixError::missing_token());

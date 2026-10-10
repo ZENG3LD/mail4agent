@@ -65,7 +65,6 @@ pub fn run(args: Vec<String>) {
 
     let homeserver = env_required("M4A_HOMESERVER_URL");
     let store = PathBuf::from(env_required("M4A_STORE_ROOT"));
-    let keychain = PathBuf::from(env_required("M4A_KEYCHAIN_DIR"));
     let grok_home = mail4agent_grok::grok_home().unwrap_or_else(|| {
         eprintln!("grok home is not set");
         std::process::exit(1);
@@ -80,7 +79,7 @@ pub fn run(args: Vec<String>) {
         .unwrap_or_else(|| grok_home.join("active_sessions.json"));
     let sessions = grok_home.join("sessions");
 
-    let mut listener = GrokListener::new(homeserver, store.clone(), keychain, leader);
+    let mut listener = GrokListener::new(homeserver, store.clone(), leader);
     let send_sock = store.join("grok-listen.sock");
     if let Err(err) = listener.listen_for_sends(&send_sock) {
         eprintln!("send socket: {err}");

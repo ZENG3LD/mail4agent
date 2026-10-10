@@ -167,11 +167,11 @@ fn send_socket_dm_wakes_the_recipient_with_a_reply_hint() {
     let root = temp.dir.join("stores");
     let product = support_product::start_product(&base);
     let base = product.url.clone();
-    let alice_token = support_product::product_user(&product, "alice");
+    let alice_invite = support_product::product_invite(&product, "alice");
     let sessions = vec![
-        HostSession::new("Alice", "web-alice").with_product("alice", alice_token.clone()),
+        HostSession::new("Alice", "web-alice").with_invite(alice_invite),
         HostSession::new("Привет мир", "web-chief")
-            .with_product("privet-mir", support_product::product_user(&product, "privet-mir"))
+            .with_invite(support_product::product_invite(&product, "privet-mir"))
             .with_routine(routine_url, Some("test-routine-key".to_string())),
     ];
     let mut client = MachineClient::open(&base, &root, sessions).expect("client opens");
@@ -179,7 +179,7 @@ fn send_socket_dm_wakes_the_recipient_with_a_reply_hint() {
     assert!(MachineClient::open(
         &base,
         &root,
-        vec![HostSession::new("Alice", "web-alice").with_product("alice", alice_token.clone())]
+        vec![HostSession::new("Alice", "web-alice").with_invite("spent-elsewhere")]
     )
     .is_err());
     let sock = temp.dir.join("web-client.sock");

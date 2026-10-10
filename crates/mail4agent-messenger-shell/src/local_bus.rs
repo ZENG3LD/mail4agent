@@ -10,7 +10,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use mail4agent_messenger::{HttpResponseDescriptor, OutgoingRequest, OutgoingRequestKind};
-use mail4agent_server::http::{hash_token, router, Homeserver};
+use mail4agent_server::http::identity::Seam;
+use mail4agent_server::http::{router, Homeserver};
 use mail4agent_server::store::{self, create_matrix_schema};
 use rusqlite::{params, Connection};
 use tower::util::ServiceExt;
@@ -56,25 +57,40 @@ pub(crate) struct LocalBus {
     local_only: AtomicBool,
     hits: AtomicU64,
     cursors: Mutex<HashMap<String, String>>,
+    /// Per-process secret of the bus's own seam; it never leaves this process.
+    secret: Vec<u8>,
+    nonce: AtomicU64,
+    /// mxid -> (nick, credential reference) of each seeded session.
+    callers: Mutex<HashMap<String, (String, String)>>,
 }
 
 impl LocalBus {
     pub(crate) fn open(prepared: &[Prepared]) -> Result<Self, ShellError> {
-        let conn = open_keyed_memory()?;
+        let mut conn = open_keyed_memory()?;
         create_matrix_schema(&conn)
             .map_err(|_| ShellError::Http("local bus schema failed".into()))?;
         mail4agent_server::keys::create_matrix_keys_schema(&conn)
             .map_err(|_| ShellError::Http("local bus keys schema failed".into()))?;
-        for (index, item) in prepared.iter().enumerate() {
-            seed_session(&conn, (index as i64) + 1, item)?;
+        let mut callers = HashMap::new();
+        for item in prepared.iter() {
+            seed_session(&mut conn, item)?;
+            callers.insert(item.user_id.clone(), (localpart_of(&item.user_id)?.to_string(), item.config.session_id().to_string()));
         }
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
             .map_err(|_| ShellError::Http("local bus runtime failed".into()))?;
+        let mut secret = [0u8; 32];
+        File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut secret)).map_err(ShellError::Io)?;
+        let secret = secret.to_vec();
+        let state = Arc::new(Homeserver::new(conn));
+        let _ = state.seam.set(Arc::new(Seam::new(vec![secret.clone()], 30, None, None)));
         Ok(Self {
-            state: Arc::new(Homeserver::new(conn)),
+            state,
+            secret,
+            nonce: AtomicU64::new(1),
+            callers: Mutex::new(callers),
             runtime,
             gate: Mutex::new(()),
             local_only: AtomicBool::new(false),
@@ -86,9 +102,9 @@ impl LocalBus {
     /// Adds one session opened after start, as [`Self::open`] seeds each.
     pub(crate) fn seed(&self, user_row: i64, item: &Prepared) -> Result<(), ShellError> {
         let _gate = self.gate.lock().unwrap_or_else(|err| err.into_inner());
-        self.state.conn_scope(|conn: &mut rusqlite::Connection| {
-        seed_session(&conn, user_row, item)
-        })
+        let _ = user_row;
+        self.callers.lock().unwrap_or_else(|e| e.into_inner()).insert(item.user_id.clone(), (localpart_of(&item.user_id)?.to_string(), item.config.session_id().to_string()));
+        self.state.conn_scope(|conn: &mut rusqlite::Connection| seed_session(conn, item))
     }
 
     pub(crate) fn set_local_only(&self, enabled: bool) {
@@ -151,8 +167,26 @@ impl LocalBus {
         let uri = local_uri(&request.path, &query)?;
         let method = axum::http::Method::from_bytes(request.method.as_str().as_bytes())
             .map_err(|_| ShellError::Http("unsupported method".into()))?;
-        let mut auth = axum::http::HeaderValue::from_str(&format!("Bearer {device_token}"))
-            .map_err(|_| ShellError::DeviceToken)?;
+        let _ = device_token;
+        let (nick, cred) = self
+            .callers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(user_id)
+            .cloned()
+            .ok_or_else(|| ShellError::Http("local bus does not know this session".into()))?;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+        let assertion = m4a_seam::Assertion {
+            nick,
+            cred_ref: cred,
+            authenticated: 1,
+            paid: 0,
+            iat: now / 1000,
+            exp: now / 1000 + 20,
+            nonce: format!("bus-{}", self.nonce.fetch_add(1, Ordering::Relaxed)),
+        };
+        let signed = m4a_seam::sign_assertion(&self.secret, method.as_str(), &uri, &assertion);
+        let mut auth = axum::http::HeaderValue::from_str(&signed).map_err(|_| ShellError::DeviceToken)?;
         auth.set_sensitive(true);
         let bytes = match &request.body {
             Some(body) => serde_json::to_vec(body)
@@ -160,7 +194,7 @@ impl LocalBus {
             None => Vec::new(),
         };
         let mut builder = axum::http::Request::builder().method(method).uri(uri);
-        builder = builder.header(axum::http::header::AUTHORIZATION, auth);
+        builder = builder.header(m4a_seam::DEFAULT_ASSERTION_HEADER, auth);
         if request.body.is_some() {
             builder = builder.header(axum::http::header::CONTENT_TYPE, "application/json");
         }
@@ -281,34 +315,28 @@ fn open_keyed_memory() -> Result<Connection, ShellError> {
     Ok(conn)
 }
 
-fn seed_session(conn: &Connection, user_id: i64, item: &Prepared) -> Result<(), ShellError> {
+fn seed_session(conn: &mut Connection, item: &Prepared) -> Result<(), ShellError> {
     let localpart = localpart_of(&item.user_id)?;
-    let now = "2026-10-05T00:00:00+00:00";
-    let mxid = store::ensure_matrix_user(conn, user_id, localpart, now)
+    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+    // The same path a signed assertion takes: identity by nick, device by credential. The device
+    // then takes the id the real server gave it, so the engine's own device id stays valid here.
+    let resolved = mail4agent_server::identities::resolve_assertion(conn, localpart, item.config.session_id(), now_ms)
         .map_err(|_| ShellError::Http("local bus could not seed a user".into()))?;
+    let mxid = store::mxid_of(conn, resolved.identity.id)
+        .map_err(|_| ShellError::Http("local bus could not seed a user".into()))?
+        .unwrap_or_default();
     if mxid != item.user_id {
-        return Err(ShellError::SessionList(
-            "local bus user id did not match the homeserver".to_string(),
-        ));
+        return Err(ShellError::SessionList("local bus user id did not match the homeserver".to_string()));
     }
-    let hash = hash_token(item.bearer.as_str());
     conn.execute(
-        "INSERT INTO devices (user_id, device_id, credential_kind, credential_ref, display_name, created_at, last_seen_at)
-         VALUES (?1, ?2, 'bearer', ?3, NULL, ?4, ?4)",
-        params![user_id, item.device_id.as_str(), hash, now],
+        "UPDATE devices SET device_id = ?1 WHERE user_id = ?2 AND device_id = ?3",
+        params![item.device_id.as_str(), resolved.identity.id, resolved.device_id],
     )
     .map_err(|_| ShellError::Http("local bus could not seed a device".into()))?;
     conn.execute(
         "INSERT INTO messenger_sessions (session_id, user_id, device_id, nick) VALUES (?1, ?2, ?3, ?4)",
-        params![
-            item.config.session_id(),
-            user_id,
-            item.device_id.as_str(),
-            item.config.nick()
-        ],
+        params![item.config.session_id(), resolved.identity.id, item.device_id.as_str(), item.nick],
     )
     .map_err(|_| ShellError::Http("local bus could not seed a session".into()))?;
     Ok(())
 }
-
-

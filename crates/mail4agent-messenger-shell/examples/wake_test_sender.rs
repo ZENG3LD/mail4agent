@@ -37,16 +37,10 @@ fn main() {
     let stamp = now_ms() / 1000;
     let session_id = format!("wake-test-sender-{stamp}");
     let store_root = std::env::temp_dir().join(format!("m4a-wake-test-{stamp}"));
-    let config = SessionConfig::new(
-        &homeserver,
-        "WakeTestSender",
-        &session_id,
-        &store_root,
-        None,
-    )
+    let config = SessionConfig::for_session(&homeserver, &session_id, &store_root)
     .unwrap_or_else(|err| fail("config", err));
     let mut store = OpenedStore::connect(&config).unwrap_or_else(|err| fail("register", err));
-    println!("registered nick={} session={session_id}", config.nick());
+    println!("registered nick={} session={session_id}", store.nick().unwrap_or(""));
     let room_id = store
         .ensure_dm(&target, now_ms())
         .unwrap_or_else(|err| fail("ensure_dm", err));

@@ -27,13 +27,10 @@
 //! paged once from the stored sync token, and only the newest inbound
 //! text in each room is prompted.
 //!
-//! The device bearer stays in memory on [`OpenedStore`]. It is sent as
-//! `Authorization: Bearer` and is not written next to the sealed records.
-//! The register response `access_token` is that bearer, and only when this
-//! call created the device. A later process for the same session gets it
-//! from the host keychain via [`DEVICE_TOKEN_ENV`], the way box-secrets
-//! works. Nothing here reads or writes a secrets file, and the bearer is
-//! not logged.
+//! The session bearer stays in memory on [`OpenedStore`]. It comes from the client's own
+//! key-signature login (the identity lives in the vault; see `m4a-agent`), is sent as
+//! `Authorization: Bearer` and is never written next to the sealed records. No password, token or
+//! device bearer is ever read from the environment or handed in by a host.
 //! Paths the engine builds under `/_matrix` are sent without that prefix:
 //! `mail4agent-server-bin` mounts the Client-Server router at `/client/v3`.
 //!
@@ -102,7 +99,7 @@ use zeroize::Zeroizing;
 pub use machine::{
     ensure_agent_webhook_routines, ensure_agent_webhook_routines_from_env, load_agents_dir,
     load_session_records, HostSession, MachineClient, RoutineReport, TickReport, WakeOptions,
-    WakeStatus, AGENTS_DIR_ENV, AGENT_RESCAN_SECS_ENV, DEFAULT_AGENTS_DIR, KEYCHAIN_DIR_ENV,
+    WakeStatus, AGENTS_DIR_ENV, AGENT_RESCAN_SECS_ENV, DEFAULT_AGENTS_DIR,
     PROFILE_NOTE_ENV, SESSIONS_DIR_ENV, SESSION_IDS_ENV, SKIP_NICKS_ENV, STORE_LOCK_FILE,
     WAKE_KEYCHAIN_FILE,
 };
@@ -161,11 +158,6 @@ pub const BOT_NAME_ENV: &str = "M4A_BOT_NAME";
 /// [`session_store_dir`] of this id. The same id reopens the same store.
 pub const SESSION_ID_ENV: &str = "M4A_SESSION_ID";
 
-/// Device bearer from the host keychain, for a session that already
-/// registered. Unset on the first connect: the register response supplies
-/// it, once, into process memory. Never a file.
-pub const DEVICE_TOKEN_ENV: &str = "M4A_DEVICE_TOKEN";
-
 /// Product-session mode: base URL of the product server. Every Client-Server
 /// call goes through its proxy with the product session token as bearer.
 pub const PRODUCT_URL_ENV: &str = "M4A_PRODUCT_URL";
@@ -174,20 +166,6 @@ pub const PRODUCT_URL_ENV: &str = "M4A_PRODUCT_URL";
 pub const PRODUCT_INVITE_ENV: &str = "M4A_PRODUCT_INVITE";
 /// Identity mode: `server` (our product API, default) or `matrix` (the Matrix client API).
 pub const TIER_ENV: &str = "M4A_TIER";
-/// Product-session mode: the product nick to log in as.
-pub const PRODUCT_NICK_ENV: &str = "M4A_PRODUCT_NICK";
-/// Product-session mode: password for `POST /product/v1/login` (not logged).
-pub const PRODUCT_PASSWORD_ENV: &str = "M4A_PRODUCT_PASSWORD";
-/// Product-session mode: an existing product session token instead of a password.
-pub const PRODUCT_TOKEN_ENV: &str = "M4A_PRODUCT_TOKEN";
-
-/// How a session proves itself to the product server.
-#[derive(Clone)]
-pub enum ProductSecret {
-    Password(Zeroizing<String>),
-    Token(Zeroizing<String>),
-}
-
 /// Identity mode: the client owns an ed25519 identity and logs in by signature. There is no
 /// password and no token the agent could be handed; `invite` is the operator's one-time code,
 /// needed only until the identity is enrolled.
@@ -196,12 +174,6 @@ pub enum ProductSecret {
 struct IdentityAuth {
     tier: m4a_agent::BackendKind,
     invite: Option<Zeroizing<String>>,
-}
-
-#[derive(Clone)]
-struct ProductAuth {
-    nick: String,
-    secret: ProductSecret,
 }
 
 /// Directory for `session_id` under `root`.
@@ -361,25 +333,20 @@ pub(crate) fn nonempty_var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
-/// One Grok Bot web session, ready to register. Built from the host
-/// environment ([`SessionConfig::from_env`]) or from the same fields the
-/// host would have injected. The nick is [`nick_from_display_name`] of
-/// `bot_name`. Local grok CLI sessions do not use this type.
+/// One session of the client, ready to log in. Built from the host environment
+/// ([`SessionConfig::from_env`]) or [`SessionConfig::new_identity`]. The nick is the one the
+/// operator assigned with the invite; it is known after the first login.
 pub struct SessionConfig {
     homeserver_url: String,
-    nick: String,
-    public_id: String,
     session_id: String,
     store_root: PathBuf,
-    device_token: Option<Zeroizing<String>>,
-    product: Option<ProductAuth>,
-    identity: Option<IdentityAuth>,
+    identity: IdentityAuth,
 }
 
 impl SessionConfig {
-    /// Identity mode: the session's identity is generated and kept by the client's vault under
-    /// `store_root`, it enrolls with the operator's `invite` once, and logs in by signature
-    /// afterwards. `tier` picks the product API (tier 2) or the Matrix API (tier 3).
+    /// The session's identity is generated and kept by the client's vault under `store_root`, it
+    /// enrolls with the operator's `invite` once, and logs in by signature afterwards. `tier`
+    /// picks the product API (tier 2) or the Matrix API (tier 3).
     pub fn new_identity(
         product_url: impl Into<String>,
         tier: m4a_agent::BackendKind,
@@ -391,83 +358,30 @@ impl SessionConfig {
         parse_base_url(&homeserver_url)?;
         let session_id = session_id.into();
         validate_session_id(&session_id)?;
+        let store_root = store_root.into();
+        let invite = invite.filter(|i| !i.is_empty()).or_else(|| read_invite_file(&store_root, &session_id));
         Ok(Self {
             homeserver_url,
-            // The operator assigned the nick; it is learned at enrollment.
-            public_id: String::new(),
-            nick: String::new(),
             session_id,
-            store_root: store_root.into(),
-            device_token: None,
-            product: None,
-            identity: Some(IdentityAuth { tier, invite: invite.filter(|i| !i.is_empty()).map(Zeroizing::new) }),
+            store_root,
+            identity: IdentityAuth { tier, invite: invite.map(Zeroizing::new) },
         })
     }
 
-    /// `bot_name` is the display name (`Alice`, `Привет мир`), not a nick.
-    pub fn new(
-        homeserver_url: impl Into<String>,
-        bot_name: &str,
-        session_id: impl Into<String>,
-        store_root: impl Into<PathBuf>,
-        device_token: Option<String>,
-    ) -> Result<Self, ShellError> {
-        let homeserver_url = homeserver_url.into();
-        parse_base_url(&homeserver_url)?;
-        let session_id = session_id.into();
-        validate_session_id(&session_id)?;
-        let nick = nick_from_display_name(bot_name)?;
-        let device_token = device_token.filter(|token| !token.is_empty());
-        if let Some(token) = &device_token {
-            validate_device_token(token)?;
-        }
-        Ok(Self {
-            homeserver_url,
-            public_id: nick.clone(),
-            nick,
-            session_id,
-            store_root: store_root.into(),
-            device_token: device_token.map(Zeroizing::new),
-            product: None,
-            identity: None,
-        })
+    /// A session on `url`: the tier from [`TIER_ENV`] and the operator's invite from the invite
+    /// file (`<store_root>/invites/<hash of the session id>`), if the operator left one.
+    pub fn for_session(url: &str, session_id: &str, store_root: &Path) -> Result<Self, ShellError> {
+        let tier = match nonempty_var(TIER_ENV).as_deref() {
+            None | Some("server") => m4a_agent::BackendKind::Server,
+            Some("matrix") => m4a_agent::BackendKind::Matrix,
+            Some(_) => return Err(ShellError::Register(format!("{TIER_ENV} is server or matrix"))),
+        };
+        Self::new_identity(url, tier, session_id, store_root, None)
     }
 
-    /// Product-session mode: log in at the product server `product_url` as
-    /// `nick` and talk to the messenger only through its proxy. The nick is
-    /// the product nick; the session id still names the local store.
-    pub fn new_product(
-        product_url: impl Into<String>,
-        nick: &str,
-        secret: ProductSecret,
-        session_id: impl Into<String>,
-        store_root: impl Into<PathBuf>,
-    ) -> Result<Self, ShellError> {
-        let homeserver_url = product_url.into();
-        parse_base_url(&homeserver_url)?;
-        let session_id = session_id.into();
-        validate_session_id(&session_id)?;
-        if nick.is_empty() || nick.len() > 64 {
-            return Err(ShellError::Register("product nick is empty or too long".into()));
-        }
-        Ok(Self {
-            homeserver_url,
-            public_id: nick.to_string(),
-            nick: nick.to_string(),
-            session_id,
-            store_root: store_root.into(),
-            device_token: None,
-            product: Some(ProductAuth { nick: nick.to_string(), secret }),
-            identity: None,
-        })
-    }
-
-    /// Host environment for a Grok Bot web session.
-    ///
-    /// Required: [`HOMESERVER_URL_ENV`] or `homeserver_url` in toml,
-    /// [`BOT_NAME_ENV`] (display name), [`SESSION_ID_ENV`], [`STORE_ROOT_ENV`].
-    /// Optional: [`DEVICE_TOKEN_ENV`]. `M4A_NICK`, [`ROUTINE_URL_ENV`], and
-    /// [`LEADER_SOCK_ENV`] are not read. Wake is chosen by the open path.
+    /// Host environment. Required: [`PRODUCT_URL_ENV`] (or [`HOMESERVER_URL_ENV`] / `homeserver_url`
+    /// in toml), [`SESSION_ID_ENV`], [`STORE_ROOT_ENV`]. Optional: [`PRODUCT_INVITE_ENV`] (first
+    /// login only), [`TIER_ENV`]. [`ROUTINE_URL_ENV`] and [`LEADER_SOCK_ENV`] are not read here.
     pub fn from_env() -> Result<Self, ShellError> {
         let toml_text = load_homeserver_toml()?;
         Self::from_lookup(
@@ -480,60 +394,25 @@ impl SessionConfig {
         mut get: impl FnMut(&str) -> Option<String>,
         toml_text: Option<&str>,
     ) -> Result<Self, ShellError> {
-        if let Some(product_url) = get(PRODUCT_URL_ENV) {
-            if get(PRODUCT_NICK_ENV).is_none() && get(PRODUCT_TOKEN_ENV).is_none() && get(PRODUCT_PASSWORD_ENV).is_none() {
-                let tier = match get(TIER_ENV).as_deref() {
-                    None | Some("server") => m4a_agent::BackendKind::Server,
-                    Some("matrix") => m4a_agent::BackendKind::Matrix,
-                    Some(_) => return Err(ShellError::Register(format!("{TIER_ENV} is server or matrix"))),
-                };
-                let session_id = get(SESSION_ID_ENV).ok_or(ShellError::EmptySession)?;
-                let store_root = get(STORE_ROOT_ENV).ok_or(ShellError::StoreRoot)?;
-                return Self::new_identity(product_url, tier, session_id, store_root, get(PRODUCT_INVITE_ENV));
-            }
-            let nick = get(PRODUCT_NICK_ENV).ok_or_else(|| ShellError::Register(format!("{PRODUCT_NICK_ENV} is required with {PRODUCT_URL_ENV}")))?;
-            let secret = match (get(PRODUCT_TOKEN_ENV), get(PRODUCT_PASSWORD_ENV)) {
-                (Some(t), _) => ProductSecret::Token(Zeroizing::new(t)),
-                (None, Some(p)) => ProductSecret::Password(Zeroizing::new(p)),
-                _ => return Err(ShellError::Register(format!("{PRODUCT_TOKEN_ENV} or {PRODUCT_PASSWORD_ENV} is required"))),
-            };
-            let session_id = get(SESSION_ID_ENV).ok_or(ShellError::EmptySession)?;
-            let store_root = get(STORE_ROOT_ENV).ok_or(ShellError::StoreRoot)?;
-            return Self::new_product(product_url, &nick, secret, session_id, store_root);
-        }
         let from_toml = match toml_text {
             Some(text) => homeserver_url_from_toml(text)?,
             None => None,
         };
-        let homeserver_url = get(HOMESERVER_URL_ENV)
+        let url = get(PRODUCT_URL_ENV)
+            .or_else(|| get(HOMESERVER_URL_ENV))
             .or(from_toml)
             .ok_or(ShellError::HomeserverUrl)?;
-        let bot_name = get(BOT_NAME_ENV).ok_or(ShellError::BotName)?;
+        let tier = match get(TIER_ENV).as_deref() {
+            None | Some("server") => m4a_agent::BackendKind::Server,
+            Some("matrix") => m4a_agent::BackendKind::Matrix,
+            Some(_) => return Err(ShellError::Register(format!("{TIER_ENV} is server or matrix"))),
+        };
         let session_id = get(SESSION_ID_ENV).ok_or(ShellError::EmptySession)?;
         let store_root = get(STORE_ROOT_ENV).ok_or(ShellError::StoreRoot)?;
-        let device_token = get(DEVICE_TOKEN_ENV);
-        let _ignored_nick_slug = get("M4A_NICK");
-        let _ = _ignored_nick_slug;
-        Self::new(
-            homeserver_url,
-            &bot_name,
-            session_id,
-            store_root,
-            device_token,
-        )
+        Self::new_identity(url, tier, session_id, store_root, get(PRODUCT_INVITE_ENV))
     }
 
-    /// True in product-session mode.
-    pub fn is_product(&self) -> bool {
-        self.product.is_some()
-    }
-
-    /// Derived nick. Not the display name.
-    pub fn nick(&self) -> &str {
-        &self.nick
-    }
-
-    /// Homeserver origin this session will register against.
+    /// Homeserver (or product) origin this session logs in at.
     pub fn homeserver_url(&self) -> &str {
         &self.homeserver_url
     }
@@ -553,16 +432,23 @@ impl std::fmt::Debug for SessionConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionConfig")
             .field("homeserver_url", &self.homeserver_url)
-            .field("nick", &self.nick)
             .field("session_id", &self.session_id)
             .field("store_root", &self.store_root)
-            .field(
-                "device_token",
-                &self.device_token.as_ref().map(|_| "[redacted]"),
-            )
-            .field("product_nick", &self.product.as_ref().map(|p| p.nick.as_str()))
+            .field("tier", &self.identity.tier)
             .finish()
     }
+}
+
+/// Where the operator leaves the one-time invite for a session: a file the client reads and
+/// deletes after the identity is enrolled. The agent is never given the code.
+fn invite_path(store_root: &Path, session_id: &str) -> PathBuf {
+    store_root.join("invites").join(hex_encode(&store_seal_key(session_id)))
+}
+
+fn read_invite_file(store_root: &Path, session_id: &str) -> Option<String> {
+    let text = std::fs::read_to_string(invite_path(store_root, session_id)).ok()?;
+    let code = text.trim().to_string();
+    (!code.is_empty()).then_some(code)
 }
 
 fn validate_session_id(session_id: &str) -> Result<(), ShellError> {
@@ -574,17 +460,6 @@ fn validate_session_id(session_id: &str) -> Result<(), ShellError> {
             .any(|ch| ch.is_whitespace() || ch.is_control())
     {
         return Err(ShellError::EmptySession);
-    }
-    Ok(())
-}
-
-fn validate_device_token(token: &str) -> Result<(), ShellError> {
-    if token.is_empty()
-        || token
-            .bytes()
-            .any(|byte| byte.is_ascii_whitespace() || !byte.is_ascii())
-    {
-        return Err(ShellError::DeviceToken);
     }
     Ok(())
 }
@@ -1049,10 +924,10 @@ impl OpenedStore {
             registered.device_id,
             &registered.user_id,
             server_name,
-            registered.base_url.as_ref().map(|u| u.as_str()).unwrap_or(&config.homeserver_url),
+            registered.base_url.as_str(),
             &registered.bearer,
         )?;
-        opened.nick = Some(registered.nick.clone().unwrap_or_else(|| config.nick.clone()));
+        opened.nick = Some(registered.nick.clone());
         opened.set_wake(wake);
         // The first sync is what publishes the public keys.
         opened.drive(1_000, false)?;
@@ -2324,55 +2199,9 @@ struct RegisteredSession {
     device_id: DeviceId,
     bearer: Zeroizing<String>,
     /// Identity mode: the nick the operator assigned.
-    nick: Option<String>,
+    nick: String,
     /// Identity mode: the base URL to use (it carries the prefix decision).
-    base_url: Option<reqwest::Url>,
-}
-
-/// Product session: login (or reuse the token), then `whoami` through the
-/// product proxy gives the mxid and the device the messenger assigned.
-fn product_session(config: &SessionConfig, auth: &ProductAuth) -> Result<RegisteredSession, ShellError> {
-    let http = |e: reqwest::Error| ShellError::Http(clip_public(e.to_string()));
-    let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(10)).http1_only().build().map_err(http)?;
-    let base = parse_base_url(&config.homeserver_url)?;
-    let token: Zeroizing<String> = match &auth.secret {
-        ProductSecret::Token(t) => t.clone(),
-        ProductSecret::Password(pw) => {
-            let mut url = base.clone();
-            url.set_path("/product/v1/login");
-            let resp = client
-                .post(url)
-                .json(&serde_json::json!({ "nick": auth.nick, "password": pw.as_str() }))
-                .send()
-                .map_err(http)?;
-            let status = resp.status().as_u16();
-            let bytes = resp.bytes().map_err(http)?;
-            if !(200..300).contains(&status) {
-                return Err(ShellError::Register(register_failure(status, &bytes)));
-            }
-            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
-            let t = v.get("token").and_then(|t| t.as_str()).unwrap_or("");
-            if t.is_empty() {
-                return Err(ShellError::Register("product login returned no token".into()));
-            }
-            Zeroizing::new(t.to_string())
-        }
-    };
-    let mut url = base;
-    url.set_path("/client/v3/account/whoami");
-    let resp = client.get(url).header(reqwest::header::AUTHORIZATION, format!("Bearer {}", token.as_str())).send().map_err(http)?;
-    let status = resp.status().as_u16();
-    let bytes = resp.bytes().map_err(http)?;
-    if !(200..300).contains(&status) {
-        return Err(ShellError::Register(register_failure(status, &bytes)));
-    }
-    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
-    let user_id = v.get("user_id").and_then(|x| x.as_str()).unwrap_or("").to_string();
-    let device_raw = v.get("device_id").and_then(|x| x.as_str()).unwrap_or("");
-    if user_id.is_empty() || device_raw.is_empty() {
-        return Err(ShellError::Register("whoami missed an id".into()));
-    }
-    Ok(RegisteredSession { user_id, device_id: DeviceId::parse(device_raw)?, bearer: token, nick: None, base_url: None })
+    base_url: reqwest::Url,
 }
 
 /// Identity mode: the client's own identity logs in by signature (enrolling first when it has to).
@@ -2391,6 +2220,8 @@ fn identity_session(config: &SessionConfig, auth: &IdentityAuth) -> Result<Regis
     };
     let mut id = ids.resolve(&config.session_id, auth.tier, backend.server_ref()).map_err(fail)?;
     let session = backend.ensure_session(&ids, &mut id, auth.invite.as_ref().map(|i| i.as_str())).map_err(fail)?;
+    // The invite is spent; the file the operator left is not kept.
+    let _ = std::fs::remove_file(invite_path(&config.store_root, &config.session_id));
     ids.adopt_nick(&mut id, &session.nick).map_err(fail)?;
     let http = |e: reqwest::Error| ShellError::Http(clip_public(e.to_string()));
     let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(10)).http1_only().build().map_err(http)?;
@@ -2420,7 +2251,7 @@ fn identity_session(config: &SessionConfig, auth: &IdentityAuth) -> Result<Regis
     if user_id.is_empty() || device_raw.is_empty() {
         return Err(ShellError::Register("whoami missed an id".into()));
     }
-    Ok(RegisteredSession { user_id, device_id: DeviceId::parse(&device_raw)?, bearer: session.token.clone(), nick: Some(session.nick), base_url: Some(base) })
+    Ok(RegisteredSession { user_id, device_id: DeviceId::parse(&device_raw)?, bearer: session.token.clone(), nick: session.nick, base_url: base })
 }
 
 #[cfg(not(any(feature = "tier-server", feature = "tier-matrix")))]
@@ -2429,77 +2260,7 @@ fn identity_session(_: &SessionConfig, _: &IdentityAuth) -> Result<RegisteredSes
 }
 
 fn register_session(config: &SessionConfig) -> Result<RegisteredSession, ShellError> {
-    if let Some(auth) = &config.identity {
-        return identity_session(config, auth);
-    }
-    if let Some(auth) = &config.product {
-        return product_session(config, auth);
-    }
-    let base = parse_base_url(&config.homeserver_url)?;
-    let mut url = base;
-    url.set_path("/client/v3/register");
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .http1_only()
-        .build()
-        .map_err(|err| ShellError::Http(clip_public(err.to_string())))?;
-    let body = serde_json::json!({
-        "public_id": config.public_id,
-        "nick": config.nick,
-        "session_id": config.session_id,
-    });
-    let response = client
-        .post(url)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(
-            serde_json::to_vec(&body)
-                .map_err(|err| ShellError::Http(clip_public(err.to_string())))?,
-        )
-        .send()
-        .map_err(|err| ShellError::Http(clip_public(err.to_string())))?;
-    let status = response.status().as_u16();
-    let bytes = response
-        .bytes()
-        .map_err(|err| ShellError::Http(clip_public(err.to_string())))?;
-    if !(200..300).contains(&status) {
-        return Err(ShellError::Register(register_failure(status, &bytes)));
-    }
-    let parsed: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|_| ShellError::Register("register response was not json".to_string()))?;
-    let user_id = parsed
-        .get("user_id")
-        .and_then(|value| value.as_str())
-        .unwrap_or("")
-        .to_string();
-    let device_raw = parsed
-        .get("device_id")
-        .and_then(|value| value.as_str())
-        .unwrap_or("");
-    if user_id.is_empty() || device_raw.is_empty() {
-        return Err(ShellError::Register(
-            "register response missed an id".to_string(),
-        ));
-    }
-    let device_id = DeviceId::parse(device_raw)?;
-    let minted = parsed
-        .get("access_token")
-        .and_then(|value| value.as_str())
-        .filter(|token| !token.is_empty());
-    let bearer = if let Some(token) = minted {
-        validate_device_token(token)?;
-        Zeroizing::new(token.to_string())
-    } else if let Some(token) = &config.device_token {
-        token.clone()
-    } else {
-        return Err(ShellError::DeviceToken);
-    };
-    Ok(RegisteredSession {
-        user_id,
-        device_id,
-        bearer,
-        nick: None,
-        base_url: None,
-    })
+    identity_session(config, &config.identity)
 }
 
 fn register_failure(status: u16, body: &[u8]) -> String {
@@ -2808,48 +2569,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn web_session_config_derives_the_nick_and_ignores_a_slug() {
-        let config = SessionConfig::from_lookup(
-            |key| match key {
-                HOMESERVER_URL_ENV => Some("http://127.0.0.1:9".to_string()),
-                BOT_NAME_ENV => Some("Привет мир".to_string()),
-                SESSION_ID_ENV => Some("web-session-1".to_string()),
-                STORE_ROOT_ENV => Some("/tmp/m4a-root".to_string()),
-                "M4A_NICK" => Some("nachshtab".to_string()),
-                _ => None,
-            },
-            None,
-        )
-        .expect("config");
-        assert_eq!(config.nick(), "privet-mir");
-        assert_eq!(
-            config.store_dir(),
-            session_store_dir(Path::new("/tmp/m4a-root"), "web-session-1")
-        );
-        let alice = SessionConfig::from_lookup(
-            |key| match key {
-                HOMESERVER_URL_ENV => Some("http://127.0.0.1:9".to_string()),
-                BOT_NAME_ENV => Some("Alice".to_string()),
-                SESSION_ID_ENV => Some("web-alice".to_string()),
-                STORE_ROOT_ENV => Some("/tmp/m4a-root".to_string()),
-                _ => None,
-            },
-            Some("homeserver_url = \"http://127.0.0.1:1\"\n"),
-        )
-        .expect("alice");
-        assert_eq!(alice.nick(), "alice");
-        assert!(alice.homeserver_url.contains("127.0.0.1:9"));
-        let from_toml = SessionConfig::from_lookup(
-            |key| match key {
-                BOT_NAME_ENV => Some("Alice".to_string()),
-                SESSION_ID_ENV => Some("web-alice".to_string()),
-                STORE_ROOT_ENV => Some("/tmp/m4a-root".to_string()),
-                _ => None,
-            },
-            Some("homeserver_url = \"http://127.0.0.1:9\"\nother = \"ignored\"\n"),
-        )
-        .expect("toml url");
+    fn session_config_is_identity_only_and_reads_no_secret() {
+        let get = |extra: &'static [(&'static str, &'static str)]| {
+            move |key: &str| {
+                extra.iter().find(|(k, _)| *k == key).map(|(_, v)| v.to_string()).or_else(|| match key {
+                    SESSION_ID_ENV => Some("web-session-1".to_string()),
+                    STORE_ROOT_ENV => Some("/tmp/m4a-root".to_string()),
+                    // Retired inputs are never consulted, even when present.
+                    "M4A_PRODUCT_PASSWORD" | "M4A_PRODUCT_TOKEN" | "M4A_DEVICE_TOKEN" => Some("must-not-be-read".to_string()),
+                    _ => None,
+                })
+            }
+        };
+        let config = SessionConfig::from_lookup(get(&[(HOMESERVER_URL_ENV, "http://127.0.0.1:9")]), None).expect("config");
+        assert_eq!(config.store_dir(), session_store_dir(Path::new("/tmp/m4a-root"), "web-session-1"));
+        assert!(!format!("{config:?}").contains("must-not-be-read"));
+        assert_eq!(config.identity.tier, m4a_agent::BackendKind::Server);
+        let matrix = SessionConfig::from_lookup(get(&[(PRODUCT_URL_ENV, "http://127.0.0.1:8"), (TIER_ENV, "matrix")]), None).expect("matrix");
+        assert_eq!(matrix.identity.tier, m4a_agent::BackendKind::Matrix);
+        assert!(SessionConfig::from_lookup(get(&[(TIER_ENV, "other"), (PRODUCT_URL_ENV, "http://127.0.0.1:8")]), None).is_err());
+        let from_toml = SessionConfig::from_lookup(get(&[]), Some("homeserver_url = \"http://127.0.0.1:9\"\nother = \"ignored\"\n")).expect("toml url");
         assert_eq!(from_toml.homeserver_url, "http://127.0.0.1:9");
+        assert!(SessionConfig::from_lookup(get(&[]), None).is_err(), "no server given");
     }
     use std::io::{Read, Write};
     use std::net::TcpListener;
