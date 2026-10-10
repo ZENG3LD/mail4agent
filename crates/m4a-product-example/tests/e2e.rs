@@ -383,3 +383,51 @@ async fn startup_reconcile_applies_revocations_and_deletions_the_messenger_never
     let forged = s.c.post(format!("{}/_matrix/account-source/v1/reconcile", s.edge)).header("x-m4a-link-token", LINK).header(m4a_seam::DEFAULT_EVENT_SIG_HEADER, "00").body("{\"id\":\"x\",\"complete\":true,\"nicks\":[]}").send().await.unwrap();
     assert_eq!(forged.status().as_u16(), 401);
 }
+
+async fn open_push(s: &Stack, tok: &str) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = format!("{}/client/v3/push", s.product.replacen("http", "ws", 1)).into_client_request().unwrap();
+    req.headers_mut().insert("authorization", format!("Bearer {tok}").parse().unwrap());
+    let (mut sock, _) = tokio_tungstenite::connect_async(req).await.expect("handshake");
+    let first = tokio::time::timeout(Duration::from_secs(5), sock.next()).await.expect("registered").unwrap().unwrap();
+    assert!(first.into_text().unwrap().contains("registered"));
+    sock
+}
+
+/// The socket must end (close frame, error or EOF) soon after the event is applied.
+async fn assert_closes(sock: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>) {
+    use futures_util::StreamExt;
+    let ended = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match sock.next().await {
+                None | Some(Err(_)) | Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) => return,
+                Some(Ok(_)) => {}
+            }
+        }
+    })
+    .await;
+    assert!(ended.is_ok(), "push socket stayed open");
+}
+
+#[tokio::test]
+async fn push_sockets_close_when_the_credential_is_revoked_or_the_account_deleted_or_reconcile_removes_it() {
+    let s = stack().await;
+    // Logout revokes the credential: that user's socket ends; another user's stays up.
+    let (_, a_tok) = s.register().await;
+    let (b_nick, b_tok) = s.register().await;
+    let mut a = open_push(&s, &a_tok).await;
+    let mut b = open_push(&s, &b_tok).await;
+    assert_eq!(s.send("POST", "/product/v1/logout", Some(&a_tok), None).await.0, 200);
+    assert_closes(&mut a).await;
+    // Admin delete: the account's socket ends.
+    let (st, _) = s.send("POST", "/product/v1/admin/delete", Some(ADMIN), Some(json!({"nick": b_nick}))).await;
+    assert_eq!(st, 200);
+    assert_closes(&mut b).await;
+    // Reconcile removal: the product forgot the credential without any event.
+    let (c_nick, c_tok) = s.register().await;
+    let mut c = open_push(&s, &c_tok).await;
+    let snap = m4a_seam::Reconcile { id: "rp".into(), complete: false, nicks: vec![m4a_seam::LiveNick { nick: c_nick, creds: vec![] }] };
+    m4a_product_kit::send_reconcile(&s.link, None, &snap, Duration::from_millis(20), 3).await.unwrap();
+    assert_closes(&mut c).await;
+}

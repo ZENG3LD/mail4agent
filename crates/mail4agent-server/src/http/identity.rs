@@ -169,6 +169,9 @@ async fn reconcile_snapshot(State(state): State<Arc<Homeserver>>, headers: Heade
     let snap: m4a_seam::Reconcile = serde_json::from_slice(&body).map_err(|_| MatrixError::bad_json("malformed reconcile body"))?;
     let out = super::with_conn_pub(&state, move |conn| identities::reconcile(conn, &snap, now_ms())).await?;
     wake_users(&state, out.wake.clone());
+    for u in &out.closed {
+        state.push.close_user(*u);
+    }
     Ok(Json(json!({ "ok": true, "devices_removed": out.devices_removed, "identities_retired": out.identities_retired })))
 }
 
@@ -182,15 +185,27 @@ async fn lifecycle_event(State(state): State<Arc<Homeserver>>, headers: HeaderMa
     if ev.id.is_empty() {
         return Err(MatrixError::bad_json("missing id"));
     }
+    let closed = Arc::new(std::sync::Mutex::new(Vec::<i64>::new()));
+    let closed_in = Arc::clone(&closed);
     let (applied, woke) = super::with_conn_pub(&state, move |conn| {
+        let closed = closed_in;
         let now = now_ms();
         let fresh = conn.execute("INSERT OR IGNORE INTO account_events_seen (event_id, at_ms) VALUES (?1, ?2)", rusqlite::params![ev.id, now])?;
         if fresh == 0 {
             return Ok((false, vec![])); // replay of an applied event: success, nothing to do
         }
         let res: Result<(bool, Vec<i64>), MatrixError> = match &ev.kind {
-            EventKind::CredentialRevoked { cred_ref } => identities::apply_credential_revoked(conn, cred_ref).map(|u| (u.is_some(), u.into_iter().collect())),
-            EventKind::AccountDeleted { nick } => identities::apply_account_deleted(conn, nick, now).map(|b| (b, vec![])),
+            EventKind::CredentialRevoked { cred_ref } => identities::apply_credential_revoked(conn, cred_ref).map(|u| {
+                closed.lock().unwrap().extend(u);
+                (u.is_some(), u.into_iter().collect())
+            }),
+            EventKind::AccountDeleted { nick } => {
+                let id = identities::identity_by_nick(conn, nick)?.map(|i| i.id);
+                identities::apply_account_deleted(conn, nick, now).map(|b| {
+                    closed.lock().unwrap().extend(id);
+                    (b, vec![])
+                })
+            }
             EventKind::NickChanged { old, new } => identities::apply_nick_changed(conn, old, new).and_then(|id| match id {
                 Some(id) => Ok((true, restamp(conn, id)?)),
                 None => Ok((false, vec![])),
@@ -204,6 +219,9 @@ async fn lifecycle_event(State(state): State<Arc<Homeserver>>, headers: HeaderMa
     })
     .await?;
     wake_users(&state, woke);
+    for u in closed.lock().unwrap().iter() {
+        state.push.close_user(*u);
+    }
     Ok(Json(json!({ "ok": true, "applied": applied })))
 }
 

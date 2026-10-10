@@ -200,6 +200,8 @@ pub struct ReconcileOutcome {
     pub devices_removed: usize,
     pub identities_retired: usize,
     pub wake: Vec<i64>,
+    /// Users whose push connections must be dropped (device removed or identity retired).
+    pub closed: Vec<i64>,
 }
 
 /// Apply the product's snapshot of live credentials. Devices of a listed nick whose
@@ -217,6 +219,7 @@ pub fn reconcile(conn: &mut Connection, snap: &m4a_seam::Reconcile, now_ms: i64)
                 out.devices_removed += 1;
                 if !out.wake.contains(&idn.id) {
                     out.wake.push(idn.id);
+                    out.closed.push(idn.id);
                 }
             }
         }
@@ -228,7 +231,9 @@ pub fn reconcile(conn: &mut Connection, snap: &m4a_seam::Reconcile, now_ms: i64)
             rows.collect::<Result<_, _>>()?
         };
         for nick in all.into_iter().filter(|n| !listed.contains(&n.to_ascii_lowercase())) {
+            let id = identity_by_nick(conn, &nick)?.map(|i| i.id);
             if apply_account_deleted(conn, &nick, now_ms)? {
+                out.closed.extend(id);
                 out.identities_retired += 1;
             }
         }

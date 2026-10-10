@@ -70,6 +70,12 @@ impl PushHub {
             .retain(|sub| sub.id != id);
     }
 
+    /// Drop every push connection that speaks for `user_id` (credential revoked, account
+    /// deleted): the sockets end, clients must reconnect and prove themselves again.
+    pub(crate) fn close_user(&self, user_id: i64) {
+        self.subs.lock().unwrap_or_else(|err| err.into_inner()).retain(|sub| !sub.users.contains(&user_id));
+    }
+
     fn next_envelope_id(&self) -> String {
         let n = self.next_envelope.fetch_add(1, Ordering::Relaxed);
         format!("p{n}")
