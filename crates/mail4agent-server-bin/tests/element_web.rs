@@ -21,7 +21,7 @@ use support_fed::{free_port, start_node};
 /// Drives Element: log in, list rooms, open a room, send a message, wait for a message from the API.
 const DRIVER: &str = r#"
 const puppeteer = require(process.env.M4A_PUPPETEER_DIR + '/node_modules/puppeteer-core');
-const [url, user, pw, shots, room, mine, theirs, space] = process.argv.slice(2);
+const [url, user, pw, shots, room, mine, theirs, space, group, gmine, gtheirs] = process.argv.slice(2);
 const out = { bad: [], steps: [] };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 (async () => {
@@ -87,6 +87,28 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
         if (!out.theirsVisible) await sleep(1000);
       }
       await shot('5-received');
+    }
+    if (group) {
+      // The closed, encrypted group in the same session.
+      out.groupOpened = await p.evaluate((name) => {
+        const els = [...document.querySelectorAll('[role=option], [role=treeitem], .mx_RoomTile, .mx_RoomListItemView, [class*=RoomListItem]')];
+        const el = els.find((e) => e.innerText && e.innerText.includes(name));
+        if (el) { el.click(); return true; }
+        return false;
+      }, group);
+      await sleep(4000);
+      await shot('6-group');
+      if (out.groupOpened) {
+        const composer = '[contenteditable=true][role=textbox], .mx_BasicMessageComposer_input';
+        await p.waitForSelector(composer, { timeout: 30000 });
+        await p.click(composer);
+        await p.keyboard.type(gmine);
+        await p.keyboard.press('Enter');
+        await sleep(6000);
+        await shot('7-group-sent');
+        out.groupSentVisible = await p.evaluate((t) => document.body.innerText.includes(t), gmine);
+        out.groupTheirsVisible = await p.evaluate((t) => document.body.innerText.includes(t), gtheirs);
+      }
     }
   } catch (e) {
     out.error = String(e);
@@ -167,9 +189,11 @@ fn element_web_logs_in_lists_rooms_and_exchanges_messages() {
     let (st, v) = bob("PUT", &format!("/client/v3/rooms/{}/send/m.room.message/b0", enc(&chan)), Some(json!({"msgtype":"m.text","body":"bob was here"})));
     assert_eq!(st, 200, "{v}");
 
+    let (st, v) = bob("PUT", &format!("/client/v3/rooms/{}/send/m.room.encrypted/g0", enc(&group)), Some(json!({"algorithm":"m.megolm.v1.aes-sha2","sender_key":"k","session_id":"s","device_id":"D","ciphertext":"bob-cipher"})));
+    assert_eq!(st, 200, "{v}");
     let driver = work.join("driver.js");
     std::fs::write(&driver, DRIVER).unwrap();
-    let out = Command::new("node").arg(&driver).args([&format!("http://127.0.0.1:{web_port}"), "alice", "correct horse", work.join("shots").to_str().unwrap(), "general", "hello from element", "reply from bob", "Domain"]).env("M4A_PUPPETEER_DIR", &pp).env("M4A_CHROME", &chrome).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn().unwrap();
+    let out = Command::new("node").arg(&driver).args([&format!("http://127.0.0.1:{web_port}"), "alice", "correct horse", work.join("shots").to_str().unwrap(), "general", "hello from element", "reply from bob", "Domain", "team", "secret from element", "Unable to decrypt"]).env("M4A_PUPPETEER_DIR", &pp).env("M4A_CHROME", &chrome).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn().unwrap();
     // Bob answers once Element has sent its message.
     let chan2 = chan.clone();
     for _ in 0..40 {
@@ -191,6 +215,19 @@ fn element_web_logs_in_lists_rooms_and_exchanges_messages() {
     assert_eq!(r["opened"], true, "the room is in Element's list");
     assert_eq!(r["sentVisible"], true);
     assert_eq!(r["theirsVisible"], true);
+
+    // The closed group is a hash-id room with encryption: Element sets up its keys, writes in it
+    // (ciphertext reaches the server under a hash id), and shows bob's ciphertext as undecryptable.
+    assert_eq!(r["groupOpened"], true, "the closed group is in Element's list: {r}");
+    assert_eq!(r["groupTheirsVisible"], true, "bob's ciphertext shows as undecryptable: {r}");
+    let (_, m) = ours.call(&c, "GET", &format!("/client/v3/rooms/{}/messages?dir=b&limit=20", enc(&group)), None);
+    let mine: Vec<&Value> = m["chunk"].as_array().unwrap().iter().filter(|e| e["type"] == "m.room.encrypted" && e["sender"] == ours.user.as_str()).collect();
+    assert!(!mine.is_empty(), "Element's encrypted message reached the server: {m}");
+    let id = mine[0]["event_id"].as_str().unwrap();
+    assert!(id.len() == 44 && id.starts_with('$') && !id.contains(':'), "hash id: {id}");
+    // E2E setup: Element published device keys and cross-signing / backup state.
+    let (_, q) = bob("POST", "/client/v3/keys/query", Some(json!({"device_keys": {&ours.user: []}})));
+    assert!(q["device_keys"][&ours.user].as_object().is_some_and(|d| !d.is_empty()), "Element uploaded its device keys: {q}");
 }
 
 fn bob_user(bob: &dyn Fn(&str, &str, Option<Value>) -> (u16, Value)) -> String {
