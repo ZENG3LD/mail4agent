@@ -204,6 +204,8 @@ async fn make_join(
             Some(crate::store::Membership::Ban) => return Err(MatrixError::forbidden("banned")),
             Some(crate::store::Membership::Invite) | Some(crate::store::Membership::Join) => {}
             _ if room.join_rule == crate::store::JoinRule::Public => {}
+            #[cfg(feature = "f3-hash-ids")]
+            _ if crate::f3::is_f3_room(c, &room_id) && crate::f3::state_join_rule_is_public(c, &room_id) => {}
             _ => return Err(MatrixError::forbidden("room is not open to this user")),
         }
         #[cfg(feature = "f3-hash-ids")]

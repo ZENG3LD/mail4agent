@@ -373,6 +373,20 @@ impl ConnDag<'_> {
     }
 }
 
+/// A DAG room is open to anyone when its current `m.room.join_rules` state says `public`. The rule
+/// is state (the rooms table's column is fixed at creation); this is how a closed-kind room is
+/// opened to a federated user without an invite.
+pub fn state_join_rule_is_public(conn: &Connection, room: &str) -> bool {
+    conn.query_row(
+        "SELECT e.content FROM current_state cs JOIN events e ON e.event_id = cs.event_id WHERE cs.room_id = ?1 AND cs.event_type = 'm.room.join_rules' AND cs.state_key = ''",
+        [room],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|c| serde_json::from_str::<Value>(&c).ok())
+    .is_some_and(|v| v.get("join_rule").and_then(Value::as_str) == Some("public"))
+}
+
 /// Events of the past from a peer (get_missing_events, backfill, an auth chain): each is checked
 /// (signature, hash or skeleton form, id, its own auth events, the state before it), stored as a
 /// non-extremity, and its timeline row is written when this server has none. They never change the

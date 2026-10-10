@@ -60,8 +60,11 @@ static SERVER_NAME_CELL: std::sync::OnceLock<String> = std::sync::OnceLock::new(
 /// The default until this runs is `example.org`.
 pub fn set_matrix_server_name(name: impl Into<String>) -> Result<(), &'static str> {
     let name = name.into();
-    if name.is_empty() || name.contains(':') || name.contains('/') {
-        return Err("server name must be one hostname");
+    // A hostname, or `host:port` (a Matrix server name may carry a port; tests and private
+    // networks use it).
+    let (host, port) = name.split_once(':').map_or((name.as_str(), None), |(h, p)| (h, Some(p)));
+    if host.is_empty() || host.contains('/') || host.contains(':') || port.is_some_and(|p| p.parse::<u16>().is_err()) {
+        return Err("server name must be a hostname, optionally with :port");
     }
     SERVER_NAME_CELL.set(name).map_err(|_| "server name already set")
 }
