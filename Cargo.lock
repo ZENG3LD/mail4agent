@@ -1591,8 +1591,10 @@ name = "m4a-seam"
 version = "0.4.1"
 dependencies = [
  "base64 0.22.1",
+ "ed25519-dalek 2.2.0",
  "hex",
  "hmac",
+ "rand 0.8.8",
  "serde",
  "serde_json",
  "sha2 0.10.9",

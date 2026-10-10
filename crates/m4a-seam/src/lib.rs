@@ -32,6 +32,8 @@
 //! `nick.changed`); the signature header carries the hex HMAC-SHA256 of the
 //! raw body bytes under the same secret.
 
+pub mod keyproof;
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 
