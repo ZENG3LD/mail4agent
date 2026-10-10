@@ -728,3 +728,41 @@ async fn a_key_signature_gives_a_one_time_matrix_login_token_without_touching_th
     assert_eq!(s.post("/product/v1/login/key/token", None, json!({ "key_id": id.key_id, "challenge_id": ch.challenge_id, "signature": "AAAA" })).await.0, 401);
     assert_eq!(s.post("/product/v1/login/key/token", None, json!({ "key_id": "kunknown", "challenge_id": "x", "signature": "y" })).await.0, 401);
 }
+
+// ---- A new key for an account that exists (lost key, second device).
+
+#[tokio::test]
+async fn an_invite_for_an_existing_account_adds_a_key_to_it_and_nothing_else() {
+    let s = stack().await;
+    let ids = Arc::new(IdentityStore::new(Arc::new(MemoryVault::new())));
+    let (inv, nick) = s.invite(Some("keeper")).await;
+    let first = enroll_as(&s, &ids, "keeper-old", &inv, None).await.unwrap();
+    assert_eq!(first.nick, nick);
+
+    // The operator makes an invite for the account; the answer says so and names the nick.
+    let (st, b) = s.post("/product/v1/admin/invite", Some(ADMIN), json!({ "nick": "keeper", "existing": true })).await;
+    assert_eq!(st, 200, "{b}");
+    assert_eq!((b["nick"].as_str(), b["existing"].as_bool()), (Some("keeper"), Some(true)));
+    let again = b["invite"].as_str().unwrap().to_string();
+
+    // A fresh identity enrolls with it and is the SAME account; the old key still works until revoked.
+    let second = enroll_as(&s, &ids, "keeper-new", &again, Some("keeper")).await.unwrap();
+    assert_eq!(second.nick, "keeper");
+    assert_ne!(second.cred_ref, first.cred_ref, "its own credential");
+    assert_eq!(s.send("GET", "/product/v1/me", Some(&second.token), None).await.1["nick"], json!("keeper"));
+    let old = ids.resolve("keeper-old", BackendKind::Server, &s.product).unwrap();
+    let relog = { let (ids2, url) = (ids.clone(), s.product.clone()); off(move || { let b = ServerBackend::new(&url).unwrap(); let mut id = ids2.resolve("keeper-old", BackendKind::Server, b.server_ref()).unwrap(); ids2.vault().delete(&m4a_agent::identity::token_label("keeper-old")).unwrap(); b.ensure_session(&ids2, &mut id, None) }).await };
+    assert!(relog.is_ok(), "the old key still logs in: {relog:?} {}", old.key_id);
+
+    // The invite is single use; another nick in the request is refused (it is reserved); an unknown
+    // nick has no invite; and the invite needs the operator.
+    let r = enroll_as(&s, &ids, "keeper-third", &again, None).await;
+    assert!(matches!(r, Err(AgentError::Refused(_))), "spent: {r:?}");
+    let (st, b) = s.post("/product/v1/admin/invite", Some(ADMIN), json!({ "nick": "keeper", "existing": true })).await;
+    assert_eq!(st, 200, "{b}");
+    let r = enroll_as(&s, &ids, "keeper-fourth", b["invite"].as_str().unwrap(), Some("someone-else")).await;
+    assert!(matches!(r, Err(AgentError::Refused(_))), "reserved: {r:?}");
+    assert_eq!(s.post("/product/v1/admin/invite", Some(ADMIN), json!({ "nick": "nobody-here", "existing": true })).await.0, 404);
+    assert_eq!(s.post("/product/v1/admin/invite", Some(ADMIN), json!({ "existing": true })).await.0, 400);
+    assert_eq!(s.post("/product/v1/admin/invite", None, json!({ "nick": "keeper", "existing": true })).await.0, 403);
+}

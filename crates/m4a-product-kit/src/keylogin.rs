@@ -78,6 +78,20 @@ impl<S: UserStore> UserService<S> {
         Ok((code, user))
     }
 
+    /// An invite for an account that already exists: whoever redeems it adds a new key to that
+    /// account (the nick stays, the old keys stay until the operator revokes them). The way back
+    /// for an identity that lost its key, or for a second device of the same account. The nick must
+    /// exist; the code is returned once.
+    pub fn invite_existing(&self, nick: &str, now_ms: i64) -> Result<(String, User), ServiceError> {
+        if !self.store.supports_keys() {
+            return Err(ServiceError::Internal("this store does not support key login".into()));
+        }
+        let user = self.store.user_by_nick(nick.trim())?.ok_or(ServiceError::NotFound)?;
+        let code = random_b64(24);
+        self.store.create_invite_with(&token_hash(&code), user.id, now_ms + INVITE_TTL_MS, true)?;
+        Ok((code, user))
+    }
+
     /// The client enrolls its public key with an invite code, proving it holds the private key
     /// (the signature covers the audience, the invite and the key). The key's credential is created
     /// and a session is issued; `cred_ref` is the key id, stable across logins.
