@@ -26,6 +26,9 @@ pub struct ProductApp {
     /// Bearer for `/product/v1/admin/*`; empty disables the admin API.
     pub admin_token: String,
     pub doors: Vec<Arc<dyn LoginDoor>>,
+    /// Serve unauthenticated reads of public rooms through the marked read-only mode
+    /// (`M4A_PRODUCT_ANON_READ=on`; the core must have `M4A_ANON_READ=on` too).
+    pub anon_read: bool,
 }
 
 type App = Arc<ProductApp>;
@@ -214,6 +217,9 @@ async fn proxy(State(app): State<App>, req: Request) -> Response {
         Ok(w) => w,
         Err(e) => return e.into_response(),
     };
+    if who.is_none() && app.anon_read && m4a_seam::anon_read_path_ok(req.method().as_str(), req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("")) {
+        return app.link.forward_anon(req).await;
+    }
     app.link.forward(who.as_ref(), req).await
 }
 

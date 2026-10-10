@@ -128,6 +128,9 @@ fn run() -> Result<(), String> {
         }
     }
     configure_identity(&hs)?;
+    if env::var("M4A_ANON_READ").map(|v| v.eq_ignore_ascii_case("on")).unwrap_or(false) {
+        let _ = hs.anon_read.set(());
+    }
     spawn_retention(Arc::clone(&hs));
     let fed_worker = hs.federation_enabled.get().is_some().then(|| Arc::clone(&hs));
     // Served both bare (behind an edge that strips `/_matrix`) and under `/_matrix` (direct federation peers).

@@ -29,6 +29,8 @@ use super::{wake_users, Homeserver};
 
 /// Internal hand-over header; never trusted from the wire.
 pub(super) const RESOLVED_HEADER: &str = "x-m4a-resolved";
+/// Pseudo user id of an anonymous read-only caller (never a row).
+pub(super) const ANON_USER: i64 = -1;
 
 /// Seam configuration of this server.
 pub struct Seam {
@@ -86,7 +88,11 @@ pub(super) fn read_resolved(headers: &HeaderMap) -> Option<(i64, String, Claims)
     let uid = it.next()?.parse().ok()?;
     let device = it.next()?.to_string();
     let flag: u8 = it.next()?.parse().ok()?;
-    Some((uid, device, claims_from(flag)))
+    let mut claims = claims_from(flag);
+    if uid == ANON_USER {
+        claims.insert("anon".into(), "1".into());
+    }
+    Some((uid, device, claims))
 }
 
 fn seam_error(e: SeamError) -> MatrixError {
@@ -101,8 +107,16 @@ fn seam_error(e: SeamError) -> MatrixError {
 /// Strip the internal header, then honour a valid signed assertion.
 pub(super) async fn assertion_layer(State(state): State<Arc<Homeserver>>, mut req: Request, next: Next) -> Response {
     req.headers_mut().remove(RESOLVED_HEADER);
+    let anon_marked = req.headers_mut().remove(m4a_seam::ANON_READ_HEADER).is_some_and(|v| v == "1");
     let Some(seam) = state.seam.get().cloned() else { return next.run(req).await };
     let Some(value) = req.headers().get(seam.assertion_header.as_str()).and_then(|v| v.to_str().ok()).map(str::to_string) else {
+        if anon_marked && state.anon_read.get().is_some() {
+            let path = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("");
+            if !m4a_seam::anon_read_path_ok(req.method().as_str(), path) {
+                return MatrixError::unauthorized("anonymous read is limited to public read-only paths").into_response();
+            }
+            req.headers_mut().insert(RESOLVED_HEADER, HeaderValue::from_static("-1|anon|0"));
+        }
         return next.run(req).await;
     };
     let method = req.method().as_str().to_string();

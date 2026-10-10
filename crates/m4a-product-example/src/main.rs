@@ -54,6 +54,7 @@ async fn run() -> Result<(), String> {
         events,
         admin_token: opt("M4A_PRODUCT_ADMIN_TOKEN").unwrap_or_default(),
         doors,
+        anon_read: opt("M4A_PRODUCT_ANON_READ").is_some_and(|v| v.eq_ignore_ascii_case("on")),
     });
     let listener = tokio::net::TcpListener::bind(&bind).await.map_err(|e| format!("bind {bind}: {e}"))?;
     eprintln!("m4a-product-example listening on {bind}");

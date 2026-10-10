@@ -67,6 +67,16 @@ impl EdgeLink {
     /// Forward `req` to the edge, asserting `who` when given. Any client-supplied
     /// `authorization`, assertion or hand-over header is dropped first.
     pub async fn forward(&self, who: Option<&AuthUser>, req: Request) -> Response {
+        self.forward_inner(who, false, req).await
+    }
+
+    /// Forward an unauthenticated request in the marked read-only mode: no assertion,
+    /// `x-m4a-anon-read: 1`. The caller must have checked [`m4a_seam::anon_read_path_ok`].
+    pub async fn forward_anon(&self, req: Request) -> Response {
+        self.forward_inner(None, true, req).await
+    }
+
+    async fn forward_inner(&self, who: Option<&AuthUser>, anon: bool, req: Request) -> Response {
         let (parts, body) = req.into_parts();
         let Ok(bytes) = to_bytes(body, MAX_BODY).await else { return plain(StatusCode::PAYLOAD_TOO_LARGE, "body too large") };
         let raw = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/").to_string();
@@ -79,6 +89,9 @@ impl EdgeLink {
         }
         if let Some(t) = &self.link_token {
             rb = rb.header(m4a_seam::LINK_TOKEN_HEADER, t);
+        }
+        if anon && who.is_none() {
+            rb = rb.header(m4a_seam::ANON_READ_HEADER, "1");
         }
         if let Some(w) = who {
             rb = rb.header(self.assertion_header.as_str(), self.assertion_for(w, parts.method.as_str(), &core_path));
@@ -123,7 +136,7 @@ fn forwardable(h: &HeaderMap, assertion_header: &str) -> Vec<(HeaderName, Header
     h.iter()
         .filter(|(k, _)| {
             let k = k.as_str();
-            !matches!(k, "host" | "content-length" | "connection" | "transfer-encoding" | "upgrade" | "authorization" | "x-m4a-resolved" | "keep-alive" | m4a_seam::LINK_TOKEN_HEADER) && k != assertion_header
+            !matches!(k, "host" | "content-length" | "connection" | "transfer-encoding" | "upgrade" | "authorization" | "x-m4a-resolved" | "keep-alive" | m4a_seam::LINK_TOKEN_HEADER) && k != assertion_header && k != m4a_seam::ANON_READ_HEADER
         })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()

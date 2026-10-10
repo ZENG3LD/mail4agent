@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
+use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
 use futures_util::{SinkExt, StreamExt};
@@ -27,7 +28,10 @@ async fn push_socket(
 ) -> axum::response::Response {
     // A handshake vouched for by a signed assertion registers by the verified
     // identity: no token frame is needed or read.
-    let verified = super::identity::read_resolved(&headers).map(|(uid, _, _)| uid);
+    let verified = super::identity::read_resolved(&headers).map(|(uid, _, _)| uid).filter(|uid| *uid > 0);
+    if super::identity::read_resolved(&headers).is_some() && verified.is_none() {
+        return axum::http::StatusCode::UNAUTHORIZED.into_response();
+    }
     ws.max_message_size(64 * 1024)
         .max_frame_size(64 * 1024)
         .on_upgrade(move |socket| run_push(socket, state, verified))

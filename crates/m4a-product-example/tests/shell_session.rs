@@ -42,6 +42,7 @@ async fn product() -> String {
         link,
         admin_token: String::new(),
         doors: vec![],
+        anon_read: false,
     });
     format!("http://{}", serve(router(app)).await)
 }

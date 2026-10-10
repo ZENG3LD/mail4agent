@@ -66,6 +66,30 @@ pub fn link_path_is_open(path: &str) -> bool {
         || path == "/client/versions"
 }
 
+/// Marker a product puts on an unauthenticated, read-only forward (no assertion). The core
+/// honours it only when anonymous read is switched on (`M4A_ANON_READ=on`), only for `GET`,
+/// and only for the paths of [`anon_read_path_ok`].
+pub const ANON_READ_HEADER: &str = "x-m4a-anon-read";
+
+/// Anonymous read allowlist: `GET`s that answer from public, world-readable data only. `path`
+/// may carry a query string and the `/_matrix` prefix.
+pub fn anon_read_path_ok(method: &str, path: &str) -> bool {
+    if method != "GET" {
+        return false;
+    }
+    let p = path.split('?').next().unwrap_or("");
+    let p = p.strip_prefix("/_matrix").filter(|r| r.starts_with('/')).unwrap_or(p);
+    if matches!(p, "/client/versions" | "/client/v3/publicRooms") || p.starts_with("/client/v3/directory/room/") {
+        return true;
+    }
+    if let Some(rest) = p.strip_prefix("/client/v3/rooms/").or_else(|| p.strip_prefix("/client/v1/rooms/")) {
+        let mut it = rest.splitn(2, '/');
+        let (room, tail) = (it.next().unwrap_or(""), it.next().unwrap_or(""));
+        return !room.is_empty() && (tail == "messages" || tail == "hierarchy" || tail == "state" || tail.starts_with("state/") || tail.starts_with("event/"));
+    }
+    false
+}
+
 /// Constant-time comparison of a presented barrier token with the expected one.
 pub fn link_token_ok(presented: Option<&str>, expected: &str) -> bool {
     match presented {
@@ -237,6 +261,15 @@ mod tests {
         assert!(!link_token_ok(Some("abcdefgX"), "abcdefgh") && !link_token_ok(Some("abc"), "abcdefgh") && !link_token_ok(None, "abcdefgh"));
         assert!(link_path_is_open("/_matrix/federation/v1/send/1") && link_path_is_open("/.well-known/matrix/server") && link_path_is_open("/edge/healthz"));
         assert!(!link_path_is_open("/_matrix/client/v3/sync") && !link_path_is_open("/client/v3/push"));
+    }
+
+    #[test]
+    fn anon_read_allowlist_is_get_only_and_public_data_only() {
+        assert!(anon_read_path_ok("GET", "/_matrix/client/v3/rooms/!r:x/messages?dir=b"));
+        assert!(anon_read_path_ok("GET", "/client/v3/publicRooms") && anon_read_path_ok("GET", "/client/v3/rooms/!r:x/state/m.room.name/"));
+        assert!(!anon_read_path_ok("POST", "/client/v3/publicRooms") && !anon_read_path_ok("GET", "/client/v3/sync"));
+        assert!(!anon_read_path_ok("GET", "/client/v3/rooms/!r:x/members") && !anon_read_path_ok("GET", "/client/v3/account/whoami"));
+        assert!(!anon_read_path_ok("GET", "/client/v3/rooms//messages"));
     }
 
     #[test]

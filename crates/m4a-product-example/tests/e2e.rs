@@ -58,6 +58,7 @@ async fn stack_with(unix_dir: Option<&std::path::Path>) -> Stack {
     mail4agent_server::store::create_matrix_schema(&conn).unwrap();
     mail4agent_server::keys::create_matrix_keys_schema(&conn).unwrap();
     let core = Arc::new(Homeserver::new(conn));
+    let _ = core.anon_read.set(());
     let _ = core.seam.set(Arc::new(Seam::new(vec![SEAM_SECRET.to_vec()], 30, None, None)));
     let core_app = require_edge_secret(mail4agent_server::http::router(core.clone()), EDGE_SECRET.to_string());
     let (core_url, edge_url) = match unix_dir {
@@ -82,6 +83,7 @@ async fn stack_with(unix_dir: Option<&std::path::Path>) -> Stack {
         link,
         admin_token: ADMIN.into(),
         doors: vec![Arc::new(FakeDoor)],
+        anon_read: true,
     });
     let product = format!("http://{}", serve(router(app)).await);
     Stack { edge: edge_url, core, product, c: reqwest::Client::new() }
@@ -316,4 +318,39 @@ async fn unix_sockets_carry_product_to_edge_to_core_including_the_push_socket() 
     let r = c.get("http://edge.local/_matrix/client/v3/capabilities").send().await.unwrap();
     assert_eq!(r.status().as_u16(), 401);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn anonymous_read_serves_public_rooms_only_and_never_writes() {
+    let s = stack().await;
+    let (_, tok) = s.register().await;
+    // A public channel with one plaintext post, and a private room with one encrypted event.
+    let (_, ch) = s.post("/_matrix/client/v3/createRoom", Some(&tok), json!({"visibility":"public","name":"open"})).await;
+    let chan = ch["room_id"].as_str().unwrap().to_string();
+    let (st, b) = s.send("PUT", &format!("/_matrix/client/v3/rooms/{chan}/send/m.room.message/a1"), Some(&tok), Some(json!({"msgtype":"m.text","body":"hello world"}))).await;
+    assert_eq!(st, 200, "{b}");
+    let (_, pr) = s.post("/_matrix/client/v3/createRoom", Some(&tok), json!({"preset":"private_chat","name":"closed"})).await;
+    let closed = pr["room_id"].as_str().unwrap().to_string();
+    // No token at all.
+    let (st, b) = s.send("GET", &format!("/_matrix/client/v3/rooms/{chan}/messages?dir=b"), None, None).await;
+    assert_eq!(st, 200, "{b}");
+    assert!(b["chunk"].to_string().contains("hello world"), "{b}");
+    let (st, _) = s.send("GET", "/_matrix/client/v3/publicRooms", None, None).await;
+    assert_eq!(st, 200);
+    // Closed rooms stay closed to anonymous readers.
+    let (st, _) = s.send("GET", &format!("/_matrix/client/v3/rooms/{closed}/messages?dir=b"), None, None).await;
+    assert_eq!(st, 403);
+    // Anonymous writes and non-allowlisted reads never reach the core with an identity.
+    let (st, _) = s.send("PUT", &format!("/_matrix/client/v3/rooms/{chan}/send/m.room.message/a2"), None, Some(json!({"msgtype":"m.text","body":"x"}))).await;
+    assert_eq!(st, 401);
+    let (st, _) = s.send("GET", "/_matrix/client/v3/sync", None, None).await;
+    assert_eq!(st, 401);
+    let (st, _) = s.send("GET", "/_matrix/client/v3/account/whoami", None, None).await;
+    assert_eq!(st, 401);
+    // The core refuses the marker itself outside the allowlist, even from a holder of the link token.
+    let r = s.c.get(format!("{}/_matrix/client/v3/account/whoami", s.edge)).header("x-m4a-link-token", LINK).header("x-m4a-anon-read", "1").send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 401);
+    // A user's token is not downgraded: an authenticated read still sees its own membership.
+    let (st, b) = s.send("GET", &format!("/_matrix/client/v3/rooms/{closed}/messages?dir=b"), Some(&tok), None).await;
+    assert_eq!(st, 200, "{b}");
 }

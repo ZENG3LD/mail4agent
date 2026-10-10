@@ -57,6 +57,8 @@ pub struct Homeserver {
     pub federation_enabled: std::sync::OnceLock<()>,
     /// Origins allowed to call federation routes; unset = any origin that proves its keys.
     pub federation_allow: std::sync::OnceLock<Vec<String>>,
+    /// Set (`M4A_ANON_READ=on`) to honour the product's marked, assertion-less read-only forwards.
+    pub anon_read: std::sync::OnceLock<()>,
     /// How remote servers' signing keys are fetched; unset = no remote verification.
     pub key_fetcher: std::sync::OnceLock<Arc<dyn crate::federation::RemoteKeys>>,
     /// Outgoing federation transport; unset = no outgoing federation.
@@ -81,6 +83,7 @@ impl Homeserver {
             federation_delegate: std::sync::OnceLock::new(),
             federation_enabled: std::sync::OnceLock::new(),
             federation_allow: std::sync::OnceLock::new(),
+            anon_read: std::sync::OnceLock::new(),
             key_fetcher: std::sync::OnceLock::new(),
             fed_transport: std::sync::OnceLock::new(),
             fed_notify: tokio::sync::Notify::new(),
@@ -122,6 +125,10 @@ pub async fn resolve_caller(
     query_token: Option<&str>,
 ) -> Result<Caller, MatrixError> {
     if let Some((user_id, device_id, claims)) = identity::read_resolved(headers) {
+        if user_id == identity::ANON_USER {
+            // Anonymous read-only caller: no row, no device; only public data answers.
+            return Ok(Caller { user_id, mxid: String::new(), device_id: String::new(), claims });
+        }
         let state = Arc::clone(state);
         return tokio::task::spawn_blocking(move || -> Result<Caller, MatrixError> {
             let conn = state.conn.lock().unwrap_or_else(|e| e.into_inner());
