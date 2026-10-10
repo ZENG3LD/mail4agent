@@ -34,6 +34,7 @@ mod messaging;
 mod rooms;
 mod push;
 mod sync;
+mod sliding;
 pub mod identity;
 
 pub struct Caller {
@@ -238,6 +239,7 @@ pub fn router(state: Arc<Homeserver>) -> Router {
         .merge(ephemeral::routes())
         .merge(account::routes())
         .merge(extras::routes())
+        .merge(sliding::routes())
                 .merge(keys::routes())
         .merge(sync::routes())
         .merge(push::routes())
@@ -268,7 +270,7 @@ const SPEC_VERSIONS: [&str; 19] = ["v1.1", "v1.2", "v1.3", "v1.4", "v1.5", "v1.6
 async fn versions() -> impl IntoResponse {
     Json(serde_json::json!({
         "versions": SPEC_VERSIONS,
-        "unstable_features": {},
+        "unstable_features": { "org.matrix.simplified_msc3575": true, "org.matrix.msc4186": true },
     }))
 }
 

@@ -148,3 +148,55 @@ fn an_alias_resolves_across_servers_and_a_remote_profile_is_fetched() {
     let (st, v) = b.call(&c, "POST", &format!("/client/v3/join/{}", enc(alias)), Some(json!({})));
     assert_eq!((st, v["room_id"].as_str()), (200, Some(room.as_str())), "join by a remote alias: {v}");
 }
+
+#[test]
+fn simplified_sliding_sync_lists_rooms_sends_deltas_and_shows_invites() {
+    let a = start_node("a.example", "alice", free_port(), &[]);
+    let c = Client::builder().timeout(Duration::from_secs(20)).build().unwrap();
+    let pr = support_product::Product { url: a.purl.clone() };
+    let bob_tok = support_product::product_user(&pr, "bob");
+    let bob = |m: &str, p: &str, b: Option<Value>| call_as(&a, &c, &bob_tok, m, p, b);
+    let alice = |m: &str, p: &str, b: Option<Value>| call_as(&a, &c, &a.token, m, p, b);
+    let bob_id = bob("GET", "/client/v3/account/whoami", None).1["user_id"].as_str().unwrap().to_string();
+    let (_, v) = alice("POST", "/client/v3/createRoom", Some(json!({"name":"general","visibility":"public"})));
+    let chan = v["room_id"].as_str().unwrap().to_string();
+    alice("PUT", &format!("/client/v3/rooms/{}/send/m.room.message/a", enc(&chan)), Some(json!({"msgtype":"m.text","body":"first"})));
+    let (_, v) = alice("POST", "/client/v3/createRoom", Some(json!({"name":"team","visibility":"private"})));
+    let group = v["room_id"].as_str().unwrap().to_string();
+
+    let path = "/client/unstable/org.matrix.simplified_msc3575/sync";
+    let req = json!({
+        "conn_id": "main",
+        "lists": { "all": { "ranges": [[0, 9]], "timeline_limit": 5, "required_state": [["m.room.name", ""], ["m.room.member", "$ME"]] } },
+        "extensions": { "to_device": {"enabled": true}, "e2ee": {"enabled": true}, "account_data": {"enabled": true} }
+    });
+    let (st, first) = alice("POST", path, Some(req.clone()));
+    assert_eq!(st, 200, "{first}");
+    assert_eq!(first["lists"]["all"]["count"], 2);
+    assert_eq!(first["rooms"][&chan]["initial"], true);
+    assert_eq!(first["rooms"][&chan]["name"], "general");
+    assert!(first["rooms"][&chan]["timeline"].as_array().unwrap().iter().any(|e| e["content"]["body"] == "first"));
+    assert!(first["rooms"][&group]["required_state"].as_array().unwrap().iter().any(|e| e["type"] == "m.room.member"));
+    assert!(first["extensions"]["e2ee"]["device_one_time_keys_count"].is_object());
+    let pos = first["pos"].as_str().unwrap().to_string();
+
+    // A new message arrives as a delta for that room only.
+    alice("PUT", &format!("/client/v3/rooms/{}/send/m.room.message/b", enc(&chan)), Some(json!({"msgtype":"m.text","body":"second"})));
+    let (_, d) = alice("POST", &format!("{path}?pos={pos}&timeout=1000"), Some(req.clone()));
+    assert_eq!(d["rooms"][&chan]["initial"], false, "{d}");
+    assert!(d["rooms"][&chan]["timeline"].as_array().unwrap().iter().any(|e| e["content"]["body"] == "second"));
+    assert!(d["rooms"].get(&group).is_none(), "an unchanged room is not repeated: {d}");
+
+    // A long poll with nothing new returns empty after the timeout.
+    let pos2 = d["pos"].as_str().unwrap().to_string();
+    let (_, e) = alice("POST", &format!("{path}?pos={pos2}&timeout=300"), Some(req.clone()));
+    assert!(e["rooms"].as_object().unwrap().is_empty(), "{e}");
+
+    // An invite shows up for the invitee with its stripped state; the is_invite filter sees only it.
+    alice("POST", &format!("/client/v3/rooms/{}/invite", enc(&group)), Some(json!({"user_id": bob_id})));
+    let breq = json!({ "lists": { "invites": { "ranges": [[0, 9]], "filters": {"is_invite": true}, "timeline_limit": 1, "required_state": [] } } });
+    let (st, b) = bob("POST", path, Some(breq));
+    assert_eq!(st, 200, "{b}");
+    assert_eq!(b["lists"]["invites"]["count"], 1);
+    assert!(b["rooms"][&group]["invite_state"].as_array().is_some_and(|a| !a.is_empty()), "{b}");
+}
