@@ -395,4 +395,22 @@ fn media_presence_and_user_lookup_work_with_synapse() {
     assert_eq!(st, 200, "{v}");
     assert_eq!((v["results"][0]["user_id"].as_str(), v["results"][0]["display_name"].as_str()), (Some(syn_user.as_str()), Some("Syn Display")), "{v}");
     let _ = our_name;
+
+    // Declining an invite: we invite Synapse's user to a closed room; Synapse refuses through
+    // make_leave / send_leave on our server, and we show them as having left.
+    let (st, v) = ours.call(plain, "POST", "/client/v3/createRoom", Some(json!({"visibility":"private","name":"declined","invite":[syn_user]})));
+    assert_eq!(st, 200, "{v}");
+    let ours_room = v["room_id"].as_str().unwrap().to_string();
+    // Synapse caches identical sync requests for two minutes: vary the timeout on every try.
+    let mut n = 0;
+    poll("synapse has the invite", || {
+        n += 1;
+        env.syn("GET", &format!("/sync?timeout={n}"), None).1["rooms"]["invite"].get(&ours_room).map(|_| ())
+    });
+    let (st, v) = env.syn("POST", &format!("/rooms/{}/leave", enc(&ours_room)), Some(json!({})));
+    assert_eq!(st, 200, "{v}\n{}", env.log_tail());
+    poll("we show the invitee as left", || {
+        let (_, m) = ours.call(plain, "GET", &format!("/client/v3/rooms/{}/members?membership=leave", enc(&ours_room)), None);
+        m["chunk"].as_array()?.iter().any(|e| e["state_key"] == syn_user.as_str()).then_some(())
+    });
 }
