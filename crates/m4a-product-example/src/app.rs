@@ -106,6 +106,10 @@ pub fn router(app: App) -> Router {
         .route("/product/v1/login", post(login))
         .route("/client/v3/login", get(matrix_login_flows).post(matrix_login))
         .route("/_matrix/client/v3/login", get(matrix_login_flows).post(matrix_login))
+        .route("/client/v3/register", post(matrix_register))
+        .route("/_matrix/client/v3/register", post(matrix_register))
+        .route("/client/v3/register/available", get(matrix_available))
+        .route("/_matrix/client/v3/register/available", get(matrix_available))
         .route("/product/v1/doors", get(doors))
         .route("/product/v1/login/door/{id}", post(door_login))
         .route("/product/v1/logout", post(logout))
@@ -147,8 +151,13 @@ async fn matrix_login(State(app): State<App>, Json(body): Json<Value>) -> Result
     let pw = body.get("password").and_then(Value::as_str).unwrap_or("").to_string();
     let Json(sess) = login(State(app.clone()), Json(json!({ "nick": nick, "password": pw }))).await?;
     let token = sess["token"].as_str().unwrap_or_default().to_string();
+    matrix_session(&app, token).await
+}
+
+/// The Matrix login answer for a product session token: user and device ids come from the messenger.
+async fn matrix_session(app: &App, token: String) -> Result<Json<Value>, ApiError> {
     let t2 = token.clone();
-    let who = blk(&app, move |a| a.users.authenticate(&t2)).await??.ok_or_else(|| err(StatusCode::FORBIDDEN, "M_FORBIDDEN", "invalid credentials"))?;
+    let who = blk(app, move |a| a.users.authenticate(&t2)).await??.ok_or_else(|| err(StatusCode::FORBIDDEN, "M_FORBIDDEN", "invalid credentials"))?;
     let req = Request::builder().method("GET").uri("/client/v3/account/whoami").body(axum::body::Body::empty()).map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "M_UNKNOWN", "request"))?;
     let resp = app.link.forward(Some(&who), req).await;
     let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16).await.map_err(|_| err(StatusCode::BAD_GATEWAY, "M_UNKNOWN", "messenger unavailable"))?;
@@ -156,6 +165,51 @@ async fn matrix_login(State(app): State<App>, Json(body): Json<Value>) -> Result
     let user_id = w["user_id"].as_str().ok_or_else(|| err(StatusCode::BAD_GATEWAY, "M_UNKNOWN", "messenger refused the session"))?.to_string();
     let home = user_id.split_once(':').map(|(_, d)| d.to_string()).unwrap_or_default();
     Ok(Json(json!({ "user_id": user_id, "access_token": token, "device_id": w["device_id"], "home_server": home })))
+}
+
+/// Matrix `register` on the product: the username becomes the nick, one dummy auth stage.
+async fn matrix_register(State(app): State<App>, Json(body): Json<Value>) -> Result<Response, ApiError> {
+    if body.pointer("/auth/type").and_then(Value::as_str) != Some("m.login.dummy") {
+        let v = json!({ "flows": [{ "stages": ["m.login.dummy"] }], "params": {}, "session": "register" });
+        return Ok((StatusCode::UNAUTHORIZED, Json(v)).into_response());
+    }
+    let username = body.get("username").and_then(Value::as_str).unwrap_or("").to_string();
+    if username.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "M_INVALID_USERNAME", "a username is required"));
+    }
+    let taken = {
+        let n = username.clone();
+        blk(&app, move |a| -> Result<_, ServiceError> { Ok(a.users.store.user_by_nick(&n)?) }).await??.is_some()
+    };
+    if taken {
+        return Err(err(StatusCode::BAD_REQUEST, "M_USER_IN_USE", "that username is taken"));
+    }
+    let Json(sess) = register(State(app.clone()), Json(json!({ "password": body.get("password").cloned().unwrap_or_default() }))).await?;
+    let token = sess["token"].as_str().unwrap_or_default().to_string();
+    let (t2, nick) = (token.clone(), username.clone());
+    let who = blk(&app, move |a| a.users.authenticate(&t2)).await??.ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "M_UNKNOWN", "session"))?;
+    let (u, evs) = blk(&app, move |a| -> Result<_, ServiceError> {
+        let u = a.users.store.user_by_nick(&who.nick)?.ok_or(ServiceError::Unauthorized)?;
+        a.users.set_nick(&u, &nick, now_ms())
+    })
+    .await??;
+    let _ = u;
+    app.events.publish(evs);
+    if body.get("inhibit_login").and_then(Value::as_bool) == Some(true) {
+        return Ok(Json(json!({ "user_id": username })).into_response());
+    }
+    Ok(matrix_session(&app, token).await?.into_response())
+}
+
+async fn matrix_available(State(app): State<App>, axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>) -> Result<Json<Value>, ApiError> {
+    let n = q.get("username").cloned().unwrap_or_default();
+    if n.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "M_INVALID_USERNAME", "a username is required"));
+    }
+    if blk(&app, move |a| -> Result<_, ServiceError> { Ok(a.users.store.user_by_nick(&n)?) }).await??.is_some() {
+        return Err(err(StatusCode::BAD_REQUEST, "M_USER_IN_USE", "that username is taken"));
+    }
+    Ok(Json(json!({ "available": true })))
 }
 
 async fn register(State(app): State<App>, Json(body): Json<Value>) -> Result<Json<Value>, ApiError> {
