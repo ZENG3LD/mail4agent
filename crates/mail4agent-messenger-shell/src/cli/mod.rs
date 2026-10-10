@@ -13,9 +13,11 @@
 //! | `send`                 | `m4a-send`                 |
 //! | `mail`                 | `m4a`                      |
 //! | `ensure-agent-webhooks`| `m4a-ensure-agent-webhooks`|
+//! | `enroll`               | —                          |
 
 #[cfg(feature = "wake-claude")]
 pub mod claude_channel;
+pub mod enroll;
 pub mod ensure_agent_webhooks;
 #[cfg(feature = "wake-grok")]
 pub mod grok_listen;
@@ -27,7 +29,7 @@ pub mod send;
 pub mod web_client;
 
 /// The subcommand names, in the order of the table above.
-pub const COMMANDS: &[&str] = &["web-client", "node-client", "grok-listen", "claude-channel", "inbox", "send", "mail", "ensure-agent-webhooks"];
+pub const COMMANDS: &[&str] = &["web-client", "node-client", "grok-listen", "claude-channel", "inbox", "send", "mail", "ensure-agent-webhooks", "enroll"];
 
 /// Runs `command` with its arguments. `Err` names an unknown command (or one this build lacks).
 pub fn dispatch(command: &str, args: Vec<String>) -> Result<(), String> {
@@ -45,6 +47,7 @@ pub fn dispatch(command: &str, args: Vec<String>) -> Result<(), String> {
         "send" => send::run(args),
         "mail" => mail::run(args),
         "ensure-agent-webhooks" => ensure_agent_webhooks::run(args),
+        "enroll" => enroll::run(args),
         other => return Err(format!("unknown command {other:?}; commands: {}", COMMANDS.join(", "))),
     }
     Ok(())
@@ -58,5 +61,10 @@ mod tests {
     fn an_unknown_command_is_named_not_run() {
         let e = dispatch("nope", vec![]).unwrap_err();
         assert!(e.contains("nope") && e.contains("web-client") && e.contains("mail"));
+    }
+
+    #[test]
+    fn enroll_is_a_command() {
+        assert!(COMMANDS.contains(&"enroll"));
     }
 }
