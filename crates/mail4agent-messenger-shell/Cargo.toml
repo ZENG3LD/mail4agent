@@ -50,6 +50,10 @@ tungstenite = { version = "0.29", default-features = false, features = ["handsha
 rusqlite = "0.32"
 
 [[bin]]
+name = "m4a-agent"
+path = "src/bin/m4a_agent.rs"
+
+[[bin]]
 name = "m4a-ensure-agent-webhooks"
 path = "src/bin/ensure_agent_webhooks.rs"
 

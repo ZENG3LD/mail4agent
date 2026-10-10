@@ -64,6 +64,7 @@
 //! built; it is not either of those open paths and it does not read a wake
 //! from the environment.
 
+pub mod cli;
 mod cmd;
 mod grok_listen;
 mod ipc;
