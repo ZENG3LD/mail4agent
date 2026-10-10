@@ -68,6 +68,11 @@ mod cmd;
 mod grok_listen;
 mod ipc;
 mod machine;
+#[cfg(feature = "local-bus")]
+mod local_bus;
+#[cfg(not(feature = "local-bus"))]
+#[path = "local_bus_off.rs"]
+mod local_bus;
 mod nick;
 mod node;
 pub mod provider;
@@ -186,6 +191,7 @@ pub enum ProductSecret {
 /// password and no token the agent could be handed; `invite` is the operator's one-time code,
 /// needed only until the identity is enrolled.
 #[derive(Clone)]
+#[cfg_attr(not(any(feature = "tier-server", feature = "tier-matrix")), allow(dead_code))]
 struct IdentityAuth {
     tier: m4a_agent::BackendKind,
     invite: Option<Zeroizing<String>>,
@@ -2371,6 +2377,7 @@ fn product_session(config: &SessionConfig, auth: &ProductAuth) -> Result<Registe
 }
 
 /// Identity mode: the client's own identity logs in by signature (enrolling first when it has to).
+#[cfg(any(feature = "tier-server", feature = "tier-matrix"))]
 fn identity_session(config: &SessionConfig, auth: &IdentityAuth) -> Result<RegisteredSession, ShellError> {
     use m4a_agent::Backend;
     let fail = |e: m4a_agent::AgentError| ShellError::Register(clip_public(e.to_string()));
@@ -2415,6 +2422,11 @@ fn identity_session(config: &SessionConfig, auth: &IdentityAuth) -> Result<Regis
         return Err(ShellError::Register("whoami missed an id".into()));
     }
     Ok(RegisteredSession { user_id, device_id: DeviceId::parse(&device_raw)?, bearer: session.token.clone(), nick: Some(session.nick), base_url: Some(base) })
+}
+
+#[cfg(not(any(feature = "tier-server", feature = "tier-matrix")))]
+fn identity_session(_: &SessionConfig, _: &IdentityAuth) -> Result<RegisteredSession, ShellError> {
+    Err(ShellError::Register("this build has no tier for identity login".into()))
 }
 
 fn register_session(config: &SessionConfig) -> Result<RegisteredSession, ShellError> {
