@@ -52,6 +52,15 @@
 //! [`MachineClient::tick`] is that loop step; the `m4a-web-client` binary
 //! runs it.
 //!
+//! Wake without a gateway agent. A session record may name `routine_file`, a path to a file of mode
+//! 0600 that the owner placed and that holds `{"url": "...", "key": "..."}`, the routine's webhook.
+//! The client reads it itself when it opens; the URL and the key are not logged, not shown in
+//! `Debug`, and never given to the agent, and a file that others can read is refused. The record
+//! itself cannot carry a URL or a key. A session with an `agent_id` and a gateway
+//! (`M4A_GATEWAY_FILE`, `{"port","scheme","token"}`) still gets its webhook created and read
+//! through the gateway as before; the gateway needs the Grok Bot agent id and is not used without
+//! one. A session with neither has no wake: its mail arrives and is read on demand.
+//!
 //! Session bearers. Each session logs in by signature with its own vaulted identity; the
 //! bearer lives in memory only and is never stored or handed in.
 
@@ -118,6 +127,9 @@ pub struct HostSession {
     /// The operator's one-time invite code, needed only until this session's identity is
     /// enrolled. Read by the client, never given to the agent.
     pub invite: Option<String>,
+    /// Path of an owner-placed file (mode 0600) with the routine's webhook `{"url","key"}`. The
+    /// client reads it itself at open; the values never go to the agent or the log.
+    pub routine_file: Option<PathBuf>,
     /// `server` tier (default) or `matrix`.
     pub tier: m4a_agent::BackendKind,
 }
@@ -132,12 +144,19 @@ impl HostSession {
             routine_url: None,
             routine_bearer: None,
             invite: None,
+            routine_file: None,
             tier: m4a_agent::BackendKind::Server,
         }
     }
 
+    /// A routine webhook the owner put in a file (see [`Self::routine_file`]).
+    pub fn with_routine_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.routine_file = Some(path.into());
+        self
+    }
+
     pub(crate) fn config(&self, url: &str, store_root: &Path) -> Result<SessionConfig, ShellError> {
-        SessionConfig::new_identity(url, self.tier, &self.session_id, store_root, self.invite.clone())
+        Ok(SessionConfig::new_identity(url, self.tier, &self.session_id, store_root, self.invite.clone())?.with_nick_request(&self.bot_name))
     }
 
     /// The operator's invite for this session's first login.
@@ -184,6 +203,10 @@ struct SessionFile {
     /// Grok Bot agent id. Missing or blank skips routine creation.
     #[serde(default)]
     agent_id: Option<String>,
+    /// Path of a file (mode 0600) that holds the routine's webhook `{"url","key"}`. Only the path
+    /// is in the record; the secret is in the file, which the owner places.
+    #[serde(default)]
+    routine_file: Option<String>,
 }
 
 /// Reads `*.json` session records from `dir`. A file that carries anything
@@ -221,6 +244,7 @@ pub fn load_session_records(dir: &Path) -> Result<Vec<HostSession>, ShellError> 
             .agent_id
             .map(|id| id.trim().to_string())
             .filter(|id| !id.is_empty());
+        session.routine_file = file.routine_file.map(|p| PathBuf::from(p.trim())).filter(|p| !p.as_os_str().is_empty());
         out.push(session);
     }
     Ok(out)
@@ -925,6 +949,53 @@ fn attach_webhook_routines(
     Ok(())
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoutineFile {
+    url: String,
+    key: String,
+}
+
+/// Reads the owner-placed routine file. The error text names the problem, never a value.
+fn read_routine_file(path: &Path) -> Result<(String, String), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(path).map_err(|_| "the routine file cannot be read".to_string())?;
+        if meta.permissions().mode() & 0o077 != 0 {
+            return Err("the routine file must be mode 0600 (owner only)".to_string());
+        }
+    }
+    let text = std::fs::read_to_string(path).map_err(|_| "the routine file cannot be read".to_string())?;
+    let file: RoutineFile = serde_json::from_str(&text).map_err(|_| "the routine file is not {\"url\",\"key\"} json".to_string())?;
+    let (url, key) = (file.url.trim().to_string(), file.key.trim().to_string());
+    if key.is_empty() || !crate::webhook::url_ok(&url) {
+        return Err("the routine file has no usable url and key".to_string());
+    }
+    Ok((url, key))
+}
+
+/// Gives every session that names a `routine_file` its wake from that file. A session that already
+/// holds a URL and a bearer is left alone. A refusal is logged without values and leaves the
+/// session without a wake (messages still arrive and can be read).
+fn attach_routine_files(sessions: &mut [HostSession]) {
+    for session in sessions.iter_mut() {
+        let Some(path) = session.routine_file.clone() else { continue };
+        if session.routine_url.is_some() && session.routine_bearer.is_some() {
+            continue;
+        }
+        let label = routine_name_for(session).unwrap_or_else(|| session.session_id.clone());
+        match read_routine_file(&path) {
+            Ok((url, key)) => {
+                session.routine_url = Some(url);
+                session.routine_bearer = Some(key);
+                eprintln!("mail4agent: wake {label}: routine file read");
+            }
+            Err(reason) => eprintln!("mail4agent: wake {label}: {reason}"),
+        }
+    }
+}
+
 /// Lock file in each sealed session directory. [`MachineClient::open`]
 /// holds an exclusive lock on it for as long as the client lives, so a
 /// second process (another client, or `m4a-send` opening the store itself)
@@ -1307,6 +1378,8 @@ impl MachineClient {
         sessions: Vec<HostSession>,
         lenient: bool,
     ) -> Result<Self, ShellError> {
+        let mut sessions = sessions;
+        attach_routine_files(&mut sessions);
         if sessions.is_empty() {
             return Err(ShellError::SessionList("session list is empty".to_string()));
         }
@@ -2248,6 +2321,52 @@ fn attach_detected_chain(store: &mut OpenedStore, config: &SessionConfig, nick: 
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn a_routine_file_gives_a_session_without_an_agent_id_its_wake_and_leaks_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("dir");
+        let file = dir.path().join("wake.json");
+        let write = |text: &str, mode: u32| {
+            std::fs::write(&file, text).expect("write");
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).expect("mode");
+        };
+        let mut set = vec![HostSession::new("Courier", "web-courier").with_routine_file(&file)];
+
+        // Owner-only file with a good pair: the session gets URL and bearer.
+        write(r#"{"url":"http://127.0.0.1:9/hook","key":"k-secret"}"#, 0o600);
+        attach_routine_files(&mut set);
+        assert_eq!(set[0].routine_url.as_deref(), Some("http://127.0.0.1:9/hook"));
+        assert_eq!(set[0].routine_bearer.as_deref(), Some("k-secret"));
+        assert!(!format!("{:?}", set[0]).contains("k-secret"), "Debug must not show the key");
+
+        // A file others can read, a file of another shape, a blank key: no wake, and the error names no value.
+        for (text, mode) in [(r#"{"url":"http://127.0.0.1:9/hook","key":"k-secret"}"#, 0o644), (r#"{"url":"http://127.0.0.1:9/hook","key":"k-secret","extra":1}"#, 0o600), (r#"{"url":"http://127.0.0.1:9/hook","key":" "}"#, 0o600), (r#"{"url":"not a url","key":"k-secret"}"#, 0o600)] {
+            write(text, mode);
+            let err = read_routine_file(&file).expect_err("refused");
+            assert!(!err.contains("k-secret") && !err.contains("127.0.0.1"), "{err}");
+            let mut one = vec![HostSession::new("Courier", "web-courier").with_routine_file(&file)];
+            attach_routine_files(&mut one);
+            assert!(one[0].routine_url.is_none() && one[0].routine_bearer.is_none());
+        }
+        // A session that already holds a wake keeps it.
+        write(r#"{"url":"http://127.0.0.1:9/other","key":"k2"}"#, 0o600);
+        let mut held = vec![HostSession::new("Courier", "web-courier").with_routine_file(&file).with_routine("http://127.0.0.1:9/mine", Some("mine".into()))];
+        attach_routine_files(&mut held);
+        assert_eq!(held[0].routine_url.as_deref(), Some("http://127.0.0.1:9/mine"));
+    }
+
+    #[test]
+    fn a_session_record_may_name_a_routine_file_but_never_carry_the_secret() {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(dir.path().join("a.json"), r#"{"bot_name":"Courier","session_id":"web-courier","routine_file":"/some/where/wake.json"}"#).expect("write");
+        let loaded = load_session_records(dir.path()).expect("records");
+        assert_eq!(loaded[0].routine_file.as_deref(), Some(Path::new("/some/where/wake.json")));
+        assert!(loaded[0].routine_url.is_none());
+        std::fs::write(dir.path().join("a.json"), r#"{"bot_name":"Courier","session_id":"web-courier","routine_url":"http://127.0.0.1:9/h"}"#).expect("write");
+        assert!(load_session_records(dir.path()).is_err(), "a URL in the record is still refused");
+    }
+
     use super::*;
 
     #[test]

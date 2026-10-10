@@ -99,6 +99,21 @@ pub trait UserStore: Send + Sync {
     fn take_invite(&self, _code_hash: &str, _now_ms: i64) -> StoreResult<Option<User>> {
         Err(StoreError::Backend("this store does not support key login".into()))
     }
+    /// [`Self::create_invite`] that also records whether the operator reserved the nick (`true`) or
+    /// left it a placeholder that the enrolling client may replace by asking for its own. A store
+    /// that does not record it treats every invite as reserved: no rename.
+    fn create_invite_with(&self, code_hash: &str, user_id: i64, expires_ms: i64, _reserved: bool) -> StoreResult<()> {
+        self.create_invite(code_hash, user_id, expires_ms)
+    }
+    /// The invite's user and its reserved flag without consuming it; `None` when it does not exist,
+    /// has expired, or the store cannot look without consuming.
+    fn peek_invite(&self, _code_hash: &str, _now_ms: i64) -> StoreResult<Option<(User, bool)>> {
+        Ok(None)
+    }
+    /// [`Self::take_invite`] with the reserved flag.
+    fn take_invite_with(&self, code_hash: &str, now_ms: i64) -> StoreResult<Option<(User, bool)>> {
+        Ok(self.take_invite(code_hash, now_ms)?.map(|u| (u, true)))
+    }
     /// Binds a public key (base64url) to a user. `key_id` is also the key credential's reference.
     fn add_key(&self, _user_id: i64, _key_id: &str, _public_key: &str, _label: &str, _now_ms: i64) -> StoreResult<()> {
         Err(StoreError::Backend("this store does not support key login".into()))

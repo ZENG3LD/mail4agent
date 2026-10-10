@@ -78,6 +78,11 @@ impl SqliteStore {
                     c.execute_batch(&format!("ALTER TABLE credentials ADD COLUMN {col} {ty}"))?;
                 }
             }
+            // Invites made before nick requests: every one of them reserved its nick.
+            let have: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('invites') WHERE name = 'reserved'", [], |r| r.get::<_, i64>(0)).map(|n| n > 0)?;
+            if !have {
+                c.execute_batch("ALTER TABLE invites ADD COLUMN reserved INTEGER NOT NULL DEFAULT 1")?;
+            }
             Ok(())
         })
         .map_err(|e| e.to_string())?;
@@ -231,13 +236,32 @@ impl UserStore for SqliteStore {
     fn create_invite(&self, code_hash: &str, user_id: i64, expires_ms: i64) -> StoreResult<()> {
         self.with(|c| c.execute("INSERT INTO invites (code_hash, user_id, expires_ms) VALUES (?1, ?2, ?3)", params![code_hash, user_id, expires_ms]).map_err(be).map(|_| ()))
     }
+    fn create_invite_with(&self, code_hash: &str, user_id: i64, expires_ms: i64, reserved: bool) -> StoreResult<()> {
+        self.with(|c| {
+            c.execute("INSERT OR REPLACE INTO invites (code_hash, user_id, expires_ms, reserved) VALUES (?1, ?2, ?3, ?4)", params![code_hash, user_id, expires_ms, reserved as i64]).map_err(be).map(|_| ())
+        })
+    }
+    fn peek_invite(&self, code_hash: &str, now_ms: i64) -> StoreResult<Option<(User, bool)>> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT u.id, u.nick, u.tier, u.nick_changes, u.nick_changed_ms, i.reserved FROM invites i JOIN users u ON u.id = i.user_id WHERE i.code_hash = ?1 AND i.expires_ms > ?2",
+                params![code_hash, now_ms],
+                |r| Ok((user(r)?, r.get::<_, i64>(5)? != 0)),
+            )
+            .optional()
+            .map_err(be)
+        })
+    }
     fn take_invite(&self, code_hash: &str, now_ms: i64) -> StoreResult<Option<User>> {
+        Ok(self.take_invite_with(code_hash, now_ms)?.map(|(u, _)| u))
+    }
+    fn take_invite_with(&self, code_hash: &str, now_ms: i64) -> StoreResult<Option<(User, bool)>> {
         self.with(|c| {
             let found = c
                 .query_row(
-                    "SELECT u.id, u.nick, u.tier, u.nick_changes, u.nick_changed_ms FROM invites i JOIN users u ON u.id = i.user_id WHERE i.code_hash = ?1 AND i.expires_ms > ?2",
+                    "SELECT u.id, u.nick, u.tier, u.nick_changes, u.nick_changed_ms, i.reserved FROM invites i JOIN users u ON u.id = i.user_id WHERE i.code_hash = ?1 AND i.expires_ms > ?2",
                     params![code_hash, now_ms],
-                    user,
+                    |r| Ok((user(r)?, r.get::<_, i64>(5)? != 0)),
                 )
                 .optional()
                 .map_err(be)?;

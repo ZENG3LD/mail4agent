@@ -74,7 +74,7 @@ impl<S: UserStore> UserService<S> {
             None => self.create_user(None, now_ms)?,
         };
         let code = random_b64(24);
-        self.store.create_invite(&token_hash(&code), user.id, now_ms + INVITE_TTL_MS)?;
+        self.store.create_invite_with(&token_hash(&code), user.id, now_ms + INVITE_TTL_MS, nick.is_some())?;
         Ok((code, user))
     }
 
@@ -82,16 +82,69 @@ impl<S: UserStore> UserService<S> {
     /// (the signature covers the audience, the invite and the key). The key's credential is created
     /// and a session is issued; `cred_ref` is the key id, stable across logins.
     pub fn enroll(&self, audience: &str, code: &str, public_key_b64: &str, signature_b64: &str, label: &str, now_ms: i64, session_ttl_ms: i64) -> Result<(User, Session, String), ServiceError> {
+        self.enroll_with_nick(audience, code, public_key_b64, signature_b64, label, None, now_ms, session_ttl_ms)
+    }
+
+    /// [`Self::enroll`] where the client also asks for a nick (its session name). The operator's
+    /// approval is still the invite. If the operator reserved a nick in the invite and the request
+    /// differs, the enrollment is refused and the invite stays usable. If the invite carries a
+    /// placeholder, the request is checked by the nick rules and the lists, must be free, and
+    /// replaces the placeholder before the key's credential exists. An empty request asks for nothing.
+    pub fn enroll_with_nick(&self, audience: &str, code: &str, public_key_b64: &str, signature_b64: &str, label: &str, requested_nick: Option<&str>, now_ms: i64, session_ttl_ms: i64) -> Result<(User, Session, String), ServiceError> {
+        let requested = requested_nick.map(str::trim).filter(|n| !n.is_empty());
         let raw = keyproof::decode(public_key_b64).filter(|k| k.len() == 32).ok_or(ServiceError::Unauthorized)?;
         if !keyproof::verify(public_key_b64, &keyproof::enroll_message(audience, code, public_key_b64), signature_b64) {
             return Err(ServiceError::Unauthorized);
         }
         let key_id = keyproof::key_id_of(&raw);
-        let user = self.store.take_invite(&token_hash(code), now_ms)?.ok_or(ServiceError::Unauthorized)?;
+        let hash = token_hash(code);
+        // Look first where the store can: a refused request must not spend the operator's invite.
+        if let (Some(want), Some((user, reserved))) = (requested, self.store.peek_invite(&hash, now_ms)?) {
+            self.check_requested_nick(&user, reserved, want, now_ms)?;
+        }
+        let (mut user, reserved) = self.store.take_invite_with(&hash, now_ms)?.ok_or(ServiceError::Unauthorized)?;
+        if let Some(want) = requested {
+            let renamed = self.check_requested_nick(&user, reserved, want, now_ms).and_then(|rename| {
+                if rename {
+                    self.store.update_nick(user.id, want, now_ms).map_err(ServiceError::from)
+                } else {
+                    Ok(user.clone())
+                }
+            });
+            match renamed {
+                Ok(u) => user = u,
+                Err(e) => {
+                    // Give the invite back (same code, fresh lifetime): the operator approved it.
+                    let _ = self.store.create_invite_with(&hash, user.id, now_ms + INVITE_TTL_MS, reserved);
+                    return Err(e);
+                }
+            }
+        }
         let label: String = label.chars().filter(|c| !c.is_control()).take(64).collect();
         self.store.add_key(user.id, &key_id, public_key_b64, &label, now_ms)?;
         let session = self.key_session(&user, &key_id, now_ms, session_ttl_ms)?;
         Ok((user, session, key_id))
+    }
+
+    /// `Ok(true)`: replace the placeholder by `want`; `Ok(false)`: `want` is the nick the user has.
+    fn check_requested_nick(&self, user: &User, reserved: bool, want: &str, now_ms: i64) -> Result<bool, ServiceError> {
+        if want.eq_ignore_ascii_case(&user.nick) {
+            return Ok(false);
+        }
+        if reserved {
+            return Err(ServiceError::InvalidNick("the invite reserves another nick".into()));
+        }
+        crate::nick_rules::validate_nick(want, &self.rules.lists).map_err(|e| ServiceError::InvalidNick(e.0))?;
+        if user.nick_changes >= 1 {
+            let next = user.nick_changed_ms + self.rules.cooldown_days * 86_400_000;
+            if now_ms < next {
+                return Err(ServiceError::Cooldown { retry_after_ms: next - now_ms });
+            }
+        }
+        if self.store.user_by_nick(want)?.is_some() {
+            return Err(ServiceError::NickTaken);
+        }
+        Ok(true)
     }
 
     /// Verifies a signed challenge and hands out a fresh access token for the key's credential.
@@ -108,6 +161,22 @@ impl<S: UserStore> UserService<S> {
         }
         let session = self.key_session(&user, key_id, now_ms, session_ttl_ms)?;
         Ok((user, session))
+    }
+
+    /// Verifies a signed challenge like [`Self::key_login`] but issues no session: the proof alone,
+    /// for callers that hand out something else (a one-time Matrix login token). The challenge is
+    /// consumed whatever the outcome.
+    pub fn key_proof(&self, book: &ChallengeBook, key_id: &str, challenge_id: &str, signature_b64: &str, now_ms: i64) -> Result<User, ServiceError> {
+        let challenge = book.take(challenge_id, key_id, now_ms).ok_or(ServiceError::Unauthorized)?;
+        let (user, public_key) = match self.store.user_by_key(key_id) {
+            Ok(Some(found)) => found,
+            Ok(None) | Err(StoreError::NotFound) => return Err(ServiceError::Unauthorized),
+            Err(e) => return Err(e.into()),
+        };
+        if challenge.audience != book.audience() || !keyproof::verify(&public_key, &keyproof::login_message(&challenge, key_id), signature_b64) {
+            return Err(ServiceError::Unauthorized);
+        }
+        Ok(user)
     }
 
     /// Removes a key and, with it, the ability to log in again.
