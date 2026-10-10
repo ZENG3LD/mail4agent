@@ -1624,6 +1624,7 @@ dependencies = [
  "axum",
  "futures-util",
  "hex",
+ "m4a-agent",
  "m4a-edge",
  "m4a-product-kit",
  "m4a-seam",

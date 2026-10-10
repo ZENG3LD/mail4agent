@@ -516,3 +516,128 @@ async fn login_tokens_refresh_tokens_password_change_3pid_and_deactivation() {
     assert_eq!(whoami(tok3).await.0, 401);
     assert_eq!(s.post("/client/v3/login", None, login(json!({"password":"a much better one"}))).await.0, 403);
 }
+
+// ---- Login by proof of possession of a key: the client resolves identity and credentials itself.
+
+use m4a_agent::backend::{matrix::MatrixBackend, server::ServerBackend};
+use m4a_agent::{AgentError, Backend, BackendKind, IdentityStore, KeyVault, MemoryVault};
+use m4a_seam::keyproof;
+
+impl Stack {
+    async fn invite(&self, nick: Option<&str>) -> (String, String) {
+        let body = nick.map(|n| json!({ "nick": n })).unwrap_or(json!({}));
+        let (st, b) = self.post("/product/v1/admin/invite", Some(ADMIN), body).await;
+        assert_eq!(st, 200, "{b}");
+        (b["invite"].as_str().unwrap().to_string(), b["nick"].as_str().unwrap().to_string())
+    }
+}
+
+/// The client half is blocking; run it off the async runtime.
+async fn off<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    tokio::task::spawn_blocking(f).await.unwrap()
+}
+
+#[tokio::test]
+async fn an_agent_client_enrolls_once_and_then_logs_in_by_signature_only() {
+    let s = stack().await;
+    assert_eq!(s.send("GET", "/client/v3/login", None, None).await.1["flows"].as_array().unwrap().iter().filter(|f| f["type"] == keyproof::LOGIN_TYPE).count(), 1);
+    let (invite, nick) = s.invite(None).await;
+    let vault: Arc<dyn KeyVault> = Arc::new(MemoryVault::new());
+    let ids = Arc::new(IdentityStore::new(vault));
+    let url = s.product.clone();
+
+    let (ids2, url2, inv) = (ids.clone(), url.clone(), invite.clone());
+    let (first, again, relog, key_id, pubkey) = off(move || {
+        let mut b = ServerBackend::new(&url2).unwrap();
+        let mut id = ids2.resolve("agent-1", BackendKind::Server, b.server_ref()).unwrap();
+        // Not enrolled and no invite: the client says so, it does not invent anything.
+        assert!(matches!(b.ensure_session(&ids2, &mut id, None), Err(AgentError::NeedsInvite)));
+        let first = b.ensure_session(&ids2, &mut id, Some(&inv)).unwrap();
+        assert!(id.enrolled);
+        // Same token while the server accepts it; no new login.
+        let again = b.ensure_session(&ids2, &mut id, None).unwrap();
+        // Token lost: a signed login gives a fresh one for the SAME credential.
+        ids2.vault().delete(&m4a_agent::identity::token_label("agent-1")).unwrap();
+        let relog = b.ensure_session(&ids2, &mut id, None).unwrap();
+        (first, again, relog, id.key_id.clone(), id.public_key.clone())
+    })
+    .await;
+    assert_eq!(first.nick, nick, "the nick the operator assigned");
+    assert_eq!(again.token.as_str(), first.token.as_str());
+    assert_ne!(relog.token.as_str(), first.token.as_str());
+    assert_eq!((relog.cred_ref.as_str(), first.cred_ref.as_str()), (key_id.as_str(), key_id.as_str()), "one credential set");
+    assert_eq!(s.send("GET", "/product/v1/me", Some(&relog.token), None).await.1["nick"], json!(nick));
+    assert_eq!(s.send("GET", "/product/v1/me", Some(&first.token), None).await.0, 401, "the old token is replaced");
+
+    // The invite is spent.
+    let other = ids.resolve("agent-2", BackendKind::Server, &url).unwrap();
+    let (ids3, url3, inv) = (ids.clone(), url.clone(), invite.clone());
+    let mut other = other;
+    let spent = off(move || ServerBackend::new(&url3).unwrap().ensure_session(&ids3, &mut other, Some(&inv))).await;
+    assert!(matches!(spent, Err(AgentError::Refused(_))), "{spent:?}");
+
+    // Replay: a signed challenge works once; the same answer again does not.
+    let (_, c) = s.post("/product/v1/login/key/challenge", None, json!({ "key_id": key_id })).await;
+    let ch = keyproof::Challenge { challenge_id: c["challenge_id"].as_str().unwrap().into(), nonce: c["nonce"].as_str().unwrap().into(), expires_ms: c["expires_ms"].as_i64().unwrap(), audience: c["audience"].as_str().unwrap().into() };
+    assert_eq!(ch.audience, "test-product");
+    let id = ids.resolve("agent-1", BackendKind::Server, &url).unwrap();
+    let sig = id.sign_login(ids.vault(), &ch).unwrap();
+    let body = json!({ "key_id": key_id, "challenge_id": ch.challenge_id, "signature": sig });
+    assert_eq!(s.post("/product/v1/login/key", None, body.clone()).await.0, 200);
+    assert_eq!(s.post("/product/v1/login/key", None, body).await.0, 401, "replay");
+    // A signature over a changed audience, a challenge for another key, a made-up key: all refused.
+    let (_, c) = s.post("/product/v1/login/key/challenge", None, json!({ "key_id": key_id })).await;
+    let ch = keyproof::Challenge { challenge_id: c["challenge_id"].as_str().unwrap().into(), nonce: c["nonce"].as_str().unwrap().into(), expires_ms: c["expires_ms"].as_i64().unwrap(), audience: "elsewhere".into() };
+    let sig = id.sign_login(ids.vault(), &ch).unwrap();
+    assert_eq!(s.post("/product/v1/login/key", None, json!({ "key_id": key_id, "challenge_id": ch.challenge_id, "signature": sig })).await.0, 401);
+    let (_, c) = s.post("/product/v1/login/key/challenge", None, json!({ "key_id": "kunknown" })).await;
+    let ch = keyproof::Challenge { challenge_id: c["challenge_id"].as_str().unwrap().into(), nonce: c["nonce"].as_str().unwrap().into(), expires_ms: c["expires_ms"].as_i64().unwrap(), audience: c["audience"].as_str().unwrap().into() };
+    let sig = id.sign_login(ids.vault(), &ch).unwrap();
+    assert_eq!(s.post("/product/v1/login/key", None, json!({ "key_id": key_id, "challenge_id": ch.challenge_id, "signature": sig })).await.0, 401, "challenge belongs to another key id");
+    assert_eq!(s.post("/product/v1/login/key", None, json!({ "key_id": "kunknown", "challenge_id": "x", "signature": "y" })).await.0, 401);
+    // Enrolling needs the admin's invite; a forged one is refused.
+    assert_eq!(s.post("/product/v1/enroll", None, json!({ "invite": "nope", "public_key": pubkey, "signature": "AAAA" })).await.0, 401);
+    assert_eq!(s.post("/product/v1/admin/invite", None, json!({})).await.0, 403, "only the operator invites");
+
+    // Revoking the credential kills the key: the signature no longer logs in.
+    let (st, _) = s.post("/product/v1/admin/revoke", Some(ADMIN), json!({ "cred_ref": key_id })).await;
+    assert_eq!(st, 200);
+    let (ids4, url4) = (ids.clone(), url.clone());
+    let mut id = id;
+    let r = off(move || ServerBackend::new(&url4).unwrap().ensure_session(&ids4, &mut id, None)).await;
+    assert!(matches!(r, Err(AgentError::Refused(_))), "{r:?}");
+}
+
+#[tokio::test]
+async fn an_agent_client_logs_in_over_the_matrix_api_with_the_custom_login_type() {
+    let s = stack().await;
+    let (invite, nick) = s.invite(None).await;
+    let ids = Arc::new(IdentityStore::new(Arc::new(MemoryVault::new())));
+    let url = s.product.clone();
+    let (ids2, inv) = (ids.clone(), invite.clone());
+    let (sess, again) = off(move || {
+        let mut b = MatrixBackend::new(&url).unwrap();
+        let mut id = ids2.resolve("agent-m", BackendKind::Matrix, b.server_ref()).unwrap();
+        let sess = b.ensure_session(&ids2, &mut id, Some(&inv)).unwrap();
+        let again = b.ensure_session(&ids2, &mut id, None).unwrap();
+        (sess, again)
+    })
+    .await;
+    assert_eq!(sess.nick, nick);
+    assert!(sess.user_id.as_deref().unwrap().starts_with(&format!("@{nick}:")), "{sess:?}");
+    assert!(sess.device_id.is_some());
+    assert_eq!(again.token.as_str(), sess.token.as_str());
+    // The access token is a working Matrix token.
+    let (st, w) = s.send("GET", "/_matrix/client/v3/account/whoami", Some(&sess.token), None).await;
+    assert_eq!(st, 200, "{w}");
+    assert_eq!(w["user_id"], json!(sess.user_id));
+    // Without the signature the Matrix login answers with the challenge, and a bad one is refused.
+    let (st, v) = s.post("/_matrix/client/v3/login", None, json!({ "type": keyproof::LOGIN_TYPE, "key_id": "kx" })).await;
+    assert_eq!((st, v["errcode"].as_str()), (401, Some("M_UNAUTHORIZED")));
+    assert!(v[keyproof::LOGIN_TYPE]["nonce"].is_string());
+    let (st, _) = s.post("/_matrix/client/v3/login", None, json!({ "type": keyproof::LOGIN_TYPE, "key_id": "kx", "challenge_id": "c", "signature": "s" })).await;
+    assert_eq!(st, 401);
+    // Password users are unaffected and cannot be reached by a key.
+    let (st, _) = s.post("/_matrix/client/v3/login", None, json!({ "type": "m.login.password", "user": nick, "password": "whatever-long" })).await;
+    assert_eq!(st, 403, "an invited identity has no password");
+}
