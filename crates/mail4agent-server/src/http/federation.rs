@@ -29,6 +29,7 @@ pub(super) fn routes() -> Router<Arc<Homeserver>> {
         .route("/federation/v2/send_join/{room_id}/{event_id}", put(send_join))
         .route("/federation/v2/invite/{room_id}/{event_id}", put(invite))
         .route("/federation/v1/backfill/{room_id}", get(backfill))
+        .route("/federation/v1/get_missing_events/{room_id}", post(get_missing_events))
         .route("/federation/v1/user/keys/query", post(keys_query))
         .route("/federation/v1/user/keys/claim", post(keys_claim))
         .route("/federation/v1/user/devices/{user_id}", get(user_devices))
@@ -120,12 +121,7 @@ async fn send_txn(
         #[cfg(feature = "f3-hash-ids")]
         if crate::f3::is_f3_wire(&pdu) {
             let id = crate::f3::wire_id(&pdu).unwrap_or_else(|_| "?".to_string());
-            let res = async {
-                let keys = super::fed_net::f3_keys(&state, std::slice::from_ref(&pdu)).await?;
-                let (p, o) = (pdu.clone(), origin.clone());
-                with_conn_pub(&state, move |c| crate::f3::receive_pdu(c, &o, &p, &keys, &rfc3339())).await
-            }
-            .await;
+            let res = super::fed_net::f3_receive_live(&state, &origin, &pdu).await;
             match res {
                 Ok(r) => {
                     wake_all.extend(r.wake);
@@ -295,19 +291,20 @@ async fn send_join_f3(state: &Arc<Homeserver>, origin: &str, room_id: &str, even
     if !is_join || pdu.get("room_id").and_then(Value::as_str) != Some(room_id) || crate::f3::wire_id(&pdu)? != event_id {
         return Err(MatrixError::bad_json("not a valid join event for this request"));
     }
-    let keys = super::fed_net::f3_keys(state, std::slice::from_ref(&pdu)).await?;
-    let (p, o, room) = (pdu.clone(), origin.to_string(), room_id.to_string());
+    let got = super::fed_net::f3_receive_live(state, origin, &pdu).await?;
+    let room = room_id.to_string();
     let eid = event_id.to_string();
     let local = crate::store::matrix_server_name().to_string();
-    let (wake, snap, info) = with_conn_pub(state, move |c| {
-        let got = crate::f3::receive_pdu(c, &o, &p, &keys, &rfc3339())?;
+    let (snap, info) = with_conn_pub(state, move |c| {
         let snap = crate::f3::snapshot_json(c, &room, &eid)?;
         let info = fr::room_info(c, &room).map_err(internal)?;
-        Ok((got.wake, snap, info))
+        Ok((snap, info))
     })
     .await?;
+    let wake = got.wake;
     after_ingest(state, wake);
-    Ok(Json(json!({ "origin": local, "state": [], "auth_chain": [], "m4a_room": info, "m4a_f3": snap })))
+    let chain = snap.get("auth_chain").cloned().unwrap_or_else(|| json!([]));
+    Ok(Json(json!({ "origin": local, "state": snap["state"], "auth_chain": chain, "m4a_room": info, "m4a_f3": snap })))
 }
 
 async fn invite(
@@ -336,7 +333,7 @@ async fn invite(
         if !is_invite {
             return Err(MatrixError::bad_json("not a valid invite for this request"));
         }
-        let all: Vec<Value> = ["state", "extremities"].iter().flat_map(|k| snap.get(*k).and_then(Value::as_array).cloned().unwrap_or_default()).collect();
+        let all = crate::f3::snapshot_events(&snap);
         if !all.iter().any(|p| p == &event) {
             return Err(MatrixError::bad_json("the snapshot does not contain the invite"));
         }
@@ -403,6 +400,15 @@ async fn backfill(
     let local = crate::store::matrix_server_name().to_string();
     let limit = q.limit.unwrap_or(50).clamp(1, 100);
     with_conn_pub(&state, move |c| {
+        #[cfg(feature = "f3-hash-ids")]
+        if crate::f3::is_f3_room(c, &room_id) {
+            if !crate::f3::origin_in_room(c, &room_id, &origin) {
+                return Err(MatrixError::forbidden("server has no member in this room"));
+            }
+            let v: Vec<String> = q.v.clone().into_iter().collect();
+            let pdus = crate::f3::backfill_json(c, &room_id, &origin, &v, q.limit.unwrap_or(50).clamp(1, 100) as usize);
+            return Ok(Json(json!({ "origin": local, "origin_server_ts": fed::now_ms(), "pdus": pdus })));
+        }
         if !fr::remote_domains(c, &room_id)?.contains(&origin) {
             return Err(MatrixError::forbidden("server has no member in this room"));
         }
@@ -419,6 +425,41 @@ async fn backfill(
         Ok(Json(json!({ "origin": local, "origin_server_ts": fed::now_ms(), "pdus": pdus })))
     })
     .await
+}
+
+/// `POST get_missing_events`: the ancestors of `latest_events` that are not at or behind
+/// `earliest_events`, oldest first. Only DAG rooms, only to a server with a user in the room.
+async fn get_missing_events(
+    State(state): State<Arc<Homeserver>>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    Path(room_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<Value>, MatrixError> {
+    require_enabled(&state)?;
+    let origin = authenticate(&state, "POST", &uri, &headers, &body).await?;
+    let v = parse_body(&body)?;
+    #[cfg(feature = "f3-hash-ids")]
+    {
+        let ids = |k: &str| -> Vec<String> { v.get(k).and_then(Value::as_array).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default() };
+        let (earliest, latest) = (ids("earliest_events"), ids("latest_events"));
+        let limit = v.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
+        return with_conn_pub(&state, move |c| {
+            if !crate::f3::is_f3_room(c, &room_id) {
+                return Err(MatrixError::not_found("unknown room"));
+            }
+            if !crate::f3::origin_in_room(c, &room_id, &origin) {
+                return Err(MatrixError::forbidden("server has no member in this room"));
+            }
+            Ok(Json(json!({ "events": crate::f3::missing_events_json(c, &room_id, &origin, &earliest, &latest, limit) })))
+        })
+        .await;
+    }
+    #[cfg(not(feature = "f3-hash-ids"))]
+    {
+        let _ = (v, room_id, origin);
+        Err(MatrixError::unrecognized())
+    }
 }
 
 async fn keys_query(State(state): State<Arc<Homeserver>>, OriginalUri(uri): OriginalUri, headers: HeaderMap, body: Bytes) -> Result<Json<Value>, MatrixError> {

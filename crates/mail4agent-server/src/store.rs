@@ -1041,6 +1041,19 @@ pub(crate) fn apply_state_event_raw_in_tx(
     })
 }
 
+/// An event row for a state event of the past: it is in the room's history, it fills no
+/// `current_state` slot. Used for events fetched by backfill or get_missing_events.
+#[cfg_attr(not(feature = "f3-hash-ids"), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn insert_past_state_row(tx: &Transaction, event_id: &str, room_id: &str, sender_user_id: i64, event_type: &str, state_key: &str, content: &str, origin_server_ts: i64) -> Result<(), MatrixStoreError> {
+    let stream_id = next_stream_id(tx)?;
+    tx.execute(
+        "INSERT INTO events (stream_id, event_id, room_id, sender_user_id, event_type, state_key, content, origin_server_ts, txn_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
+        params![stream_id, event_id, room_id, sender_user_id, event_type, state_key, content, origin_server_ts],
+    )?;
+    Ok(())
+}
+
 /// Point a `current_state` slot at `event_id` (an already stored state event) and refresh the
 /// membership and power-level caches from that event's content. Used by the DAG layer when state
 /// resolution picks a different winner than the event that was written last.

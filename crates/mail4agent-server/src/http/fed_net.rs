@@ -60,6 +60,51 @@ pub(crate) async fn f3_keys(state: &Arc<Homeserver>, pdus: &[Value]) -> Result<m
     Ok(keys)
 }
 
+/// A peer's live event for a DAG room. When it cites events this server does not hold, they are
+/// fetched from `origin` (get_missing_events), verified and stored first, then the event is
+/// processed again; the fork this makes is merged by state resolution.
+#[cfg(feature = "f3-hash-ids")]
+pub(crate) async fn f3_receive_live(state: &Arc<Homeserver>, origin: &str, pdu: &Value) -> Result<crate::f3::Received, MatrixError> {
+    for _ in 0..3 {
+        let keys = f3_keys(state, std::slice::from_ref(pdu)).await?;
+        let (p, o) = (pdu.clone(), origin.to_string());
+        let res = with_conn_pub(state, move |c| Ok(crate::f3::receive_detail(c, Some(&o), &p, &keys, &now_rfc3339()))).await?;
+        match res {
+            Ok(r) => return Ok(r),
+            Err(crate::f3::RecvErr::Other(e)) => return Err(e),
+            Err(crate::f3::RecvErr::Missing(_)) => f3_fetch_missing(state, origin, pdu).await?,
+        }
+    }
+    Err(MatrixError::forbidden("the event still cites unknown events after fetching"))
+}
+
+/// Ask `origin` for the events between our forward extremities and `pdu`, check and store them.
+#[cfg(feature = "f3-hash-ids")]
+async fn f3_fetch_missing(state: &Arc<Homeserver>, origin: &str, pdu: &Value) -> Result<(), MatrixError> {
+    let room = pdu.get("room_id").and_then(Value::as_str).ok_or_else(|| MatrixError::bad_json("room_id"))?.to_string();
+    let latest = crate::f3::wire_id(pdu)?;
+    let r2 = room.clone();
+    let earliest = with_conn_pub(state, move |c| Ok(crate::f3::extremity_ids(c, &r2))).await?;
+    let body = json!({ "earliest_events": earliest, "latest_events": [latest], "limit": 50, "min_depth": 0 });
+    let (status, resp) = fed_request(state, origin, "POST", &format!("/federation/v1/get_missing_events/{}", enc(&room)), Some(body)).await?;
+    if status != 200 {
+        return Err(map_status(status, "get_missing_events"));
+    }
+    let events = resp.get("events").and_then(Value::as_array).cloned().unwrap_or_default();
+    if events.is_empty() {
+        return Err(MatrixError::forbidden("the origin returned no missing events"));
+    }
+    f3_store_history(state, &room, events).await.map(|_| ())
+}
+
+/// Verify (keys fetched as needed) and store events of the past.
+#[cfg(feature = "f3-hash-ids")]
+pub(crate) async fn f3_store_history(state: &Arc<Homeserver>, room: &str, events: Vec<Value>) -> Result<usize, MatrixError> {
+    let keys = f3_keys(state, &events).await?;
+    let room = room.to_string();
+    with_conn_pub(state, move |c| crate::f3::process_historic(c, &room, &events, &keys, &now_rfc3339())).await
+}
+
 fn backoff_ms(attempts: i64) -> i64 {
     (1000i64 << attempts.clamp(0, 10)).min(600_000)
 }
@@ -312,15 +357,29 @@ async fn federated_join_f3(state: &Arc<Homeserver>, caller: &super::Caller, room
     }
     let snap = resp.get("m4a_f3").cloned().ok_or_else(|| MatrixError::unknown("send_join: no room snapshot"))?;
     let info = resp.get("m4a_room").cloned().ok_or_else(|| MatrixError::unknown("send_join: no room info"))?;
-    let all: Vec<Value> = ["state", "extremities"].iter().flat_map(|k| snap.get(*k).and_then(Value::as_array).cloned().unwrap_or_default()).collect();
+    let all = crate::f3::snapshot_events(&snap);
     let keys = f3_keys(state, &all).await?;
     let room = room_id.to_string();
+    let shared = matches!(info.get("history_visibility").and_then(Value::as_str), Some("shared") | Some("world_readable"));
     let ids = with_conn_pub(state, move |c| {
         crate::f3::import_snapshot(c, &room, &info, &snap, &keys, &now_rfc3339())?;
         let ids = crate::rooms::member_and_invited_ids(c, &room).map_err(internal)?;
         Ok(ids.into_iter().collect::<Vec<_>>())
     })
     .await?;
+    // A late joiner catches up the history, parallel branches included, when the room shares it.
+    if shared {
+        let q = format!("/federation/v1/backfill/{}?v={}&limit=100", enc(room_id), enc(&event_id));
+        match fed_request(state, dest, "GET", &q, None).await {
+            Ok((200, resp)) => {
+                let events = resp.get("pdus").and_then(Value::as_array).cloned().unwrap_or_default();
+                if let Err(e) = f3_store_history(state, room_id, events).await {
+                    tracing::warn!("backfill after join: {}", e.error);
+                }
+            }
+            other => tracing::warn!("backfill after join: {:?}", other.map(|x| x.0)),
+        }
+    }
     Ok(ids)
 }
 

@@ -285,35 +285,241 @@ fn project(tx: &Transaction, room: &str, acc: &dag::Accepted, prev_current: &Sta
     Ok(())
 }
 
-/// A peer's event for a DAG room. `keys` must hold the public key of every server that signed it
-/// (the caller fetched them). Everything lands in one transaction.
+/// Why a peer's event was not taken.
+#[derive(Debug)]
+pub enum RecvErr {
+    /// Events this event needs (prev or auth) are unknown here; fetch them from the peer and retry.
+    Missing(Vec<String>),
+    Other(MatrixError),
+}
+
+impl From<MatrixError> for RecvErr {
+    fn from(e: MatrixError) -> Self {
+        RecvErr::Other(e)
+    }
+}
+
+fn is_known(conn: &Connection, id: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM dag_events e WHERE e.event_id = ?1 AND (e.outlier = 0 OR EXISTS (SELECT 1 FROM dag_event_state s WHERE s.event_id = e.event_id))",
+        [id],
+        |_| Ok(()),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .is_some()
+}
+
+/// A peer's event for a DAG room, sent by `origin` itself (the sender must be its user). `keys`
+/// must hold the public key of every server that signed it (the caller fetched them). Everything
+/// lands in one transaction.
 pub fn receive_pdu(conn: &mut Connection, origin: &str, pdu: &Value, keys: &PublicKeyMap, now: &str) -> Result<Received, MatrixError> {
+    receive_detail(conn, Some(origin), pdu, keys, now).map_err(|e| match e {
+        RecvErr::Missing(ids) => MatrixError::forbidden(format!("unknown prev or auth events: {}", ids.join(","))),
+        RecvErr::Other(e) => e,
+    })
+}
+
+/// [`receive_pdu`] that says when events are missing. `origin: None` is for events relayed by
+/// another server (fetched with get_missing_events): the sender may be on any server.
+pub fn receive_detail(conn: &mut Connection, origin: Option<&str>, pdu: &Value, keys: &PublicKeyMap, now: &str) -> Result<Received, RecvErr> {
     let room = str_of(pdu, "room_id")?.to_string();
     let sender = str_of(pdu, "sender")?.to_string();
-    if crate::fed_rooms::domain_of(&sender) != Some(origin) || !crate::fed_rooms::is_remote_mxid(&sender) {
-        return Err(MatrixError::forbidden("sender is not a user of the sending server"));
+    if let Some(origin) = origin {
+        if crate::fed_rooms::domain_of(&sender) != Some(origin) || !crate::fed_rooms::is_remote_mxid(&sender) {
+            return Err(MatrixError::forbidden("sender is not a user of the sending server").into());
+        }
     }
     if !is_f3_room(conn, &room) {
-        return Err(MatrixError::not_found("unknown room"));
+        return Err(MatrixError::not_found("unknown room").into());
     }
     let obj = json_obj(pdu).map_err(MatrixError::bad_json)?;
     let rules = rules();
     let id = dag::compute_event_id(&rules, &obj).map_err(bad)?;
     let tx = conn.transaction().map_err(|_| MatrixError::internal())?;
-    if tx.query_row("SELECT 1 FROM dag_events WHERE event_id = ?1", [id.as_str()], |_| Ok(())).optional().map_err(|_| MatrixError::internal())?.is_some() {
+    if is_known(&tx, id.as_str()) {
         return Ok(Received { event_id: id.to_string(), duplicate: true, ..Default::default() });
+    }
+    // Needed events first, so a gap is reported before any signature work.
+    let wire = Pdu::from_wire(id.clone(), &obj).map_err(MatrixError::bad_json)?;
+    let missing: Vec<String> = wire.prev_events.iter().chain(wire.auth_events.iter()).filter(|e| !is_known(&tx, e.as_str()) && !(wire.auth_events.contains(e) && ConnDag { conn: &tx, room: &room }.pdu_exists(e))).map(|e| e.to_string()).collect();
+    if !missing.is_empty() {
+        return Err(RecvErr::Missing(missing));
     }
     let sender_uid = ensure_users(&tx, pdu, now)?;
     let db = ConnDag { conn: &tx, room: &room };
     let prev_current = dag::current_state(&rules, &db).map_err(bad)?;
-    let acc = dag::accept_wire(&rules, &db, obj, keys, None).map_err(bad)?;
+    let acc = match dag::accept_wire(&rules, &db, obj, keys, None) {
+        Ok(a) => a,
+        Err(dag::Reject::MissingPrev(e)) | Err(dag::Reject::MissingAuth(e)) => return Err(RecvErr::Missing(vec![e])),
+        Err(e) => return Err(bad(e).into()),
+    };
     store_accepted(&tx, &room, &acc, false).map_err(|_| MatrixError::internal())?;
+    if dag::is_skeleton(&rules, &acc.json) {
+        let _ = tx.execute("UPDATE dag_events SET skeleton = 1 WHERE event_id = ?1", [acc.event_id.as_str()]);
+    }
     if !acc.soft_failed {
         project(&tx, &room, &acc, &prev_current, sender_uid, now).map_err(MatrixError::from)?;
     }
     let wake = crate::rooms::member_and_invited_ids(&tx, &room).map_err(|_| MatrixError::internal())?;
     tx.commit().map_err(|_| MatrixError::internal())?;
     Ok(Received { event_id: id.to_string(), duplicate: false, soft_failed: acc.soft_failed, forked: acc.forked, wake })
+}
+
+impl ConnDag<'_> {
+    fn pdu_exists(&self, id: &EventId) -> bool {
+        dag::DagRead::pdu(self, id).is_some()
+    }
+}
+
+/// Events of the past from a peer (get_missing_events, backfill, an auth chain): each is checked
+/// (signature, hash or skeleton form, id, its own auth events, the state before it), stored as a
+/// non-extremity, and its timeline row is written when this server has none. They never change the
+/// current state or the forward extremities; the live event that needed them does that.
+pub fn process_historic(conn: &mut Connection, room: &str, events: &[Value], keys: &PublicKeyMap, now: &str) -> Result<usize, MatrixError> {
+    if !is_f3_room(conn, room) {
+        return Err(MatrixError::not_found("unknown room"));
+    }
+    let rules = rules();
+    let mut parsed: Vec<(OwnedEventId, CanonicalJsonObject, Value)> = Vec::new();
+    for v in events {
+        if v.get("room_id").and_then(Value::as_str) != Some(room) {
+            return Err(MatrixError::bad_json("event of another room"));
+        }
+        let obj = json_obj(v).map_err(MatrixError::bad_json)?;
+        dag::verify_wire(&rules, &obj, keys).map_err(bad)?;
+        let id = dag::compute_event_id(&rules, &obj).map_err(bad)?;
+        parsed.push((id, obj, v.clone()));
+    }
+    parsed.sort_by_key(|(id, o, _)| (match o.get("depth") { Some(CanonicalJsonValue::Integer(i)) => i64::from(*i), _ => 0 }, id.clone()));
+    let tx = conn.transaction().map_err(|_| MatrixError::internal())?;
+    let mut done = 0;
+    for (id, obj, v) in parsed {
+        let has_state = tx.query_row("SELECT 1 FROM dag_event_state WHERE event_id = ?1", [id.as_str()], |_| Ok(())).optional().map_err(|_| MatrixError::internal())?.is_some();
+        if has_state {
+            continue;
+        }
+        let uid = ensure_users(&tx, &v, now)?;
+        let db = ConnDag { conn: &tx, room };
+        // The event itself may already be stored as an outlier; accept_historic only needs its ancestors.
+        let h = dag::accept_historic(&rules, &db, id.clone(), obj.clone()).map_err(bad)?;
+        let text = serde_json::to_string(&obj).unwrap_or_default();
+        let skel = dag::is_skeleton(&rules, &obj);
+        tx.execute(
+            "INSERT OR IGNORE INTO dag_events (event_id, room_id, depth, event_type, sender, state_key, origin_server_ts, pdu, outlier, skeleton) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9)",
+            params![id.as_str(), room, h.pdu.depth as i64, h.pdu.kind.to_string(), h.pdu.sender.as_str(), h.pdu.state_key, u64::from(h.pdu.origin_server_ts.0) as i64, text, skel as i64],
+        )
+        .map_err(|_| MatrixError::internal())?;
+        for p in &h.pdu.prev_events {
+            let _ = tx.execute("INSERT OR IGNORE INTO dag_edges (event_id, prev_event_id) VALUES (?1, ?2)", params![id.as_str(), p.as_str()]);
+        }
+        for a in &h.pdu.auth_events {
+            let _ = tx.execute("INSERT OR IGNORE INTO dag_auth (event_id, auth_event_id) VALUES (?1, ?2)", params![id.as_str(), a.as_str()]);
+        }
+        let gid = new_group(&tx, room, &h.state_after).map_err(|_| MatrixError::internal())?;
+        tx.execute("INSERT OR REPLACE INTO dag_event_state (event_id, group_id) VALUES (?1, ?2)", params![id.as_str(), gid]).map_err(|_| MatrixError::internal())?;
+        let _ = tx.execute("INSERT OR REPLACE INTO fed_pdus (event_id, room_id, pdu) VALUES (?1, ?2, ?3)", params![id.as_str(), room, text]);
+        if skel {
+            let _ = tx.execute("INSERT OR IGNORE INTO fed_skeleton (event_id) VALUES (?1)", [id.as_str()]);
+        }
+        let in_events = tx.query_row("SELECT 1 FROM events WHERE event_id = ?1", [id.as_str()], |_| Ok(())).optional().map_err(|_| MatrixError::internal())?.is_some();
+        if !in_events {
+            let content = h.pdu.content.get().to_string();
+            let ts = u64::from(h.pdu.origin_server_ts.0) as i64;
+            let kind = h.pdu.kind.to_string();
+            match &h.pdu.state_key {
+                Some(sk) => crate::store::insert_past_state_row(&tx, id.as_str(), room, uid, &kind, sk, &content, ts).map_err(MatrixError::from)?,
+                None => {
+                    let row = crate::store::TimelineEventRow { event_id: id.as_str(), room_id: room, sender_user_id: uid, event_type: &kind, content: &content, origin_server_ts: ts, txn_id: None };
+                    crate::store::insert_timeline_event_raw_in_tx(&tx, &row).map_err(MatrixError::from)?;
+                }
+            }
+        }
+        done += 1;
+    }
+    tx.commit().map_err(|_| MatrixError::internal())?;
+    Ok(done)
+}
+
+fn pdu_value(conn: &Connection, id: &str) -> Option<Value> {
+    conn.query_row("SELECT pdu FROM dag_events WHERE event_id = ?1", [id], |r| r.get::<_, String>(0)).ok().and_then(|s| serde_json::from_str(&s).ok())
+}
+
+/// Lowest depth `origin` may be served: everything when the room's history is shared, otherwise
+/// from the first membership event of one of its users.
+fn serve_min_depth(conn: &Connection, room: &str, origin: &str) -> i64 {
+    let shared = crate::store::get_room(conn, room).ok().flatten().is_some_and(|r| matches!(r.history_visibility, crate::store::HistoryVisibility::Shared | crate::store::HistoryVisibility::WorldReadable));
+    if shared {
+        return 0;
+    }
+    conn.query_row("SELECT MIN(depth) FROM dag_events WHERE room_id = ?1 AND event_type = 'm.room.member' AND state_key LIKE ?2", params![room, format!("@%:{origin}")], |r| r.get::<_, Option<i64>>(0)).ok().flatten().unwrap_or(i64::MAX)
+}
+
+/// Walk back through `prev_events` from `roots`, nearest first, never past `stop`, at most `limit`
+/// events at or above `min_depth`. Returns `(depth, id)`.
+fn walk_back(conn: &Connection, roots: Vec<String>, stop: &HashSet<String>, limit: usize, min_depth: i64, room: &str) -> Vec<(i64, String)> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut queue: std::collections::VecDeque<String> = roots.into();
+    let mut out = Vec::new();
+    while let Some(id) = queue.pop_front() {
+        if out.len() >= limit {
+            break;
+        }
+        if stop.contains(&id) || !seen.insert(id.clone()) {
+            continue;
+        }
+        let Some(depth): Option<i64> = conn.query_row("SELECT depth FROM dag_events WHERE event_id = ?1 AND room_id = ?2", params![id, room], |r| r.get(0)).optional().ok().flatten() else { continue };
+        if depth < min_depth {
+            continue;
+        }
+        out.push((depth, id.clone()));
+        if let Ok(mut st) = conn.prepare("SELECT prev_event_id FROM dag_edges WHERE event_id = ?1") {
+            if let Ok(rows) = st.query_map([&id], |r| r.get::<_, String>(0)) {
+                queue.extend(rows.flatten());
+            }
+        }
+    }
+    out
+}
+
+/// Whether `origin` has a user in the room (invited, joined or left): the condition for serving it history.
+pub fn origin_in_room(conn: &Connection, room: &str, origin: &str) -> bool {
+    conn.query_row("SELECT 1 FROM dag_events WHERE room_id = ?1 AND event_type = 'm.room.member' AND state_key LIKE ?2 LIMIT 1", params![room, format!("@%:{origin}")], |_| Ok(())).optional().ok().flatten().is_some()
+}
+
+/// `get_missing_events`: the ancestors of `latest` (not `latest` themselves) that are not at or
+/// behind `earliest`, oldest first. Skeletons are served as stored.
+pub fn missing_events_json(conn: &Connection, room: &str, origin: &str, earliest: &[String], latest: &[String], limit: usize) -> Vec<Value> {
+    let mut roots = Vec::new();
+    for l in latest {
+        if let Ok(mut st) = conn.prepare("SELECT prev_event_id FROM dag_edges WHERE event_id = ?1") {
+            if let Ok(rows) = st.query_map([l], |r| r.get::<_, String>(0)) {
+                roots.extend(rows.flatten());
+            }
+        }
+    }
+    let stop: HashSet<String> = earliest.iter().cloned().collect();
+    let mut found = walk_back(conn, roots, &stop, limit.clamp(1, 100), serve_min_depth(conn, room, origin), room);
+    found.sort();
+    found.into_iter().filter_map(|(_, id)| pdu_value(conn, &id)).collect()
+}
+
+/// `backfill`: the events `v` and their ancestors, newest first.
+pub fn backfill_json(conn: &Connection, room: &str, origin: &str, v: &[String], limit: usize) -> Vec<Value> {
+    let mut found = walk_back(conn, v.to_vec(), &HashSet::new(), limit.clamp(1, 100), serve_min_depth(conn, room, origin), room);
+    found.sort_by(|a, b| b.cmp(a));
+    found.into_iter().filter_map(|(_, id)| pdu_value(conn, &id)).collect()
+}
+
+/// Forward extremity ids of a room.
+pub fn extremity_ids(conn: &Connection, room: &str) -> Vec<String> {
+    dag::DagRead::extremities(&ConnDag { conn, room }).into_iter().map(|e| e.to_string()).collect()
+}
+
+/// Every event of a snapshot as one list: state, extremities, auth chain.
+pub fn snapshot_events(snap: &Value) -> Vec<Value> {
+    ["state", "extremities", "auth_chain"].iter().flat_map(|k| snap.get(*k).and_then(Value::as_array).cloned().unwrap_or_default()).collect()
 }
 
 /// The room as it was right after `at` (an event this server holds): the state events of that
@@ -327,7 +533,25 @@ pub fn snapshot_json(conn: &Connection, room: &str, at: &str) -> Result<Value, M
     let get = |id: &str| -> Option<Value> { conn.query_row("SELECT pdu FROM dag_events WHERE event_id = ?1", [id], |r| r.get::<_, String>(0)).ok().and_then(|s| serde_json::from_str(&s).ok()) };
     let state: Vec<Value> = after.values().filter_map(|i| get(i.as_str())).collect();
     let extremities: Vec<Value> = get(at).into_iter().collect();
-    Ok(serde_json::json!({ "state": state, "extremities": extremities }))
+    // The auth chain: everything the state events (and the event itself) cite, transitively.
+    let mut have: HashSet<String> = after.values().map(|i| i.to_string()).collect();
+    have.insert(at.to_string());
+    let mut todo: Vec<String> = have.iter().cloned().collect();
+    let mut chain = Vec::new();
+    while let Some(id) = todo.pop() {
+        if let Ok(mut st) = conn.prepare("SELECT auth_event_id FROM dag_auth WHERE event_id = ?1") {
+            let ids: Vec<String> = st.query_map([&id], |r| r.get::<_, String>(0)).map(|r| r.flatten().collect()).unwrap_or_default();
+            for a in ids {
+                if have.insert(a.clone()) {
+                    if let Some(p) = get(&a) {
+                        chain.push(p);
+                    }
+                    todo.push(a);
+                }
+            }
+        }
+    }
+    Ok(serde_json::json!({ "state": state, "extremities": extremities, "auth_chain": chain }))
 }
 
 /// Start (or complete) a replica of a DAG room from a peer's snapshot: every event is checked for
@@ -341,8 +565,13 @@ pub fn import_snapshot(conn: &mut Connection, room_id: &str, info: &Value, snap:
     crate::fed_rooms::create_replica_room(&tx, room_id, info, now)?;
     mark_room(&tx, room_id).map_err(|_| MatrixError::internal())?;
     let ext_ids: HashSet<OwnedEventId> = ext_v.iter().filter_map(|e| json_obj(e).ok()).filter_map(|o| dag::compute_event_id(&rules, &o).ok()).collect();
+    // The joiner re-verifies the whole auth chain: signatures, hashes, ids, and the auth rules of
+    // every event against the state its own auth events describe.
+    let chain_v = list("auth_chain");
+    let all_objs: Vec<CanonicalJsonObject> = state_v.iter().chain(ext_v.iter()).chain(chain_v.iter()).map(|v| json_obj(v).map_err(MatrixError::bad_json)).collect::<Result<_, _>>()?;
+    dag::verify_auth_chain(&rules, &all_objs, keys).map_err(bad)?;
     let mut parsed: Vec<(OwnedEventId, CanonicalJsonObject, Value)> = Vec::new();
-    for v in state_v.iter().chain(ext_v.iter()) {
+    for v in state_v.iter().chain(ext_v.iter()).chain(chain_v.iter()) {
         if v.get("room_id").and_then(Value::as_str) != Some(room_id) {
             return Err(MatrixError::bad_json("event of another room"));
         }
@@ -652,6 +881,101 @@ mod tests {
         assert_eq!(skel, 1);
         // A second pass has nothing left to do.
         assert_eq!(crate::retention::purge_delivered_events(&mut c, TS + 10_000_000, &policy).unwrap(), 0);
+    }
+
+    /// A second database standing in for another server that holds a replica of A's room (it shares
+    /// A's users and name, which is enough for the DAG logic); keys come from A.
+    fn replica_conn() -> Connection {
+        conn()
+    }
+
+    fn a_keys(a: &Connection, events: &[Value]) -> PublicKeyMap {
+        let mut keys = PublicKeyMap::new();
+        let refs: Vec<&Value> = events.iter().collect();
+        assert!(missing_keys(a, &refs, &mut keys).is_empty());
+        keys
+    }
+
+    fn room_with_bob_joined(c: &mut Connection) -> String {
+        let room = create(c, false);
+        let alice = store::mxid_of(c, 1).unwrap().unwrap();
+        let bob = store::mxid_of(c, 2).unwrap().unwrap();
+        apply_invite(c, &room, 1, &alice, InviteTarget { user_id: 2, displayname: "bob" }, NOW, TS + 10).unwrap();
+        decide_and_apply_join(c, &room, 2, &bob, "bob", NOW, TS + 20).unwrap();
+        room
+    }
+
+    #[test]
+    fn a_joiner_reverifies_the_auth_chain_and_refuses_a_missing_or_altered_link() {
+        let mut a = conn();
+        let room = room_with_bob_joined(&mut a);
+        let last = extremity_ids(&a, &room).remove(0);
+        let snap = snapshot_json(&a, &room, &last).unwrap();
+        let chain = snap["auth_chain"].as_array().unwrap().clone();
+        assert!(!chain.is_empty(), "bob's invite is superseded by his join: it travels in the chain");
+        let info = crate::fed_rooms::room_info(&a, &room).unwrap();
+
+        let try_import = |snap: &Value| {
+            let mut b = replica_conn();
+            let keys = a_keys(&a, &snapshot_events(snap));
+            let r = import_snapshot(&mut b, &room, &info, snap, &keys, NOW);
+            (r, b)
+        };
+        let (ok, b) = try_import(&snap);
+        ok.unwrap();
+        assert_eq!(count(&b, "SELECT COUNT(*) FROM dag_extremities"), 1);
+        assert_eq!(store::room_member(&b, &room, 2).unwrap().unwrap().membership, store::Membership::Join);
+
+        let mut cut = snap.clone();
+        cut["auth_chain"].as_array_mut().unwrap().remove(0);
+        let (r, b) = try_import(&cut);
+        assert!(r.is_err(), "a chain with a link missing is refused");
+        assert_eq!(count(&b, "SELECT COUNT(*) FROM rooms"), 0, "and nothing is left behind");
+
+        let mut altered = snap.clone();
+        altered["auth_chain"][0]["origin_server_ts"] = Value::from(5);
+        assert!(try_import(&altered).0.is_err(), "an altered link is refused");
+    }
+
+    #[test]
+    fn history_is_served_oldest_first_without_the_asked_for_events_and_skeletons_arrive_as_skeletons() {
+        let mut a = conn();
+        let room = room_with_bob_joined(&mut a);
+        let before = extremity_ids(&a, &room).remove(0);
+        let m1 = send(&mut a, &room, "t1", TS + 30);
+        let m2 = send(&mut a, &room, "t2", TS + 31);
+        let ids = |v: &[Value]| -> Vec<String> { v.iter().map(|p| wire_id(p).unwrap()).collect() };
+
+        // get_missing_events(earliest = before, latest = m2): exactly m1, nothing at or before `before`, not m2.
+        let got = missing_events_json(&a, &room, "example.org", &[before.clone()], &[m2.event_id.clone()], 10);
+        assert_eq!(ids(&got), vec![m1.event_id.clone()]);
+        // backfill from m2: m2 first, newest to oldest.
+        let bf = backfill_json(&a, &room, "example.org", &[m2.event_id.clone()], 100);
+        let order = ids(&bf);
+        assert_eq!(order[..2], [m2.event_id.clone(), m1.event_id.clone()]);
+
+        // m1's content is erased on A; what A serves from then on is the skeleton.
+        assert!(skeletonize(&a, &m1.event_id).unwrap());
+        let served = missing_events_json(&a, &room, "example.org", &[before.clone()], &[m2.event_id.clone()], 10);
+        assert_eq!(served[0]["content"], serde_json::json!({}));
+        assert_eq!(wire_id(&served[0]).unwrap(), m1.event_id, "same id, same signatures");
+
+        // A server that held the room at `before` takes the skeleton as history.
+        let mut b = replica_conn();
+        let snap = snapshot_json(&a, &room, &before).unwrap();
+        let info = crate::fed_rooms::room_info(&a, &room).unwrap();
+        let keys = a_keys(&a, &snapshot_events(&snap));
+        import_snapshot(&mut b, &room, &info, &snap, &keys, NOW).unwrap();
+        let keys = a_keys(&a, &served);
+        assert_eq!(process_historic(&mut b, &room, &served, &keys, NOW).unwrap(), 1);
+        let content: String = b.query_row("SELECT content FROM events WHERE event_id = ?1", [&m1.event_id], |r| r.get(0)).unwrap();
+        assert_eq!(content, "{}");
+        assert_eq!(count(&b, &format!("SELECT skeleton FROM dag_events WHERE event_id = '{}'", m1.event_id)), 1);
+        // The same call again changes nothing, and a content-altered copy of a skeleton is refused.
+        assert_eq!(process_historic(&mut b, &room, &served, &keys, NOW).unwrap(), 0);
+        let mut forged = served.clone();
+        forged[0]["content"] = serde_json::json!({"body": "x"});
+        assert!(process_historic(&mut b, &room, &forged, &keys, NOW).is_err());
     }
 
     fn peer_signer() -> Signer {

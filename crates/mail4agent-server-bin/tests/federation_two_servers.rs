@@ -7,83 +7,15 @@
 
 #[path = "support_product.rs"]
 mod support_product;
+#[path = "support/fed.rs"]
+mod support_fed;
 
-use std::io::Read;
-use std::net::TcpStream;
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use mail4agent_server::federation::enc;
 use reqwest::blocking::Client;
-use serde_json::{json, Value};
-
-struct Srv {
-    name: &'static str,
-    addr: String,
-    token: String,
-    /// Product server in front of this core; clients talk to it.
-    purl: String,
-    device: String,
-    user: String,
-    dir: PathBuf,
-    child: Option<Child>,
-}
-
-impl Drop for Srv {
-    fn drop(&mut self) {
-        if let Some(c) = self.child.as_mut() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
-
-fn key_hex() -> String {
-    let mut b = [0u8; 32];
-    std::fs::File::open("/dev/urandom").unwrap().read_exact(&mut b).unwrap();
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
-
-impl Srv {
-    fn call(&self, c: &Client, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
-        let url = format!("{}{}", self.purl, path);
-        let mut r = c.request(method.parse().unwrap(), url).bearer_auth(&self.token);
-        if let Some(b) = body {
-            r = r.json(&b);
-        }
-        let resp = r.send().unwrap();
-        (resp.status().as_u16(), resp.json().unwrap_or(Value::Null))
-    }
-}
-
-fn poll<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
-    let t = Instant::now();
-    loop {
-        if let Some(v) = f() {
-            return v;
-        }
-        assert!(t.elapsed() < Duration::from_secs(25), "timed out waiting for: {what}");
-        std::thread::sleep(Duration::from_millis(200));
-    }
-}
-
-fn bodies(a: &Srv, c: &Client, room: &str) -> Vec<String> {
-    let (_, v) = a.call(c, "GET", &format!("/client/v3/rooms/{}/messages?dir=b&limit=50", enc(room)), None);
-    v["chunk"].as_array().cloned().unwrap_or_default().iter().filter_map(|e| e["content"]["body"].as_str().or_else(|| e["content"]["ciphertext"].as_str()).map(str::to_string)).collect()
-}
-
-fn send(a: &Srv, c: &Client, room: &str, ty: &str, txn: &str, content: Value) -> Value {
-    let (st, v) = a.call(c, "PUT", &format!("/client/v3/rooms/{}/send/{}/{}", enc(room), ty, txn), Some(content));
-    assert_eq!(st, 200, "send {txn}: {v}");
-    v
-}
+use serde_json::json;
+use support_fed::{bodies, event_ids, free_port, is_hash_id, poll, send, Srv};
 
 #[test]
 fn two_servers_federate_public_room_dm_keys_and_to_device() {
@@ -178,16 +110,6 @@ fn two_servers_federate_public_room_dm_keys_and_to_device() {
     let _ = (a.name, b.name);
 }
 
-/// Event ids of one room as one server lists them (newest first).
-fn event_ids(a: &Srv, c: &Client, room: &str) -> Vec<String> {
-    let (_, v) = a.call(c, "GET", &format!("/client/v3/rooms/{}/messages?dir=b&limit=100", enc(room)), None);
-    v["chunk"].as_array().cloned().unwrap_or_default().iter().filter_map(|e| e["event_id"].as_str().map(str::to_string)).collect()
-}
-
-fn is_hash_id(id: &str) -> bool {
-    id.len() == 44 && id.starts_with('$') && !id.contains(['+', '/', '='])
-}
-
 /// Closed rooms are DAG rooms when the feature is on: every event of the room, on both servers,
 /// carries the same reference-hash id; the public channel stays legacy; m4a-fed-1 carries both.
 #[cfg(feature = "f3-hash-ids")]
@@ -248,33 +170,7 @@ fn two_servers_federate_f3_closed_rooms_and_keep_public_rooms_legacy() {
     poll("bob sees the public post", || bodies(&b, &c, &town).iter().any(|x| x == "public").then_some(()));
 }
 
+
 fn start_with_ports(name: &'static str, localpart: &str, port: u16, peer: (&str, u16)) -> Srv {
-    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let dir = PathBuf::from(format!("/tmp/m4a-fed-{}-{}-{}", name, std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)));
-    let key = key_hex();
-    std::fs::create_dir_all(&dir).unwrap();
-    let addr = format!("127.0.0.1:{port}");
-    let exe = std::env::var("CARGO_BIN_EXE_mail4agent_server_bin").or_else(|_| std::env::var("CARGO_BIN_EXE_mail4agent-server-bin")).expect("bin");
-    let child = Command::new(exe)
-        .args(["--bind", &addr, "--db", dir.join("messenger.db").to_str().unwrap(), "--server-name", name])
-        .env("M4A_DB_KEY_HEX", &key)
-        .env("M4A_FEDERATION", "1")
-        .env("M4A_FEDERATION_PEER_OVERRIDE", format!("{}=http://127.0.0.1:{}", peer.0, peer.1))
-        .env("M4A_ASSERTION_SECRET", support_product::SEAM_SECRET)
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .unwrap();
-    let t = Instant::now();
-    while TcpStream::connect(&addr).is_err() {
-        assert!(t.elapsed() < Duration::from_secs(20), "server {name} did not start");
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    // The product server in front of this core; the user's first call is its first contact.
-    let product = support_product::start_product(&format!("http://{addr}"));
-    let token = support_product::product_user(&product, localpart);
-    let who: Value = Client::new().get(format!("{}/client/v3/account/whoami", product.url)).bearer_auth(&token).send().unwrap().json().unwrap();
-    let (user, device) = (who["user_id"].as_str().unwrap().to_string(), who["device_id"].as_str().unwrap().to_string());
-    assert_eq!(user, format!("@{localpart}:{name}"));
-    Srv { name, addr, token, purl: product.url, device, user, dir, child: Some(child) }
+    support_fed::start_node(name, localpart, port, &[peer])
 }
