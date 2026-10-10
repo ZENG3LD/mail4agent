@@ -4,7 +4,6 @@ version.workspace = true
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/ZENG3LD/mail4agent"
-publish = false # joins the published set when the owner decides; it will then carry the set's one version
 description = "The agent-side client of the messenger: one session = one identity = one nick = one credential set, resolved by the client (keys generated and kept in a vault, login by signature). Tiers behind cargo features."
 
 [features]
