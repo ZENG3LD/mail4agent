@@ -10,11 +10,16 @@ description = "The agent-side client of the messenger: one session = one identit
 [features]
 # The full pack is the default; a light build turns features off.
 default = ["full"]
-full = ["tier-server", "tier-matrix", "vault-keychain"]
+full = ["tier-server", "tier-matrix", "vault-keychain", "bridges"]
 # Tier 2: our server through its own (non-Matrix) product API.
 tier-server = ["dep:reqwest"]
 # Tier 3: the Matrix client API (custom login type, same key proof).
 tier-matrix = ["dep:reqwest"]
+# The bridge framework (trait, registry, per-room consent, scoped credentials). A bridge itself is
+# one more feature, `bridge-<name>`; `bridge-loopback` is the in-memory reference skeleton and is
+# not part of `full`.
+bridges = []
+bridge-loopback = ["bridges"]
 # Keep the vault's master key in the OS keychain when there is one.
 vault-keychain = ["dep:keyring"]
 
