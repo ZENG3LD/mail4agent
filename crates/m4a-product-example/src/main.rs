@@ -70,6 +70,7 @@ async fn run() -> Result<(), String> {
         doors,
         anon_read: opt("M4A_PRODUCT_ANON_READ").is_some_and(|v| v.eq_ignore_ascii_case("on")),
         tokens: Default::default(),
+        challenges: m4a_product_kit::ChallengeBook::new(opt("M4A_PRODUCT_AUDIENCE").unwrap_or_else(|| "m4a-product".into())),
         // Access tokens given out with refresh tokens last this long; 0 turns refresh tokens off.
         access_ttl_ms: opt("M4A_PRODUCT_ACCESS_TTL_SECS").and_then(|v| v.parse::<i64>().ok()).unwrap_or(3600) * 1000,
     });

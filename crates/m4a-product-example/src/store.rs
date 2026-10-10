@@ -40,6 +40,18 @@ CREATE TABLE IF NOT EXISTS credentials (
     refresh_hash TEXT,
     refresh_expires_ms INTEGER
 );
+CREATE TABLE IF NOT EXISTS user_keys (
+    key_id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    public_key TEXT NOT NULL,
+    label TEXT NOT NULL,
+    created_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS invites (
+    code_hash TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    expires_ms INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS door_links (
     source TEXT NOT NULL,
     subject TEXT NOT NULL,
@@ -212,6 +224,44 @@ impl UserStore for SqliteStore {
         self.with(|c| {
             c.execute("UPDATE credentials SET token_hash = ?2, access_expires_ms = ?3 WHERE cred_ref = ?1", params![cred_ref, token_hash, access_expires_ms]).map_err(be).map(|_| ())
         })
+    }
+    fn supports_keys(&self) -> bool {
+        true
+    }
+    fn create_invite(&self, code_hash: &str, user_id: i64, expires_ms: i64) -> StoreResult<()> {
+        self.with(|c| c.execute("INSERT INTO invites (code_hash, user_id, expires_ms) VALUES (?1, ?2, ?3)", params![code_hash, user_id, expires_ms]).map_err(be).map(|_| ()))
+    }
+    fn take_invite(&self, code_hash: &str, now_ms: i64) -> StoreResult<Option<User>> {
+        self.with(|c| {
+            let found = c
+                .query_row(
+                    "SELECT u.id, u.nick, u.tier, u.nick_changes, u.nick_changed_ms FROM invites i JOIN users u ON u.id = i.user_id WHERE i.code_hash = ?1 AND i.expires_ms > ?2",
+                    params![code_hash, now_ms],
+                    user,
+                )
+                .optional()
+                .map_err(be)?;
+            // Spent or expired, it goes either way.
+            c.execute("DELETE FROM invites WHERE code_hash = ?1", params![code_hash]).map_err(be)?;
+            Ok(found)
+        })
+    }
+    fn add_key(&self, user_id: i64, key_id: &str, public_key: &str, label: &str, now_ms: i64) -> StoreResult<()> {
+        self.with(|c| c.execute("INSERT INTO user_keys (key_id, user_id, public_key, label, created_ms) VALUES (?1, ?2, ?3, ?4, ?5)", params![key_id, user_id, public_key, label, now_ms]).map_err(be).map(|_| ()))
+    }
+    fn user_by_key(&self, key_id: &str) -> StoreResult<Option<(User, String)>> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT u.id, u.nick, u.tier, u.nick_changes, u.nick_changed_ms, k.public_key FROM user_keys k JOIN users u ON u.id = k.user_id WHERE k.key_id = ?1",
+                params![key_id],
+                |r| Ok((user(r)?, r.get::<_, String>(5)?)),
+            )
+            .optional()
+            .map_err(be)
+        })
+    }
+    fn delete_key(&self, key_id: &str) -> StoreResult<bool> {
+        self.with(|c| c.execute("DELETE FROM user_keys WHERE key_id = ?1", params![key_id]).map_err(be).map(|n| n > 0))
     }
     fn link_door(&self, user_id: i64, source: &str, subject: &str) -> StoreResult<()> {
         self.with(|c| {

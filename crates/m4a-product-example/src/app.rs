@@ -33,6 +33,8 @@ pub struct ProductApp {
     pub tokens: m4a_product_kit::LoginTokens,
     /// Lifetime of an access token handed out with a refresh token (0 turns refresh tokens off).
     pub access_ttl_ms: i64,
+    /// Open key-login challenges (replay protection) and this product's audience name.
+    pub challenges: m4a_product_kit::ChallengeBook,
 }
 
 /// A refresh token lives this long.
@@ -113,6 +115,10 @@ pub fn router(app: App) -> Router {
     Router::new()
         .route("/product/v1/register", post(register))
         .route("/product/v1/login", post(login))
+        .route("/product/v1/enroll", post(key_enroll))
+        .route("/product/v1/login/key/challenge", post(key_challenge))
+        .route("/product/v1/login/key", post(key_login))
+        .route("/product/v1/admin/invite", post(admin_invite))
         .route("/client/v3/login", get(matrix_login_flows).post(matrix_login))
         .route("/_matrix/client/v3/login", get(matrix_login_flows).post(matrix_login))
         .route("/client/v3/refresh", post(matrix_refresh))
@@ -180,7 +186,7 @@ async fn cors(req: Request, next: axum::middleware::Next) -> Response {
 
 /// The Matrix client login flow list: a nick and a password, or a one-time login token.
 async fn matrix_login_flows() -> Json<Value> {
-    Json(json!({ "flows": [{ "type": "m.login.password" }, { "type": "m.login.token", "get_login_token": true }] }))
+    Json(json!({ "flows": [{ "type": "m.login.password" }, { "type": "m.login.token", "get_login_token": true }, { "type": m4a_seam::keyproof::LOGIN_TYPE }] }))
 }
 
 /// Matrix login on top of the product login: `m.login.password` (the nick is the user) or
@@ -189,6 +195,9 @@ async fn matrix_login_flows() -> Json<Value> {
 /// `refresh_token: true` gets an expiring access token and a refresh token.
 async fn matrix_login(State(app): State<App>, Json(body): Json<Value>) -> Result<Json<Value>, ApiError> {
     let bad = || err(StatusCode::FORBIDDEN, "M_FORBIDDEN", "invalid credentials");
+    if body.get("type").and_then(Value::as_str) == Some(m4a_seam::keyproof::LOGIN_TYPE) {
+        return matrix_key_login(&app, &body).await;
+    }
     let user = if body.get("type").and_then(Value::as_str) == Some("m.login.token") {
         let t = body.get("token").and_then(Value::as_str).unwrap_or("");
         let nick = app.tokens.redeem(t, now_ms()).ok_or_else(|| err(StatusCode::FORBIDDEN, "M_FORBIDDEN", "invalid or expired login token"))?;
@@ -563,4 +572,70 @@ async fn push(State(app): State<App>, headers: HeaderMap, axum::extract::Query(q
         }
     };
     app.link.relay_push(who, ws)
+}
+
+// ---- Login by proof of possession of a key (no password). See `m4a_seam::keyproof`.
+
+fn key_ttl(app: &App) -> i64 {
+    if app.access_ttl_ms > 0 { app.access_ttl_ms } else { 24 * 3_600_000 }
+}
+
+fn unauthorized_key() -> ApiError {
+    err(StatusCode::UNAUTHORIZED, "M_FORBIDDEN", "key proof refused")
+}
+
+/// `POST /product/v1/admin/invite {nick?, tier?}`: the operator approves one identity. The nick is
+/// assigned now. The invite code is returned once and is given to the client, never to the agent.
+async fn admin_invite(State(app): State<App>, headers: HeaderMap, Json(b): Json<Value>) -> Result<Json<Value>, ApiError> {
+    admin(&app, &headers)?;
+    let nick = b.get("nick").and_then(Value::as_str).map(str::to_string);
+    let tier = b.get("tier").and_then(Value::as_str).map(str::to_string);
+    let (code, user) = blk(&app, move |a| a.users.invite(nick.as_deref(), tier.as_deref(), now_ms())).await??;
+    Ok(Json(json!({ "invite": code, "nick": user.nick, "audience": app.challenges.audience() })))
+}
+
+/// `POST /product/v1/enroll {invite, public_key, signature, label?}`.
+async fn key_enroll(State(app): State<App>, Json(b): Json<Value>) -> Result<Json<Value>, ApiError> {
+    let s = |k: &str| b.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let (code, pk, sig, label) = (s("invite"), s("public_key"), s("signature"), s("label"));
+    let ttl = key_ttl(&app);
+    let (user, session, key_id) = blk(&app, move |a| a.users.enroll(a.challenges.audience(), &code, &pk, &sig, &label, now_ms(), ttl)).await?.map_err(|e| match e {
+        ServiceError::Unauthorized => unauthorized_key(),
+        other => other.into(),
+    })?;
+    Ok(Json(json!({ "nick": user.nick, "token": session.token, "key_id": key_id })))
+}
+
+/// `POST /product/v1/login/key/challenge {key_id}`.
+async fn key_challenge(State(app): State<App>, Json(b): Json<Value>) -> Json<Value> {
+    let kid = b.get("key_id").and_then(Value::as_str).unwrap_or("");
+    Json(serde_json::to_value(app.challenges.issue(kid, now_ms())).unwrap_or(Value::Null))
+}
+
+async fn key_session_for(app: &App, kid: String, cid: String, sig: String) -> Result<(m4a_product_kit::User, m4a_product_kit::service::Session), ApiError> {
+    let ttl = key_ttl(app);
+    blk(app, move |a| a.users.key_login(&a.challenges, &kid, &cid, &sig, now_ms(), ttl)).await?.map_err(|e| match e {
+        ServiceError::Unauthorized => unauthorized_key(),
+        other => other.into(),
+    })
+}
+
+/// `POST /product/v1/login/key {key_id, challenge_id, signature}`.
+async fn key_login(State(app): State<App>, Json(b): Json<Value>) -> Result<Json<Value>, ApiError> {
+    let s = |k: &str| b.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let (user, session) = key_session_for(&app, s("key_id"), s("challenge_id"), s("signature")).await?;
+    Ok(session_json(&user.nick, &session.token))
+}
+
+/// The Matrix carriage of the same login: type `org.m4a.login.signature`. With only `key_id` the
+/// answer is 401 carrying the challenge under the type name; with the signature it logs in.
+async fn matrix_key_login(app: &App, body: &Value) -> Result<Json<Value>, ApiError> {
+    let s = |k: &str| body.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let (kid, cid, sig) = (s("key_id"), s("challenge_id"), s("signature"));
+    if cid.is_empty() || sig.is_empty() {
+        let c = app.challenges.issue(&kid, now_ms());
+        return Err(ApiError(StatusCode::UNAUTHORIZED, json!({ "errcode": "M_UNAUTHORIZED", "error": "sign the challenge", m4a_seam::keyproof::LOGIN_TYPE: c })));
+    }
+    let (_, session) = key_session_for(app, kid, cid, sig).await?;
+    matrix_session(app, session.token).await
 }

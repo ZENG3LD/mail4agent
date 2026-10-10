@@ -33,6 +33,7 @@ pub fn start_product(core_url: &str) -> Product {
                 anon_read: false,
         tokens: Default::default(),
         access_ttl_ms: 3_600_000,
+        challenges: m4a_product_kit::ChallengeBook::new("test-product"),
             });
             let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
             tx.send(format!("http://{}", l.local_addr().expect("addr"))).expect("send");
