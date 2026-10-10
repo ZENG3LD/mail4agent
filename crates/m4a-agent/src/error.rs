@@ -13,6 +13,10 @@ pub enum AgentError {
     Refused(String),
     /// The server answered something the client does not understand.
     Protocol(String),
+    /// The host's own store (where sealed records live) failed.
+    Store(String),
+    /// The engine rejected what the server sent.
+    Ingest(String),
     /// Not enrolled yet and no invite was given.
     NeedsInvite,
 }
@@ -25,6 +29,8 @@ impl fmt::Display for AgentError {
             Self::Transport(m) => write!(f, "transport: {m}"),
             Self::Refused(m) => write!(f, "refused: {m}"),
             Self::Protocol(m) => write!(f, "protocol: {m}"),
+            Self::Store(m) => write!(f, "store: {m}"),
+            Self::Ingest(m) => write!(f, "ingest: {m}"),
             Self::NeedsInvite => write!(f, "this identity is not enrolled yet: the operator must give an invite"),
         }
     }

@@ -54,8 +54,8 @@ fn arg_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 impl OpenedStore {
     /// Display title of a room: its name, or the other members for a DM/group.
     fn room_title(&self, room_id: &RoomId) -> String {
-        let me = self.core.user_id().clone();
-        let Some(state) = self.core.room_state(room_id) else { return String::new() };
+        let me = self.driver.core.user_id().clone();
+        let Some(state) = self.driver.core.room_state(room_id) else { return String::new() };
         if let Some(name) = state.name.as_deref().filter(|n| !n.is_empty()) {
             return name.to_string();
         }
@@ -74,7 +74,7 @@ impl OpenedStore {
             return RoomId::parse(spec).map_err(|e| e.to_string());
         }
         let wanted = spec.trim_start_matches(['#', '@']).to_ascii_lowercase();
-        let ids: Vec<RoomId> = self.core.room_ids().cloned().collect();
+        let ids: Vec<RoomId> = self.driver.core.room_ids().cloned().collect();
         let by_name: Vec<RoomId> = ids
             .iter()
             .filter(|id| self.room_title(id).to_ascii_lowercase() == wanted)
@@ -101,7 +101,7 @@ impl OpenedStore {
     }
 
     fn rows(&self, room_id: &RoomId, limit: usize) -> Vec<Value> {
-        let Some(timeline) = self.core.timeline(room_id) else { return Vec::new() };
+        let Some(timeline) = self.driver.core.timeline(room_id) else { return Vec::new() };
         let mut out: Vec<Value> = timeline
             .items()
             .iter()
@@ -290,8 +290,8 @@ impl OpenedStore {
             "mentions" => {
                 let limit = a.get("limit").and_then(Value::as_u64).unwrap_or(20).min(200) as usize;
                 let me = self.nick().unwrap_or("").to_ascii_lowercase();
-                let my_id = self.core.user_id().as_str().to_string();
-                let ids: Vec<RoomId> = self.core.room_ids().cloned().collect();
+                let my_id = self.driver.core.user_id().as_str().to_string();
+                let ids: Vec<RoomId> = self.driver.core.room_ids().cloned().collect();
                 let mut hits = Vec::new();
                 for id in ids {
                     for mut row in self.rows(&id, 200) {

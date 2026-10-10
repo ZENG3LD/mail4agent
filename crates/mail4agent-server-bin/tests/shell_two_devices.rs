@@ -193,7 +193,7 @@ fn open_shell(
     token: &str,
 ) -> OpenedStore {
     let device = DeviceId::parse(device_id).expect("device id");
-    OpenedStore::open(dir, session, device, user_id, "localhost", base_url, token)
+    OpenedStore::open(dir, session, device, user_id, "localhost", std::sync::Arc::new(m4a_agent::backend::attached::AttachedBackend::with_prefix(m4a_agent::BackendKind::Server, base_url, token, false).expect("backend")), token)
         .expect("open shell")
 }
 

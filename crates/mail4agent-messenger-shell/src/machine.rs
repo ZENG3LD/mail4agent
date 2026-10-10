@@ -1174,6 +1174,7 @@ pub(crate) struct Prepared {
     pub(crate) user_id: String,
     pub(crate) device_id: DeviceId,
     pub(crate) bearer: Zeroizing<String>,
+    pub(crate) backend: Arc<dyn m4a_agent::Backend>,
     pub(crate) routine_url: Option<String>,
     pub(crate) routine_bearer: Option<String>,
 }
@@ -1185,7 +1186,7 @@ pub struct MachineClient {
     product_mode: bool,
     sessions: Vec<OpenedStore>,
     bus: Arc<LocalBus>,
-    push: crate::push::PushLink,
+    push: m4a_agent::engine::PushLink,
     /// When set, [`Self::poll_agent_directory`] rescans this folder for new
     /// bots and creates their webhook routines. Session stores already open
     /// are left alone; a new process picks up new sealed stores.
@@ -1336,6 +1337,7 @@ impl MachineClient {
                 user_id: registered.user_id,
                 device_id: registered.device_id,
                 bearer: registered.bearer,
+                backend: registered.backend,
                 routine_url: session.routine_url,
                 routine_bearer: session.routine_bearer,
             });
@@ -1368,7 +1370,7 @@ impl MachineClient {
                 item.device_id.clone(),
                 &item.user_id,
                 server_name,
-                &item.config.homeserver_url,
+                Arc::clone(&item.backend),
                 item.bearer.as_str(),
             )?;
             store.set_registered_nick(item.nick.to_string());
@@ -1398,7 +1400,7 @@ impl MachineClient {
             .map(|item| item.bearer.as_str().to_string())
             .collect();
         let product_mode = true;
-        let push = crate::push::PushLink::open(&prepared[0].config.homeserver_url, tokens, product_mode)?;
+        let push = m4a_agent::engine::PushLink::open(&prepared[0].config.homeserver_url, prepared[0].backend.keep_prefix(), tokens, product_mode)?;
         Ok(Self {
             product_mode,
             sessions: opened,
@@ -1727,6 +1729,7 @@ impl MachineClient {
             user_id: registered.user_id,
             device_id: registered.device_id,
             bearer: registered.bearer,
+                backend: registered.backend,
             routine_url: session.routine_url.clone(),
             routine_bearer: session.routine_bearer.clone(),
         };
@@ -1738,7 +1741,7 @@ impl MachineClient {
             item.device_id.clone(),
             &item.user_id,
             server_name_of(&item.user_id)?,
-            &item.config.homeserver_url,
+            Arc::clone(&item.backend),
             item.bearer.as_str(),
         )?;
         store.set_registered_nick(item.nick.to_string());
@@ -1762,7 +1765,7 @@ impl MachineClient {
             .iter()
             .map(|store| store.device_bearer().to_string())
             .collect();
-        match crate::push::PushLink::open(&self.homeserver_url, tokens, self.product_mode) {
+        match m4a_agent::engine::PushLink::open(&self.homeserver_url, self.sessions.first().is_some_and(|s| s.keep_prefix()), tokens, self.product_mode) {
             Ok(push) => {
                 let old = std::mem::replace(&mut self.push, push);
                 for (recipient, event) in old.drain() {

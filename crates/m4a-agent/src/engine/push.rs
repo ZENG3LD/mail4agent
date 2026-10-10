@@ -1,4 +1,4 @@
-//! The machine client's one socket. The client opens it against the
+//! The client's push socket. The client opens it against the
 //! homeserver it already has. Push contract **v1**: metadata only
 //! (`room`, `sender`, `event_id`, `recipient`, `wire_type`) — never a
 //! plaintext `body`. The ack goes out before the event is handed to that
@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 
 use tungstenite::{stream::MaybeTlsStream, Message};
 
-use crate::{clip_public, ShellError};
+use super::http::clip_public;
+use crate::error::AgentError;
 
 /// One room event the homeserver pushed for a single session.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,7 +38,7 @@ struct Incoming {
     event: PushedRoomEvent,
 }
 
-pub(crate) struct PushLink {
+pub struct PushLink {
     inbox: Arc<Mutex<Vec<Incoming>>>,
     stop: Arc<AtomicBool>,
     workers: Vec<JoinHandle<()>>,
@@ -55,11 +56,11 @@ impl Drop for PushLink {
 impl PushLink {
     /// One socket for all `tokens`, or with `separate` (product mode: a handshake
     /// is vouched for one identity) one socket per token sharing one inbox.
-    pub(crate) fn open(base_url: &str, tokens: Vec<String>, separate: bool) -> Result<Self, ShellError> {
+    pub fn open(base_url: &str, keep_prefix: bool, tokens: Vec<String>, separate: bool) -> Result<Self, AgentError> {
         if tokens.is_empty() {
-            return Err(ShellError::Http("push socket has no session".into()));
+            return Err(AgentError::Transport("push socket has no session".into()));
         }
-        let url = push_ws_url(base_url)?;
+        let url = push_ws_url(base_url, keep_prefix)?;
         let inbox = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let groups: Vec<Vec<String>> = if separate { tokens.into_iter().map(|t| vec![t]).collect() } else { vec![tokens] };
@@ -84,17 +85,17 @@ impl PushLink {
             }
             for failed in &faileds {
                 if let Some(err) = failed.lock().unwrap_or_else(|err| err.into_inner()).clone() {
-                    return Err(ShellError::Http(err)); // Drop stops and joins the workers
+                    return Err(AgentError::Transport(err)); // Drop stops and joins the workers
                 }
             }
             if start.elapsed() > Duration::from_secs(5) {
-                return Err(ShellError::Http("push socket did not register".into()));
+                return Err(AgentError::Transport("push socket did not register".into()));
             }
             thread::sleep(Duration::from_millis(20));
         }
     }
 
-    pub(crate) fn drain(&self) -> Vec<(String, PushedRoomEvent)> {
+    pub fn drain(&self) -> Vec<(String, PushedRoomEvent)> {
         self.inbox
             .lock()
             .unwrap_or_else(|err| err.into_inner())
@@ -104,23 +105,23 @@ impl PushLink {
     }
 }
 
-fn push_ws_url(base: &str) -> Result<String, ShellError> {
-    let url = reqwest::Url::parse(base).map_err(|_| ShellError::BaseUrl)?;
+fn push_ws_url(base: &str, keep_prefix: bool) -> Result<String, AgentError> {
+    let url = reqwest::Url::parse(base).map_err(|_| AgentError::Protocol("not a valid server URL".into()))?;
     let scheme = match url.scheme() {
         "http" => "ws",
         "https" => "wss",
-        _ => return Err(ShellError::BaseUrl),
+        _ => return Err(AgentError::Protocol("not a valid server URL".into())),
     };
     let host = url
         .host_str()
         .filter(|host| !host.is_empty())
-        .ok_or(ShellError::BaseUrl)?;
+        .ok_or(AgentError::Protocol("not a valid server URL".into()))?;
     let mut raw = format!("{scheme}://{host}");
     if let Some(port) = url.port() {
         raw.push(':');
         raw.push_str(&port.to_string());
     }
-    raw.push_str("/client/v3/push");
+    raw.push_str(if keep_prefix { "/_matrix/client/v3/push" } else { "/client/v3/push" });
     Ok(raw)
 }
 
@@ -261,9 +262,9 @@ mod tests {
 
     #[test]
     fn https_homeserver_opens_the_push_socket_as_wss() {
-        let url = push_ws_url("https://example.test/ignored").expect("url");
+        let url = push_ws_url("https://example.test/ignored", false).expect("url");
         assert_eq!(url, "wss://example.test/client/v3/push");
-        let local = push_ws_url("http://127.0.0.1:9").expect("local");
+        let local = push_ws_url("http://127.0.0.1:9", false).expect("local");
         assert_eq!(local, "ws://127.0.0.1:9/client/v3/push");
     }
 

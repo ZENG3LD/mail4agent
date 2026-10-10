@@ -18,7 +18,8 @@ use tower::util::ServiceExt;
 use zeroize::Zeroizing;
 
 use crate::machine::Prepared;
-use crate::{clip_public, percent_encode, perform_http, ShellError};
+use crate::{clip_public, ShellError};
+use m4a_agent::engine::http::percent_encode;
 
 fn localpart_of(mxid: &str) -> Result<&str, ShellError> {
     let rest = mxid
@@ -124,32 +125,29 @@ impl LocalBus {
     /// homeserver if the flag changes before the worker runs.
     pub(crate) fn fulfill(
         &self,
-        client: &reqwest::blocking::Client,
-        base_url: &reqwest::Url,
-        device_token: &str,
         user_id: &str,
         request: &OutgoingRequest,
         force_local: Option<bool>,
+        remote: &dyn Fn(&OutgoingRequest) -> Result<HttpResponseDescriptor, ShellError>,
     ) -> Result<(HttpResponseDescriptor, bool), ShellError> {
         let local = force_local.unwrap_or_else(|| self.local_only());
         if local {
-            let response = self.dispatch_local(device_token, user_id, request, true)?;
+            let response = self.dispatch_local(user_id, request, true)?;
             return Ok((response, false));
         }
         if request.kind == OutgoingRequestKind::KeysUpload {
-            let mirrored = self.dispatch_local(device_token, user_id, request, false)?;
+            let mirrored = self.dispatch_local(user_id, request, false)?;
             if !(200..300).contains(&mirrored.status) {
                 return Ok((mirrored, false));
             }
         }
         self.hits.fetch_add(1, Ordering::Relaxed);
-        let response = perform_http(client, base_url, device_token, request)?;
+        let response = remote(request)?;
         Ok((response, true))
     }
 
     fn dispatch_local(
         &self,
-        device_token: &str,
         user_id: &str,
         request: &OutgoingRequest,
         isolate_sync: bool,
@@ -167,7 +165,6 @@ impl LocalBus {
         let uri = local_uri(&request.path, &query)?;
         let method = axum::http::Method::from_bytes(request.method.as_str().as_bytes())
             .map_err(|_| ShellError::Http("unsupported method".into()))?;
-        let _ = device_token;
         let (nick, cred) = self
             .callers
             .lock()

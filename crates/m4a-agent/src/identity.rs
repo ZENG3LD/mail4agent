@@ -75,6 +75,7 @@ fn signing_key(vault: &dyn KeyVault, sid: &str) -> Result<SigningKey> {
 }
 
 /// Finds or creates identities. Everything is kept in the vault.
+#[derive(Clone)]
 pub struct IdentityStore {
     vault: Arc<dyn KeyVault>,
 }
