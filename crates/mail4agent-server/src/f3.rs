@@ -231,7 +231,12 @@ fn str_of<'a>(v: &'a Value, k: &str) -> Result<&'a str, MatrixError> {
 
 fn ensure_users(conn: &Connection, pdu: &Value, now: &str) -> Result<i64, MatrixError> {
     let sender = str_of(pdu, "sender")?;
-    let uid = crate::fed_rooms::ensure_remote_user(conn, sender, now).map_err(|_| MatrixError::bad_json("sender"))?;
+    // Events of this server's own users show up in a snapshot the peer sends back.
+    let uid = if crate::fed_rooms::is_remote_mxid(sender) {
+        crate::fed_rooms::ensure_remote_user(conn, sender, now).map_err(|_| MatrixError::bad_json("sender"))?
+    } else {
+        crate::store::user_id_of(conn, sender)?.ok_or_else(|| MatrixError::not_found("unknown local user"))?
+    };
     if pdu.get("type").and_then(Value::as_str) == Some("m.room.member") {
         let sk = str_of(pdu, "state_key")?;
         if crate::fed_rooms::is_remote_mxid(sk) {
@@ -311,15 +316,17 @@ pub fn receive_pdu(conn: &mut Connection, origin: &str, pdu: &Value, keys: &Publ
     Ok(Received { event_id: id.to_string(), duplicate: false, soft_failed: acc.soft_failed, forked: acc.forked, wake })
 }
 
-/// A snapshot of the room for a peer that joins or is invited: the current state events and the
-/// forward-extremity events, as stored wire JSON.
-pub fn snapshot_json(conn: &Connection, room: &str) -> Result<Value, MatrixError> {
+/// The room as it was right after `at` (an event this server holds): the state events of that
+/// state and the event itself, as stored wire JSON. A peer that is invited or joins starts its
+/// replica from this, with `at` as its only forward extremity, so the events that follow cite
+/// something it holds.
+pub fn snapshot_json(conn: &Connection, room: &str, at: &str) -> Result<Value, MatrixError> {
     let db = ConnDag { conn, room };
-    let rules = rules();
-    let cur = dag::current_state(&rules, &db).map_err(bad)?;
+    let id = OwnedEventId::try_from(at).map_err(|_| MatrixError::bad_json("event id"))?;
+    let after = dag::DagRead::state_after(&db, &id).ok_or_else(|| MatrixError::not_found("unknown event"))?;
     let get = |id: &str| -> Option<Value> { conn.query_row("SELECT pdu FROM dag_events WHERE event_id = ?1", [id], |r| r.get::<_, String>(0)).ok().and_then(|s| serde_json::from_str(&s).ok()) };
-    let state: Vec<Value> = cur.values().filter_map(|id| get(id.as_str())).collect();
-    let extremities: Vec<Value> = dag::DagRead::extremities(&db).iter().filter_map(|id| get(id.as_str())).collect();
+    let state: Vec<Value> = after.values().filter_map(|i| get(i.as_str())).collect();
+    let extremities: Vec<Value> = get(at).into_iter().collect();
     Ok(serde_json::json!({ "state": state, "extremities": extremities }))
 }
 
@@ -333,6 +340,7 @@ pub fn import_snapshot(conn: &mut Connection, room_id: &str, info: &Value, snap:
     let tx = conn.transaction().map_err(|_| MatrixError::internal())?;
     crate::fed_rooms::create_replica_room(&tx, room_id, info, now)?;
     mark_room(&tx, room_id).map_err(|_| MatrixError::internal())?;
+    let ext_ids: HashSet<OwnedEventId> = ext_v.iter().filter_map(|e| json_obj(e).ok()).filter_map(|o| dag::compute_event_id(&rules, &o).ok()).collect();
     let mut parsed: Vec<(OwnedEventId, CanonicalJsonObject, Value)> = Vec::new();
     for v in state_v.iter().chain(ext_v.iter()) {
         if v.get("room_id").and_then(Value::as_str) != Some(room_id) {
@@ -350,39 +358,59 @@ pub fn import_snapshot(conn: &mut Connection, room_id: &str, info: &Value, snap:
         _ => 0,
     });
     let mut state: StateMap<OwnedEventId> = StateMap::new();
+    let state_ids: HashSet<OwnedEventId> = state_v.iter().filter_map(|e| json_obj(e).ok()).filter_map(|o| dag::compute_event_id(&rules, &o).ok()).collect();
     for (id, obj, v) in &parsed {
         let pdu = Pdu::from_wire(id.clone(), obj).map_err(MatrixError::bad_json)?;
         let uid = ensure_users(&tx, v, now)?;
-        // Stored as an outlier: no edges are followed, the state group below is the snapshot.
-        tx.execute(
-            "INSERT OR IGNORE INTO dag_events (event_id, room_id, depth, event_type, sender, state_key, origin_server_ts, pdu, outlier) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
-            params![id.as_str(), room_id, pdu.depth as i64, pdu.kind.to_string(), pdu.sender.as_str(), pdu.state_key, u64::from(pdu.origin_server_ts.0) as i64, serde_json::to_string(obj).unwrap_or_default()],
-        )
-        .map_err(|_| MatrixError::internal())?;
-        for p in &pdu.prev_events {
-            let _ = tx.execute("INSERT OR IGNORE INTO dag_edges (event_id, prev_event_id) VALUES (?1, ?2)", params![id.as_str(), p.as_str()]);
+        let known = tx.query_row("SELECT 1 FROM dag_events WHERE event_id = ?1", [id.as_str()], |_| Ok(())).optional().map_err(|_| MatrixError::internal())?.is_some();
+        if !known {
+            // Stored as an outlier: its own edges are not followed, the state group below is the snapshot.
+            tx.execute(
+                "INSERT INTO dag_events (event_id, room_id, depth, event_type, sender, state_key, origin_server_ts, pdu, outlier) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
+                params![id.as_str(), room_id, pdu.depth as i64, pdu.kind.to_string(), pdu.sender.as_str(), pdu.state_key, u64::from(pdu.origin_server_ts.0) as i64, serde_json::to_string(obj).unwrap_or_default()],
+            )
+            .map_err(|_| MatrixError::internal())?;
+            for p in &pdu.prev_events {
+                let _ = tx.execute("INSERT OR IGNORE INTO dag_edges (event_id, prev_event_id) VALUES (?1, ?2)", params![id.as_str(), p.as_str()]);
+            }
+            for a in &pdu.auth_events {
+                let _ = tx.execute("INSERT OR IGNORE INTO dag_auth (event_id, auth_event_id) VALUES (?1, ?2)", params![id.as_str(), a.as_str()]);
+            }
+            let _ = tx.execute("INSERT OR REPLACE INTO fed_pdus (event_id, room_id, pdu) VALUES (?1, ?2, ?3)", params![id.as_str(), room_id, serde_json::to_string(obj).unwrap_or_default()]);
         }
-        for a in &pdu.auth_events {
-            let _ = tx.execute("INSERT OR IGNORE INTO dag_auth (event_id, auth_event_id) VALUES (?1, ?2)", params![id.as_str(), a.as_str()]);
-        }
-        let _ = tx.execute("INSERT OR REPLACE INTO fed_pdus (event_id, room_id, pdu) VALUES (?1, ?2, ?3)", params![id.as_str(), room_id, serde_json::to_string(obj).unwrap_or_default()]);
         if let Some(sk) = &pdu.state_key {
-            if state_v.iter().any(|s| dag::compute_event_id(&rules, &json_obj(s).unwrap_or_default()).ok().as_ref() == Some(id)) {
+            if state_ids.contains(id) {
                 state.insert((StateEventType::from(pdu.kind.to_string()), sk.clone()), id.clone());
-                let content = pdu.content.get().to_string();
-                crate::store::apply_state_event_raw_in_tx(&tx, id.as_str(), room_id, uid, &pdu.kind.to_string(), sk, &content, u64::from(pdu.origin_server_ts.0) as i64, now).map_err(MatrixError::from)?;
+                if !known {
+                    let content = pdu.content.get().to_string();
+                    crate::store::apply_state_event_raw_in_tx(&tx, id.as_str(), room_id, uid, &pdu.kind.to_string(), sk, &content, u64::from(pdu.origin_server_ts.0) as i64, now).map_err(MatrixError::from)?;
+                }
             }
         }
     }
+    // A replica that already exists (an invite came first) moves to the snapshot's state.
+    for ((t, k), id) in &state {
+        let have: Option<String> = tx.query_row("SELECT event_id FROM current_state WHERE room_id = ?1 AND event_type = ?2 AND state_key = ?3", params![room_id, t.to_string(), k], |r| r.get(0)).optional().map_err(|_| MatrixError::internal())?;
+        if have.as_deref() != Some(id.as_str()) {
+            crate::store::set_current_state_slot(&tx, room_id, &t.to_string(), k, id.as_str(), now).map_err(MatrixError::from)?;
+        }
+    }
     let gid = new_group(&tx, room_id, &state).map_err(|_| MatrixError::internal())?;
-    for (id, _, v) in &parsed {
-        if ext_v.iter().any(|e| e == v) || ext_v.iter().any(|e| dag::compute_event_id(&rules, &json_obj(e).unwrap_or_default()).ok().as_ref() == Some(id)) {
+    tx.execute("DELETE FROM dag_extremities WHERE room_id = ?1", [room_id]).map_err(|_| MatrixError::internal())?;
+    for (id, _, _) in &parsed {
+        if ext_ids.contains(id) {
             tx.execute("INSERT OR REPLACE INTO dag_event_state (event_id, group_id) VALUES (?1, ?2)", params![id.as_str(), gid]).map_err(|_| MatrixError::internal())?;
             tx.execute("INSERT OR IGNORE INTO dag_extremities (room_id, event_id) VALUES (?1, ?2)", params![room_id, id.as_str()]).map_err(|_| MatrixError::internal())?;
         }
     }
     tx.commit().map_err(|_| MatrixError::internal())?;
     Ok(())
+}
+
+/// Event id of a wire event that has none of its own.
+pub fn wire_id(pdu: &Value) -> Result<String, MatrixError> {
+    let obj = json_obj(pdu).map_err(MatrixError::bad_json)?;
+    Ok(dag::compute_event_id(&rules(), &obj).map_err(bad)?.to_string())
 }
 
 /// Public keys needed to check `pdus`, for signers whose keys are our own (the caller fills in
@@ -607,6 +635,25 @@ mod tests {
         receive_pdu(c, origin, pdu, &keys, NOW)
     }
 
+    #[test]
+    fn retention_turns_delivered_messages_of_dag_rooms_into_skeletons_instead_of_deleting_them() {
+        let mut c = conn();
+        crate::keys::create_matrix_keys_schema(&c).unwrap();
+        crate::retention::create_retention_schema(&c).unwrap();
+        let room = create(&mut c, false);
+        let m = send(&mut c, &room, "t1", TS + 30);
+        let policy = crate::retention::RetentionPolicy { ttl_ms: 1_000, ack_grace_ms: 0, keep_last: 0, stale_device_ms: 1 };
+        let n = crate::retention::purge_delivered_events(&mut c, TS + 10_000_000, &policy).unwrap();
+        assert_eq!(n, 1);
+        // The row stays (its place in the room), the ciphertext is gone, the id still verifies.
+        let content: String = c.query_row("SELECT content FROM events WHERE event_id = ?1", [&m.event_id], |r| r.get(0)).unwrap();
+        assert_eq!(content, "{}");
+        let skel: i64 = c.query_row("SELECT skeleton FROM dag_events WHERE event_id = ?1", [&m.event_id], |r| r.get(0)).unwrap();
+        assert_eq!(skel, 1);
+        // A second pass has nothing left to do.
+        assert_eq!(crate::retention::purge_delivered_events(&mut c, TS + 10_000_000, &policy).unwrap(), 0);
+    }
+
     fn peer_signer() -> Signer {
         let key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
         Signer::new("b.example", "ed25519:b1", move |m| key.sign(m).to_bytes())
@@ -666,7 +713,7 @@ mod tests {
         assert!(v["prev_events"].as_array().unwrap().iter().any(|p| p == m.event_id.as_str()));
 
         // The snapshot a peer would import carries the state and the extremity.
-        let snap = snapshot_json(&c, &room).unwrap();
+        let snap = snapshot_json(&c, &room, &m2.event_id).unwrap();
         assert!(snap["state"].as_array().unwrap().len() >= 7 && snap["extremities"].as_array().unwrap().len() == 1);
     }
 }

@@ -42,6 +42,24 @@ pub(crate) async fn verify_pdu(state: &Arc<Homeserver>, pdu: &Value) -> Result<b
     fr::verify_pdu_with_key(pdu, &signer, &key_id, &pk).map_err(|_| MatrixError::forbidden("bad pdu signature"))
 }
 
+/// Public keys of everyone who signed `pdus` (our own from the database, peers' fetched).
+#[cfg(feature = "f3-hash-ids")]
+pub(crate) async fn f3_keys(state: &Arc<Homeserver>, pdus: &[Value]) -> Result<m4a_matrix_core::PublicKeyMap, MatrixError> {
+    let owned = pdus.to_vec();
+    let (mut keys, need) = with_conn_pub(state, move |c| {
+        let mut keys = m4a_matrix_core::PublicKeyMap::new();
+        let refs: Vec<&Value> = owned.iter().collect();
+        let need = crate::f3::missing_keys(c, &refs, &mut keys);
+        Ok((keys, need))
+    })
+    .await?;
+    for (server, key_id) in need {
+        let pk = super::federation::remote_key(state, &server, &key_id).await?;
+        crate::f3::add_key(&mut keys, &server, &key_id, &pk)?;
+    }
+    Ok(keys)
+}
+
 fn backoff_ms(attempts: i64) -> i64 {
     (1000i64 << attempts.clamp(0, 10)).min(600_000)
 }
@@ -109,7 +127,11 @@ pub async fn drain_outbox(state: &Arc<Homeserver>) -> usize {
                         }
                     }
                 }
-                let body = json!({ "room_version": "11", "event": item.payload["event"], "room_info": item.payload["room_info"], "invite_room_state": item.payload["state"] });
+                #[allow(unused_mut)]
+                let mut body = json!({ "room_version": "11", "event": item.payload["event"], "room_info": item.payload["room_info"], "invite_room_state": item.payload["state"] });
+                if let Some(snap) = item.payload.get("f3") {
+                    body["f3"] = snap.clone();
+                }
                 let path = format!("/federation/v2/invite/{}/{}", enc(&item.room_id), enc(&item.event_id));
                 match fed_request(state, &dest, "PUT", &path, Some(body)).await {
                     Ok((200, _)) | Ok((403, _)) => {
@@ -218,6 +240,10 @@ pub(crate) async fn federated_join(state: &Arc<Homeserver>, caller: &super::Call
     if status != 200 {
         return Err(map_status(status, "make_join"));
     }
+    #[cfg(feature = "f3-hash-ids")]
+    if tmpl.get("m4a_f3").and_then(Value::as_bool) == Some(true) {
+        return federated_join_f3(state, caller, room_id, &dest, &tmpl).await;
+    }
     let mut ev = tmpl.get("event").and_then(Value::as_object).cloned().ok_or_else(|| MatrixError::unknown("make_join: no event"))?;
     let uid = caller.user_id;
     let label = with_conn_pub(state, move |c| crate::nick::effective_label(c, uid).map_err(internal)).await?;
@@ -259,6 +285,38 @@ pub(crate) async fn federated_join(state: &Arc<Homeserver>, caller: &super::Call
             fr::ingest_pdu(c, p, *ok, fr::Mode::Trusted, &now)?;
         }
         fr::store_own_pdu(c, &pdu, user_id, &mxid, &now)?;
+        let ids = crate::rooms::member_and_invited_ids(c, &room).map_err(internal)?;
+        Ok(ids.into_iter().collect::<Vec<_>>())
+    })
+    .await?;
+    Ok(ids)
+}
+
+/// Join a DAG room: the peer's template (with `prev_events`/`auth_events`/`depth`) is filled in and
+/// signed here; the answer is the room as it stood right after the join, from which the replica starts.
+#[cfg(feature = "f3-hash-ids")]
+async fn federated_join_f3(state: &Arc<Homeserver>, caller: &super::Caller, room_id: &str, dest: &str, tmpl: &Value) -> Result<Vec<i64>, MatrixError> {
+    let mut ev = tmpl.get("event").cloned().ok_or_else(|| MatrixError::unknown("make_join: no event"))?;
+    if ev.get("sender").and_then(Value::as_str) != Some(caller.mxid.as_str()) || ev.get("room_id").and_then(Value::as_str) != Some(room_id) {
+        return Err(MatrixError::unknown("make_join: template does not match the request"));
+    }
+    let uid = caller.user_id;
+    let label = with_conn_pub(state, move |c| crate::nick::effective_label(c, uid).map_err(internal)).await?;
+    if !label.is_empty() {
+        ev["content"]["displayname"] = json!(label);
+    }
+    let (event_id, pdu) = with_conn_pub(state, move |c| crate::f3::sign_own(c, &ev, fed::now_ms())).await?;
+    let (status, resp) = fed_request(state, dest, "PUT", &format!("/federation/v2/send_join/{}/{}", enc(room_id), enc(&event_id)), Some(pdu)).await?;
+    if status != 200 {
+        return Err(map_status(status, "send_join"));
+    }
+    let snap = resp.get("m4a_f3").cloned().ok_or_else(|| MatrixError::unknown("send_join: no room snapshot"))?;
+    let info = resp.get("m4a_room").cloned().ok_or_else(|| MatrixError::unknown("send_join: no room info"))?;
+    let all: Vec<Value> = ["state", "extremities"].iter().flat_map(|k| snap.get(*k).and_then(Value::as_array).cloned().unwrap_or_default()).collect();
+    let keys = f3_keys(state, &all).await?;
+    let room = room_id.to_string();
+    let ids = with_conn_pub(state, move |c| {
+        crate::f3::import_snapshot(c, &room, &info, &snap, &keys, &now_rfc3339())?;
         let ids = crate::rooms::member_and_invited_ids(c, &room).map_err(internal)?;
         Ok(ids.into_iter().collect::<Vec<_>>())
     })

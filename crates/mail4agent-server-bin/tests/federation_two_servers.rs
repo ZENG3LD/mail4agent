@@ -178,8 +178,79 @@ fn two_servers_federate_public_room_dm_keys_and_to_device() {
     let _ = (a.name, b.name);
 }
 
+/// Event ids of one room as one server lists them (newest first).
+fn event_ids(a: &Srv, c: &Client, room: &str) -> Vec<String> {
+    let (_, v) = a.call(c, "GET", &format!("/client/v3/rooms/{}/messages?dir=b&limit=100", enc(room)), None);
+    v["chunk"].as_array().cloned().unwrap_or_default().iter().filter_map(|e| e["event_id"].as_str().map(str::to_string)).collect()
+}
+
+fn is_hash_id(id: &str) -> bool {
+    id.len() == 44 && id.starts_with('$') && !id.contains(['+', '/', '='])
+}
+
+/// Closed rooms are DAG rooms when the feature is on: every event of the room, on both servers,
+/// carries the same reference-hash id; the public channel stays legacy; m4a-fed-1 carries both.
+#[cfg(feature = "f3-hash-ids")]
+#[test]
+fn two_servers_federate_f3_closed_rooms_and_keep_public_rooms_legacy() {
+    let (ra, rb) = (free_port(), free_port());
+    let a = start_with_ports("a.example", "alice", ra, ("b.example", rb));
+    let b = start_with_ports("b.example", "bob", rb, ("a.example", ra));
+    let c = Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
+    let ct = |tag: &str| json!({"algorithm":"m.megolm.v1.aes-sha2","sender_key":"k","session_id":"s","device_id":"D","ciphertext":format!("ct-{tag}")});
+
+    // A closed group: invite across servers, join, messages both ways.
+    let (st, v) = a.call(&c, "POST", "/client/v3/createRoom", Some(json!({"visibility":"private","name":"closed","invite":[b.user]})));
+    assert_eq!(st, 200, "create: {v}");
+    let room = v["room_id"].as_str().unwrap().to_string();
+    poll("bob has the invite", || b.call(&c, "GET", "/client/v3/sync?timeout=0", None).1["rooms"]["invite"].get(&room).map(|_| ()));
+    let (st, v) = b.call(&c, "POST", &format!("/client/v3/rooms/{}/join", enc(&room)), Some(json!({})));
+    assert_eq!(st, 200, "bob joins the f3 room: {v}");
+    poll("alice sees bob joined", || a.call(&c, "GET", &format!("/client/v3/rooms/{}/joined_members", enc(&room)), None).1["joined"].get(&b.user).map(|_| ()));
+
+    let m1 = send(&a, &c, &room, "m.room.encrypted", "m1", ct("a1"))["event_id"].as_str().unwrap().to_string();
+    assert!(is_hash_id(&m1), "sender gets the computed id back: {m1}");
+    poll("bob receives alice's message", || bodies(&b, &c, &room).iter().any(|x| x == "ct-a1").then_some(()));
+    let m2 = send(&b, &c, &room, "m.room.encrypted", "m2", ct("b1"))["event_id"].as_str().unwrap().to_string();
+    assert!(is_hash_id(&m2), "{m2}");
+    poll("alice receives bob's message", || bodies(&a, &c, &room).iter().any(|x| x == "ct-b1").then_some(()));
+
+    // Both servers hold the same events under the same ids.
+    let (ea, eb) = (event_ids(&a, &c, &room), event_ids(&b, &c, &room));
+    for id in [&m1, &m2] {
+        assert!(ea.contains(id) && eb.contains(id), "{id} is on both servers: a={ea:?} b={eb:?}");
+    }
+    assert!(ea.iter().all(|i| is_hash_id(i)), "every event of the room on a is hash-id: {ea:?}");
+    assert!(eb.iter().all(|i| is_hash_id(i)), "every event of the room on b is hash-id: {eb:?}");
+
+    // State written on one side shows on the other: power levels (a), then a rename by bob (b), both checked by the DAG's auth rules.
+    let pl_path = format!("/client/v3/rooms/{}/state/m.room.power_levels", enc(&room));
+    let (_, mut pl) = a.call(&c, "GET", &pl_path, None);
+    pl["users"][&b.user] = json!(50);
+    assert_eq!(a.call(&c, "PUT", &pl_path, Some(pl)).0, 200);
+    poll("b sees the new power levels", || (b.call(&c, "GET", &pl_path, None).1["users"][&b.user] == json!(50)).then_some(()));
+    let name_path = format!("/client/v3/rooms/{}/state/m.room.name", enc(&room));
+    let (st, _) = b.call(&c, "PUT", &name_path, Some(json!({"name":"renamed by bob"})));
+    assert_eq!(st, 200);
+    poll("a sees bob's rename", || (a.call(&c, "GET", &name_path, None).1["name"] == json!("renamed by bob")).then_some(()));
+
+    // Bob leaves; alice sees it.
+    assert_eq!(b.call(&c, "POST", &format!("/client/v3/rooms/{}/leave", enc(&room)), Some(json!({}))).0, 200);
+    poll("alice sees bob left", || a.call(&c, "GET", &format!("/client/v3/rooms/{}/joined_members", enc(&room)), None).1["joined"].get(&b.user).is_none().then_some(()));
+
+    // A public channel is not part of the layer: it still federates with legacy ids (the m4a-fed-1 test above covers its flow).
+    let (_, v) = a.call(&c, "POST", "/client/v3/createRoom", Some(json!({"visibility":"public","name":"town"})));
+    let town = v["room_id"].as_str().unwrap().to_string();
+    let e = send(&a, &c, &town, "m.room.message", "p1", json!({"msgtype":"m.text","body":"public"}))["event_id"].as_str().unwrap().to_string();
+    assert!(!is_hash_id(&e), "public channel keeps legacy ids: {e}");
+    let (st, _) = b.call(&c, "POST", &format!("/client/v3/rooms/{}/join", enc(&town)), Some(json!({})));
+    assert_eq!(st, 200);
+    poll("bob sees the public post", || bodies(&b, &c, &town).iter().any(|x| x == "public").then_some(()));
+}
+
 fn start_with_ports(name: &'static str, localpart: &str, port: u16, peer: (&str, u16)) -> Srv {
-    let dir = PathBuf::from(format!("/tmp/m4a-fed-{}-{}", name, std::process::id()));
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = PathBuf::from(format!("/tmp/m4a-fed-{}-{}-{}", name, std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)));
     let key = key_hex();
     std::fs::create_dir_all(&dir).unwrap();
     let addr = format!("127.0.0.1:{port}");

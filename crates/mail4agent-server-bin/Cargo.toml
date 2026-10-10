@@ -13,6 +13,10 @@ description = "Loopback process for the mail4agent messenger homeserver. Listens
 name = "mail4agent-server-bin"
 path = "src/main.rs"
 
+[features]
+# Rooms created while this is on are DAG rooms (hash ids, signed events). Off by default.
+f3-hash-ids = ["mail4agent-server/f3-hash-ids"]
+
 [dependencies]
 mail4agent-server = { workspace = true  }
 # Names the connection type init_messenger_db returns. Features stay on

@@ -327,6 +327,10 @@ pub fn ingest_pdu(conn: &mut Connection, pdu: &Value, content_ok: bool, mode: Mo
     let get = |k: &str| pdu.get(k).and_then(Value::as_str).map(str::to_string);
     let event_id = get("event_id").ok_or_else(|| MatrixError::bad_json("event_id"))?;
     let room_id = get("room_id").ok_or_else(|| MatrixError::bad_json("room_id"))?;
+    #[cfg(feature = "f3-hash-ids")]
+    if crate::f3::is_f3_room(conn, &room_id) {
+        return Err(MatrixError::forbidden("this room is a DAG room: events arrive as hashed events"));
+    }
     let sender = get("sender").ok_or_else(|| MatrixError::bad_json("sender"))?;
     let ty = get("type").ok_or_else(|| MatrixError::bad_json("type"))?;
     let ts = pdu.get("origin_server_ts").and_then(Value::as_i64).ok_or_else(|| MatrixError::bad_json("origin_server_ts"))?;
@@ -445,7 +449,14 @@ pub fn export_local_events(conn: &Connection, local: &str, now_ms: i64) -> Resul
         };
         for d in &domains {
             if invitee_domain.as_deref() == Some(d.as_str()) {
-                let payload = json!({ "event": pdu, "room_info": room_info(conn, &ev.room_id)?, "state": local_state_pdus(conn, &ev.room_id, local, now_ms)? });
+                #[allow(unused_mut)]
+                let mut payload = json!({ "event": pdu, "room_info": room_info(conn, &ev.room_id)?, "state": local_state_pdus(conn, &ev.room_id, local, now_ms)? });
+                #[cfg(feature = "f3-hash-ids")]
+                if crate::f3::is_f3_room(conn, &ev.room_id) {
+                    // A DAG room's invite carries the room as it stood after the invite itself.
+                    payload["state"] = json!([]);
+                    payload["f3"] = crate::f3::snapshot_json(conn, &ev.room_id, &ev.event_id).map_err(|e| FedError::Malformed(e.error))?;
+                }
                 enqueue(conn, d, "invite", &ev.room_id, &ev.event_id, &payload, now_ms)?;
             } else {
                 enqueue(conn, d, "send", &ev.room_id, &ev.event_id, &pdu, now_ms)?;

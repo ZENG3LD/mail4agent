@@ -117,6 +117,26 @@ async fn send_txn(
     let mut results = serde_json::Map::new();
     let mut wake_all: Vec<i64> = Vec::new();
     for pdu in pdus {
+        #[cfg(feature = "f3-hash-ids")]
+        if crate::f3::is_f3_wire(&pdu) {
+            let id = crate::f3::wire_id(&pdu).unwrap_or_else(|_| "?".to_string());
+            let res = async {
+                let keys = super::fed_net::f3_keys(&state, std::slice::from_ref(&pdu)).await?;
+                let (p, o) = (pdu.clone(), origin.clone());
+                with_conn_pub(&state, move |c| crate::f3::receive_pdu(c, &o, &p, &keys, &rfc3339())).await
+            }
+            .await;
+            match res {
+                Ok(r) => {
+                    wake_all.extend(r.wake);
+                    results.insert(id, json!({}));
+                }
+                Err(e) => {
+                    results.insert(id, json!({ "error": e.error }));
+                }
+            }
+            continue;
+        }
         let id = pdu.get("event_id").and_then(Value::as_str).unwrap_or("?").to_string();
         let outcome = match super::fed_net::verify_pdu(&state, &pdu).await {
             Ok(content_ok) => {
@@ -190,6 +210,11 @@ async fn make_join(
             _ if room.join_rule == crate::store::JoinRule::Public => {}
             _ => return Err(MatrixError::forbidden("room is not open to this user")),
         }
+        #[cfg(feature = "f3-hash-ids")]
+        if crate::f3::is_f3_room(c, &room_id) {
+            let event = crate::f3::join_template(c, &room_id, &user_id, fed::now_ms())?;
+            return Ok(Json(json!({ "room_version": room.room_version, "event": event, "m4a_f3": true })));
+        }
         Ok(Json(json!({
             "room_version": room.room_version,
             "event": {
@@ -211,6 +236,10 @@ async fn send_join(
     require_enabled(&state)?;
     let origin = authenticate(&state, "PUT", &uri, &headers, &body).await?;
     let pdu = parse_body(&body)?;
+    #[cfg(feature = "f3-hash-ids")]
+    if crate::f3::is_f3_wire(&pdu) {
+        return send_join_f3(&state, &origin, &room_id, &event_id, pdu).await;
+    }
     let sender = pdu.get("sender").and_then(Value::as_str).unwrap_or_default().to_string();
     let is_join = pdu.get("type").and_then(Value::as_str) == Some("m.room.member")
         && pdu.get("content").and_then(|c| c.get("membership")).and_then(Value::as_str) == Some("join")
@@ -254,6 +283,33 @@ async fn send_join(
     Ok(Json(resp.1))
 }
 
+/// A peer's signed join of a DAG room: checked and accepted like any event (so a join that raced
+/// another event forks the DAG and is merged by state resolution), answered with the room as it
+/// stood right after the join.
+#[cfg(feature = "f3-hash-ids")]
+async fn send_join_f3(state: &Arc<Homeserver>, origin: &str, room_id: &str, event_id: &str, pdu: Value) -> Result<Json<Value>, MatrixError> {
+    let sender = pdu.get("sender").and_then(Value::as_str).unwrap_or_default().to_string();
+    let is_join = pdu.get("type").and_then(Value::as_str) == Some("m.room.member")
+        && pdu.get("content").and_then(|c| c.get("membership")).and_then(Value::as_str) == Some("join")
+        && pdu.get("state_key").and_then(Value::as_str) == Some(sender.as_str());
+    if !is_join || pdu.get("room_id").and_then(Value::as_str) != Some(room_id) || crate::f3::wire_id(&pdu)? != event_id {
+        return Err(MatrixError::bad_json("not a valid join event for this request"));
+    }
+    let keys = super::fed_net::f3_keys(state, std::slice::from_ref(&pdu)).await?;
+    let (p, o, room) = (pdu.clone(), origin.to_string(), room_id.to_string());
+    let eid = event_id.to_string();
+    let local = crate::store::matrix_server_name().to_string();
+    let (wake, snap, info) = with_conn_pub(state, move |c| {
+        let got = crate::f3::receive_pdu(c, &o, &p, &keys, &rfc3339())?;
+        let snap = crate::f3::snapshot_json(c, &room, &eid)?;
+        let info = fr::room_info(c, &room).map_err(internal)?;
+        Ok((got.wake, snap, info))
+    })
+    .await?;
+    after_ingest(state, wake);
+    Ok(Json(json!({ "origin": local, "state": [], "auth_chain": [], "m4a_room": info, "m4a_f3": snap })))
+}
+
 async fn invite(
     State(state): State<Arc<Homeserver>>,
     OriginalUri(uri): OriginalUri,
@@ -269,6 +325,31 @@ async fn invite(
     let state_pdus = v.get("invite_room_state").and_then(Value::as_array).cloned().unwrap_or_default();
     let sender = event.get("sender").and_then(Value::as_str).unwrap_or_default();
     let invitee = event.get("state_key").and_then(Value::as_str).unwrap_or_default().to_string();
+    #[cfg(feature = "f3-hash-ids")]
+    if let Some(snap) = v.get("f3").cloned() {
+        let is_invite = event.get("type").and_then(Value::as_str) == Some("m.room.member")
+            && event.get("content").and_then(|c| c.get("membership")).and_then(Value::as_str) == Some("invite")
+            && fr::domain_of(sender) == Some(origin.as_str())
+            && event.get("room_id").and_then(Value::as_str) == Some(room_id.as_str())
+            && !fr::is_remote_mxid(&invitee)
+            && crate::f3::wire_id(&event)? == event_id;
+        if !is_invite {
+            return Err(MatrixError::bad_json("not a valid invite for this request"));
+        }
+        let all: Vec<Value> = ["state", "extremities"].iter().flat_map(|k| snap.get(*k).and_then(Value::as_array).cloned().unwrap_or_default()).collect();
+        if !all.iter().any(|p| p == &event) {
+            return Err(MatrixError::bad_json("the snapshot does not contain the invite"));
+        }
+        let keys = super::fed_net::f3_keys(&state, &all).await?;
+        let room = room_id.clone();
+        let wake = with_conn_pub(&state, move |c| {
+            crate::f3::import_snapshot(c, &room, &info, &snap, &keys, &rfc3339())?;
+            Ok(crate::rooms::member_and_invited_ids(c, &room).map_err(internal)?)
+        })
+        .await?;
+        after_ingest(&state, wake);
+        return Ok(Json(json!({ "event": event })));
+    }
     let is_invite = event.get("type").and_then(Value::as_str) == Some("m.room.member")
         && event.get("content").and_then(|c| c.get("membership")).and_then(Value::as_str) == Some("invite");
     if !is_invite
