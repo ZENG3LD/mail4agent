@@ -220,6 +220,9 @@ pub enum MatrixStoreError {
     /// allows to be redacted (the `String` is that `event_type`) — see
     /// [`redact_event`]'s doc comment.
     UnredactableEvent(String),
+    /// A room of the DAG layer (feature `f3-hash-ids`) refused an event: the auth rules or a
+    /// signature check said no. The message is the reason.
+    F3Rejected(String),
 }
 
 impl From<rusqlite::Error> for MatrixStoreError {
@@ -554,6 +557,7 @@ pub fn create_matrix_schema(conn: &Connection) -> rusqlite::Result<()> {
     crate::public_forum::create_forum_schema(conn)?;
     crate::media::create_media_schema(conn)?;
     crate::fed_rooms::create_fed_schema(conn)?;
+    crate::dag_schema::create_dag_schema(conn)?;
     crate::identities::create_identities_schema(conn)
 }
 
@@ -839,14 +843,14 @@ fn collect_events(rows: &mut rusqlite::Rows<'_>) -> rusqlite::Result<Vec<MatrixE
 /// [`insert_timeline_event_in_tx`] (its callers all build one; the public
 /// writers spell the same fields out as separate arguments).
 #[derive(Debug, Clone, Copy)]
-struct TimelineEventRow<'a> {
-    event_id: &'a str,
-    room_id: &'a str,
-    sender_user_id: i64,
-    event_type: &'a str,
-    content: &'a str,
-    origin_server_ts: i64,
-    txn_id: Option<&'a str>,
+pub(crate) struct TimelineEventRow<'a> {
+    pub(crate) event_id: &'a str,
+    pub(crate) room_id: &'a str,
+    pub(crate) sender_user_id: i64,
+    pub(crate) event_type: &'a str,
+    pub(crate) content: &'a str,
+    pub(crate) origin_server_ts: i64,
+    pub(crate) txn_id: Option<&'a str>,
 }
 
 /// The `&Transaction`-scoped core of [`insert_timeline_event`]. Room
@@ -858,6 +862,18 @@ struct TimelineEventRow<'a> {
 /// replay) can call it directly instead of re-deriving a transaction-scoped
 /// version of this logic.
 fn insert_timeline_event_in_tx(tx: &Transaction, row: &TimelineEventRow<'_>) -> Result<MatrixEvent, MatrixStoreError> {
+    // A room of the DAG layer (feature `f3-hash-ids`) gets a signed event with a computed id,
+    // built and stored in this same transaction; every other room is untouched.
+    #[cfg(feature = "f3-hash-ids")]
+    if let Some(p) = crate::f3::prepare_local(tx, row.room_id, row.sender_user_id, row.event_type, None, row.content, row.origin_server_ts)? {
+        let row = TimelineEventRow { event_id: &p.event_id, content: &p.content, ..*row };
+        return insert_timeline_event_raw_in_tx(tx, &row);
+    }
+    insert_timeline_event_raw_in_tx(tx, row)
+}
+
+/// The plain write: the caller already chose the id (legacy rooms) or the DAG layer did.
+pub(crate) fn insert_timeline_event_raw_in_tx(tx: &Transaction, row: &TimelineEventRow<'_>) -> Result<MatrixEvent, MatrixStoreError> {
     let TimelineEventRow { event_id, room_id, sender_user_id, event_type, content, origin_server_ts, txn_id } = *row;
     let stream_id = next_stream_id(tx)?;
     tx.execute(
@@ -947,7 +963,7 @@ pub fn insert_timeline_event_deduped(
     }
     let row = TimelineEventRow { event_id, room_id, sender_user_id, event_type, content, origin_server_ts, txn_id: Some(txn_id) };
     let event = insert_timeline_event_in_tx(&tx, &row)?;
-    txn_dedup_record(&tx, sender_user_id, device_id, txn_id, Some(event_id), now)?;
+    txn_dedup_record(&tx, sender_user_id, device_id, txn_id, Some(&event.event_id), now)?;
     tx.commit()?;
     Ok(DedupedWrite::New(event))
 }
@@ -961,6 +977,28 @@ pub fn insert_timeline_event_deduped(
 /// transaction").
 #[allow(clippy::too_many_arguments)]
 fn apply_state_event_in_tx(
+    tx: &Transaction,
+    event_id: &str,
+    room_id: &str,
+    sender_user_id: i64,
+    event_type: &str,
+    state_key: &str,
+    content: &str,
+    origin_server_ts: i64,
+    now: &str,
+) -> Result<MatrixEvent, MatrixStoreError> {
+    // Rooms of the DAG layer (feature `f3-hash-ids`): signed event, computed id, DAG rows and the
+    // projection below all land in this one transaction.
+    #[cfg(feature = "f3-hash-ids")]
+    if let Some(p) = crate::f3::prepare_local(tx, room_id, sender_user_id, event_type, Some(state_key), content, origin_server_ts)? {
+        return apply_state_event_raw_in_tx(tx, &p.event_id, room_id, sender_user_id, event_type, state_key, &p.content, origin_server_ts, now);
+    }
+    apply_state_event_raw_in_tx(tx, event_id, room_id, sender_user_id, event_type, state_key, content, origin_server_ts, now)
+}
+
+/// The plain state write (event row, `current_state` slot, membership and power caches).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_state_event_raw_in_tx(
     tx: &Transaction,
     event_id: &str,
     room_id: &str,
@@ -1001,6 +1039,26 @@ fn apply_state_event_in_tx(
         redacts: None,
         redacted_by: None,
     })
+}
+
+/// Point a `current_state` slot at `event_id` (an already stored state event) and refresh the
+/// membership and power-level caches from that event's content. Used by the DAG layer when state
+/// resolution picks a different winner than the event that was written last.
+#[cfg_attr(not(feature = "f3-hash-ids"), allow(dead_code))]
+pub(crate) fn set_current_state_slot(tx: &Transaction, room_id: &str, event_type: &str, state_key: &str, event_id: &str, now: &str) -> Result<(), MatrixStoreError> {
+    let content: String = tx.query_row("SELECT content FROM events WHERE event_id = ?1", params![event_id], |r| r.get(0))?;
+    tx.execute(
+        "INSERT INTO current_state (room_id, event_type, state_key, event_id) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(room_id, event_type, state_key) DO UPDATE SET event_id = excluded.event_id",
+        params![room_id, event_type, state_key, event_id],
+    )?;
+    if event_type == "m.room.member" {
+        refresh_room_member(tx, room_id, state_key, &content, now)?;
+    }
+    if event_type == "m.room.power_levels" {
+        refresh_power_levels(tx, room_id, &content)?;
+    }
+    Ok(())
 }
 
 /// One state event for [`apply_state_event`]: its identity, the state slot
@@ -1196,6 +1254,12 @@ pub fn create_room_with_state(
         bootstrap.dm_pair_key,
         bootstrap.legacy_dm_id,
     )?;
+    // New closed rooms are DAG rooms when the layer is compiled in; rooms created before stay legacy.
+    // Plaintext public channels live in the public store (`pub_events`) and stay legacy.
+    #[cfg(feature = "f3-hash-ids")]
+    if !(bootstrap.kind == RoomKind::Channel && !bootstrap.is_encrypted) {
+        crate::f3::mark_room(&tx, bootstrap.room_id)?;
+    }
 
     let mut applied = Vec::with_capacity(state_events.len());
     for event in state_events {
@@ -1237,7 +1301,7 @@ pub fn create_room_with_state(
 /// [`MatrixStoreError::UnknownMxid`]. `power_level` is left untouched on an
 /// existing row (only [`refresh_power_levels`] ever sets it) and starts
 /// `NULL` (falls back to `users_default`) on a brand-new one.
-fn refresh_room_member(tx: &Transaction, room_id: &str, state_key: &str, content: &str, now: &str) -> Result<(), MatrixStoreError> {
+pub(crate) fn refresh_room_member(tx: &Transaction, room_id: &str, state_key: &str, content: &str, now: &str) -> Result<(), MatrixStoreError> {
     let value: serde_json::Value = serde_json::from_str(content)?;
     let membership_str = value
         .get("membership")
@@ -1263,7 +1327,7 @@ fn refresh_room_member(tx: &Transaction, room_id: &str, state_key: &str, content
 /// resolved fresh from the room's current `m.room.power_levels` by whatever
 /// reads it (a later piece; this table is a cache of the last-seen event,
 /// not re-derived from an entry that never had a member row to land on).
-fn refresh_power_levels(tx: &Transaction, room_id: &str, content: &str) -> Result<(), MatrixStoreError> {
+pub(crate) fn refresh_power_levels(tx: &Transaction, room_id: &str, content: &str) -> Result<(), MatrixStoreError> {
     let value: serde_json::Value = serde_json::from_str(content)?;
     tx.execute("UPDATE room_members SET power_level = NULL WHERE room_id = ?1", params![room_id])?;
     if let Some(users) = value.get("users").and_then(|v| v.as_object()) {

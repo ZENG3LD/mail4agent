@@ -88,6 +88,24 @@ fn resolve_over(rules: &RoomVersionRules, db: &dyn DagRead, ids: &[OwnedEventId]
     }
 }
 
+/// The store plus the event being accepted, which is not written yet.
+struct WithNew<'a> {
+    db: &'a dyn DagRead,
+    pdu: &'a Pdu,
+}
+
+impl DagRead for WithNew<'_> {
+    fn pdu(&self, id: &EventId) -> Option<Pdu> {
+        if id == self.pdu.event_id { Some(self.pdu.clone()) } else { self.db.pdu(id) }
+    }
+    fn state_after(&self, id: &EventId) -> Option<StateMap<OwnedEventId>> {
+        self.db.state_after(id)
+    }
+    fn extremities(&self) -> Vec<OwnedEventId> {
+        self.db.extremities()
+    }
+}
+
 /// The room's current state: the forward extremities' states, resolved.
 pub fn current_state(rules: &RoomVersionRules, db: &dyn DagRead) -> Result<StateMap<OwnedEventId>, Reject> {
     resolve_over(rules, db, &db.extremities(), None)
@@ -169,7 +187,7 @@ pub fn accept(rules: &RoomVersionRules, db: &dyn DagRead, event_id: OwnedEventId
     ext.push(event_id.clone());
     ext.sort();
     let forked = ext.len() > 1;
-    let current_state = resolve_over(rules, db, &ext, Some((&event_id, &state_after)))?;
+    let current_state = resolve_over(rules, &WithNew { db, pdu: &pdu }, &ext, Some((&event_id, &state_after)))?;
     Ok(Accepted { event_id, pdu, json, state_after, soft_failed: false, extremities: ext, current_state, forked })
 }
 

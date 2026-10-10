@@ -760,13 +760,6 @@ pub fn apply_create_room(
         dm_pair_key: dm_pair.as_deref(),
         legacy_dm_id: None,
     };
-    // F3 spike: a NEW room gets signed v11 events with computed ids. Any failure keeps the legacy
-    // events, so the flag can never make room creation fail.
-    #[cfg(feature = "f3-hash-ids")]
-    let state_events = match crate::f3::hash_bootstrap(conn, &room_id, req.creator_mxid, &state_events, origin_ts) {
-        Ok(events) => events,
-        Err(_) => state_events,
-    };
     crate::store::create_room_with_state(conn, bootstrap, &state_events, origin_ts)?;
     let mut notify_user_ids: HashSet<i64> = req.invitees.iter().map(|invitee| invitee.user_id).collect();
     notify_user_ids.insert(req.creator_user_id);
@@ -836,11 +829,10 @@ pub fn apply_put_state(
         let new_power_levels: serde_json::Value = serde_json::from_str(content)?;
         crate::store::validate_power_levels_change(&power_levels, &new_power_levels, sender_mxid).map_err(MatrixError::forbidden)?;
     }
-    let event_id = crate::store::new_event_id();
-    crate::store::apply_state_event(
+    let event = crate::store::apply_state_event(
         conn,
         &crate::store::StateEventWrite {
-            event_id: &event_id,
+            event_id: &crate::store::new_event_id(),
             room_id,
             sender_user_id,
             event_type,
@@ -851,7 +843,7 @@ pub fn apply_put_state(
         },
     )?;
     let notify = member_and_invited_ids(conn, room_id)?;
-    Ok((event_id, notify))
+    Ok((event.event_id, notify))
 }
 
 /// Forget a room the caller has already left.

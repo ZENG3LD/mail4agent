@@ -151,6 +151,8 @@ fn partitioned_servers_converge_on_the_same_state_after_exchanging_a_fork() {
     let on_b = b.receive(&a, &xa.event_id).unwrap();
     assert!(on_a.forked && on_b.forked, "two forward extremities");
     assert_eq!(a.extremities(), b.extremities());
+    assert_eq!(on_a.current_state, a.current(), "the state reported at acceptance is the resolved one, new event included");
+    assert_eq!(on_b.current_state, b.current());
     assert_eq!(a.current(), b.current(), "state resolution v2 gives both servers the same room state");
     assert_eq!(a.name(), Some(yb.event_id.clone()), "equal-mainline conflict: the later timestamp wins");
     // The next event cites both branches and closes the fork.

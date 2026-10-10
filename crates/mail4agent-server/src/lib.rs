@@ -13,6 +13,7 @@ pub mod identities;
 pub mod policy;
 pub mod ephemeral;
 pub mod error;
+pub mod dag_schema;
 pub mod events;
 #[cfg(feature = "f3-hash-ids")]
 pub mod f3;

@@ -153,6 +153,7 @@ impl From<MatrixStoreError> for MatrixError {
                 MatrixError::invalid_param(format!("Invalid relation target: {id}"))
             }
             MatrixStoreError::WrongRoom(id) => MatrixError::invalid_param(format!("Event is not in this room: {id}")),
+            MatrixStoreError::F3Rejected(why) => MatrixError::forbidden(format!("Refused by the room's auth rules: {why}")),
             MatrixStoreError::UnredactableEvent(t) => {
                 MatrixError::forbidden(format!("This event type cannot be redacted: {t}"))
             }

@@ -142,6 +142,15 @@ pub fn purge_delivered_events(conn: &mut Connection, now_ms: i64, policy: &Reten
         // the room's history stays verifiable for remote servers; only the ciphertext goes.
         let room: Option<String> = tx.query_row("SELECT room_id FROM events WHERE event_id = ?1", params![id], |r| r.get(0)).ok();
         if let Some(room) = room {
+            // DAG rooms (feature `f3-hash-ids`) keep a skeleton whether federated or not, once no
+            // federation delivery of the event is still queued; otherwise it waits for a later pass.
+            #[cfg(feature = "f3-hash-ids")]
+            if crate::f3::is_f3_room(&tx, &room) {
+                if crate::f3::skeletonize(&tx, id).map_err(|_| rusqlite::Error::InvalidQuery)? {
+                    removed += 1;
+                }
+                continue;
+            }
             if crate::fed_rooms::room_is_federated(&tx, &room)? {
                 crate::fed_rooms::skeletonize_event(&tx, id)?;
                 removed += 1;
