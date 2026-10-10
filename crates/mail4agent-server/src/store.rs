@@ -585,6 +585,12 @@ pub fn open_messenger_db(path: &str, key_hex: &str) -> Result<tesserax_store::Db
     Ok(db)
 }
 
+/// Parallel read-only connections (same file, same key) for the store opened by [`open_messenger_db`].
+pub fn open_read_pool(path: &str, key_hex: &str, size: usize) -> Result<tesserax_store::ReadPool, String> {
+    let cfg = messenger_db_config(path, key_hex)?;
+    tesserax_store::ReadPoolConfig::from_config(cfg).pool_size(size.max(1)).open().map_err(|e| e.to_string())
+}
+
 /// Creates every messenger table that does not exist yet (idempotent).
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     create_matrix_schema(conn)?;

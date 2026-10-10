@@ -106,6 +106,12 @@ fn run() -> Result<(), String> {
     }
     db.blocking(|conn| Ok(run_boot_migrations(conn))).map_err(|e| format!("store: {e}"))??;
     let hs = Arc::new(Homeserver::from_db(db));
+    {
+        // Parallel readers for sync and history (M4A_READ_POOL, default 4); writes stay on the one writer.
+        let size = env::var("M4A_READ_POOL").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4);
+        let path = db_path.to_str().ok_or_else(|| "db path is not utf-8".to_string())?;
+        let _ = hs.readers.set(mail4agent_server::store::open_read_pool(path, &key_hex, size)?);
+    }
     if let Ok(url) = env::var("M4A_PUBLIC_BASE_URL") {
         let _ = hs.public_base_url.set(url.trim_end_matches('/').to_string());
     }

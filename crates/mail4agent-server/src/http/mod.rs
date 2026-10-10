@@ -209,6 +209,19 @@ where
     state.db.write(move |conn| Ok(work(conn))).await.map_err(|_| MatrixError::internal())?
 }
 
+/// Read-only work on a pooled reader connection (the store's parallel WAL readers); falls back to
+/// the writer when no read pool is attached (in-memory stores). `work` must not write.
+pub async fn with_read_pub<T, F>(state: &Arc<Homeserver>, work: F) -> Result<T, MatrixError>
+where
+    T: Send + 'static,
+    F: FnOnce(&Connection) -> Result<T, MatrixError> + Send + 'static,
+{
+    match state.readers.get() {
+        Some(pool) => pool.read(move |conn| Ok(work(conn))).await.map_err(|_| MatrixError::internal())?,
+        None => state.db.read(move |conn| Ok(work(conn))).await.map_err(|_| MatrixError::internal())?,
+    }
+}
+
 pub fn wake_users(state: &Homeserver, ids: impl IntoIterator<Item = i64>) {
     state.live.wake_many(ids.into_iter().map(|id| format!("user:{id}")));
     // Every write that wakes sync may also owe a federation delivery.

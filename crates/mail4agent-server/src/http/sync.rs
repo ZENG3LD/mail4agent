@@ -57,29 +57,37 @@ async fn sync_handler(
         // inside spawn_blocking, so wait never holds it.
         let registration = state.live.register(&format!("user:{user_id}"));
         let response = {
-            let state = Arc::clone(&state);
+            // The only write of a sync is the device's retention ack: it goes through the writer,
+            // the (long) read of the response goes through the parallel readers.
+            let since = {
+                let device_id = device_id.clone();
+                super::with_conn_pub(&state, move |conn| {
+                    // A `since` above the server's own stream counter cannot come from this
+                    // store (fresh instance, restored backup): answer with an initial sync.
+                    let since = match since {
+                        Some(t) if t.stream_id > crate::store::max_stream_id(conn)? => None,
+                        other => other,
+                    };
+                    if let Some(token) = since {
+                        // `since` proves this device holds everything up to it (retention ack).
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(0);
+                        let _ = crate::retention::record_device_ack(conn, user_id, &device_id, token.stream_id, now_ms);
+                    }
+                    Ok(since)
+                })
+                .await?
+            };
+            let st = Arc::clone(&state);
             let mxid = mxid.clone();
             let device_id = device_id.clone();
             let filter = filter.clone();
-            tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MatrixError> {
-                state.conn_scope(|conn: &mut rusqlite::Connection| {
-                // A `since` above the server's own stream counter cannot come from this
-                // store (fresh instance, restored backup): answer with an initial sync.
-                let since = match since {
-                    Some(t) if t.stream_id > crate::store::max_stream_id(&conn)? => None,
-                    other => other,
-                };
-                if let Some(token) = since {
-                    // `since` proves this device holds everything up to it (retention ack).
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as i64)
-                        .unwrap_or(0);
-                    let _ = crate::retention::record_device_ack(&conn, user_id, &device_id, token.stream_id, now_ms);
-                }
+            super::with_read_pub(&state, move |conn| {
                 crate::sync::build_sync_response(
-                    &conn,
-                    &state.typing,
+                    conn,
+                    &st.typing,
                     user_id,
                     &mxid,
                     &device_id,
@@ -88,10 +96,8 @@ async fn sync_handler(
                     full_state,
                     std::time::Instant::now(),
                 )
-                })
             })
-            .await
-            .map_err(|_| MatrixError::internal())??
+            .await?
         };
         if !crate::sync::sync_response_is_empty(&response) {
             return Ok(Json(response));

@@ -139,8 +139,7 @@ async fn get_messages(
     let user_id = caller.user_id;
     let device_id = caller.device_id;
 
-    let body = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MatrixError> {
-        state.conn_scope(|conn: &mut rusqlite::Connection| {
+    let body = super::with_read_pub(&state, move |conn: &rusqlite::Connection| {
         let room = store::get_room(&conn, &room_id)?.ok_or_else(|| MatrixError::not_found("no such room"))?;
         let window = store::visible_upper_bound(&conn, &room, user_id)?;
         if window == HistoryWindow::Nothing {
@@ -163,10 +162,8 @@ async fn get_messages(
             body["state"] = serde_json::Value::Array(lazy_load_member_state(&conn, &room_id, &page.chunk)?);
         }
         Ok(body)
-        })
     })
-    .await
-    .map_err(|_| MatrixError::internal())??;
+    .await?;
 
     Ok(Json(body))
 }
@@ -180,8 +177,7 @@ async fn get_event(
     let user_id = caller.user_id;
     let device_id = caller.device_id;
 
-    let body = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MatrixError> {
-        state.conn_scope(|conn: &mut rusqlite::Connection| {
+    let body = super::with_read_pub(&state, move |conn: &rusqlite::Connection| {
         let room = store::get_room(&conn, &room_id)?.ok_or_else(|| MatrixError::not_found("no such room"))?;
         let window = store::visible_upper_bound(&conn, &room, user_id)?;
         if window == HistoryWindow::Nothing {
@@ -195,10 +191,8 @@ async fn get_event(
         }
         let own_txn_id = store::txn_id_for_event(&conn, user_id, &device_id, &event.event_id)?;
         client_event_json(&conn, &event, own_txn_id.as_deref())
-        })
     })
-    .await
-    .map_err(|_| MatrixError::internal())??;
+    .await?;
 
     Ok(Json(body))
 }
@@ -220,8 +214,7 @@ async fn get_relations_inner(
     let limit = clamp_limit(query.limit);
     let user_id = caller.user_id;
 
-    let body = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MatrixError> {
-        state.conn_scope(|conn: &mut rusqlite::Connection| {
+    let body = super::with_read_pub(&state, move |conn: &rusqlite::Connection| {
         let room = store::get_room(&conn, &room_id)?.ok_or_else(|| MatrixError::not_found("no such room"))?;
         let window = store::visible_upper_bound(&conn, &room, user_id)?;
         if window == HistoryWindow::Nothing {
@@ -249,10 +242,8 @@ async fn get_relations_inner(
             }
         }
         Ok(body)
-        })
     })
-    .await
-    .map_err(|_| MatrixError::internal())??;
+    .await?;
 
     Ok(Json(body))
 }
