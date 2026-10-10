@@ -84,6 +84,7 @@ members = [
     "crates/mail4agent-server-bin",
     "crates/m4a-edge",
     "crates/m4a-seam",
+    "crates/m4a-matrix-core",
     "crates/m4a-product-kit",
     "crates/m4a-product-example",
 ]
