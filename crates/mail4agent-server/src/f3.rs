@@ -692,6 +692,9 @@ pub fn import_snapshot(conn: &mut Connection, room_id: &str, info: &Value, snap:
             crate::store::set_current_state_slot(&tx, room_id, &t.to_string(), k, id.as_str(), now).map_err(MatrixError::from)?;
         }
     }
+    // Placeholders made by a spec invite give way to the real events.
+    let _ = tx.execute("DELETE FROM current_state WHERE room_id = ?1 AND event_id LIKE '$stripped-%'", [room_id]);
+    let _ = tx.execute("DELETE FROM events WHERE room_id = ?1 AND event_id LIKE '$stripped-%'", [room_id]);
     let gid = new_group(&tx, room_id, &state).map_err(|_| MatrixError::internal())?;
     tx.execute("DELETE FROM dag_extremities WHERE room_id = ?1", [room_id]).map_err(|_| MatrixError::internal())?;
     for (id, _, _) in &parsed {
@@ -699,6 +702,55 @@ pub fn import_snapshot(conn: &mut Connection, room_id: &str, info: &Value, snap:
             tx.execute("INSERT OR REPLACE INTO dag_event_state (event_id, group_id) VALUES (?1, ?2)", params![id.as_str(), gid]).map_err(|_| MatrixError::internal())?;
             tx.execute("INSERT OR IGNORE INTO dag_extremities (room_id, event_id) VALUES (?1, ?2)", params![room_id, id.as_str()]).map_err(|_| MatrixError::internal())?;
         }
+    }
+    tx.commit().map_err(|_| MatrixError::internal())?;
+    Ok(())
+}
+
+/// An invite from a server that follows the spec (room version 11, no snapshot): the invite event
+/// is verified and stored as an outlier (it is all this server knows of the room), and the stripped
+/// state the inviter sent is projected under placeholder ids so a client can show what it is invited
+/// to. The real events replace the placeholders when the invitee joins (`import_snapshot`).
+pub fn import_spec_invite(conn: &mut Connection, room_id: &str, invite: &Value, stripped: &[Value], keys: &PublicKeyMap, now: &str) -> Result<(), MatrixError> {
+    let rules = rules();
+    let obj = json_obj(invite).map_err(MatrixError::bad_json)?;
+    dag::verify_wire(&rules, &obj, keys).map_err(bad)?;
+    let id = dag::compute_event_id(&rules, &obj).map_err(bad)?;
+    let pdu = Pdu::from_wire(id.clone(), &obj).map_err(MatrixError::bad_json)?;
+    if pdu.room_id.as_str() != room_id {
+        return Err(MatrixError::bad_json("event of another room"));
+    }
+    let has = |ty: &str| stripped.iter().any(|s| s.get("type").and_then(Value::as_str) == Some(ty));
+    let info = serde_json::json!({ "kind": "group", "join_rule": "invite", "history_visibility": "shared", "creator": pdu.sender.as_str(), "is_encrypted": has("m.room.encryption") });
+    let tx = conn.transaction().map_err(|_| MatrixError::internal())?;
+    crate::fed_rooms::create_replica_room(&tx, room_id, &info, now)?;
+    mark_room(&tx, room_id).map_err(|_| MatrixError::internal())?;
+    let known = tx.query_row("SELECT 1 FROM dag_events WHERE event_id = ?1", [id.as_str()], |_| Ok(())).optional().map_err(|_| MatrixError::internal())?.is_some();
+    if !known {
+        let uid = ensure_users(&tx, invite, now)?;
+        let ts = u64::from(pdu.origin_server_ts.0) as i64;
+        let text = serde_json::to_string(&obj).unwrap_or_default();
+        tx.execute(
+            "INSERT INTO dag_events (event_id, room_id, depth, event_type, sender, state_key, origin_server_ts, pdu, outlier) VALUES (?1, ?2, ?3, 'm.room.member', ?4, ?5, ?6, ?7, 1)",
+            params![id.as_str(), room_id, pdu.depth as i64, pdu.sender.as_str(), pdu.state_key, ts, text],
+        )
+        .map_err(|_| MatrixError::internal())?;
+        let _ = tx.execute("INSERT OR REPLACE INTO fed_pdus (event_id, room_id, pdu) VALUES (?1, ?2, ?3)", params![id.as_str(), room_id, text]);
+        for (n, s) in stripped.iter().enumerate() {
+            let (Some(ty), Some(sk)) = (s.get("type").and_then(Value::as_str), s.get("state_key").and_then(Value::as_str)) else { continue };
+            if ty == "m.room.member" {
+                continue;
+            }
+            let content = s.get("content").cloned().unwrap_or_else(|| serde_json::json!({}));
+            let ph = format!("$stripped-{n}-{}", id.as_str().trim_start_matches('$'));
+            let _ = crate::store::apply_state_event_raw_in_tx(&tx, &ph, room_id, uid, ty, sk, &content.to_string(), ts, now);
+        }
+        crate::store::apply_state_event_raw_in_tx(&tx, id.as_str(), room_id, uid, "m.room.member", pdu.state_key.as_deref().unwrap_or(""), pdu.content.get(), ts, now).map_err(MatrixError::from)?;
+        let mut state: StateMap<OwnedEventId> = StateMap::new();
+        state.insert((StateEventType::from("m.room.member".to_string()), pdu.state_key.clone().unwrap_or_default()), id.clone());
+        let gid = new_group(&tx, room_id, &state).map_err(|_| MatrixError::internal())?;
+        tx.execute("INSERT OR REPLACE INTO dag_event_state (event_id, group_id) VALUES (?1, ?2)", params![id.as_str(), gid]).map_err(|_| MatrixError::internal())?;
+        tx.execute("INSERT OR IGNORE INTO dag_extremities (room_id, event_id) VALUES (?1, ?2)", params![room_id, id.as_str()]).map_err(|_| MatrixError::internal())?;
     }
     tx.commit().map_err(|_| MatrixError::internal())?;
     Ok(())

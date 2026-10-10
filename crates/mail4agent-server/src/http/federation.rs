@@ -338,6 +338,39 @@ async fn invite(
     let origin = authenticate(&state, "PUT", &uri, &headers, &body).await?;
     let v = parse_body(&body)?;
     let event = v.get("event").cloned().ok_or_else(|| MatrixError::bad_json("event"))?;
+    #[cfg(feature = "f3-hash-ids")]
+    if v.get("room_info").is_none() && v.get("room_version").and_then(Value::as_str) == Some("11") && event.get("event_id").is_none() {
+        // A spec server's invite: signed event plus stripped state, no snapshot.
+        let invitee = event.get("state_key").and_then(Value::as_str).unwrap_or_default().to_string();
+        let ok = event.get("type").and_then(Value::as_str) == Some("m.room.member")
+            && event.get("content").and_then(|c| c.get("membership")).and_then(Value::as_str) == Some("invite")
+            && fr::domain_of(event.get("sender").and_then(Value::as_str).unwrap_or_default()) == Some(origin.as_str())
+            && event.get("room_id").and_then(Value::as_str) == Some(room_id.as_str())
+            && !fr::is_remote_mxid(&invitee)
+            && crate::f3::wire_id(&event)? == event_id;
+        if !ok {
+            return Err(MatrixError::bad_json("not a valid invite for this request"));
+        }
+        let stripped = v.get("invite_room_state").and_then(Value::as_array).cloned().unwrap_or_default();
+        let keys = super::fed_net::f3_keys(&state, std::slice::from_ref(&event)).await?;
+        let (room, ev) = (room_id.clone(), event.clone());
+        let (signed, wake) = with_conn_pub(&state, move |c| {
+            if crate::store::user_id_of(c, &invitee)?.is_none() {
+                return Err(MatrixError::not_found("unknown local user"));
+            }
+            let (_, signed) = crate::f3::sign_own(c, &ev, fed::now_ms())?;
+            let mut keys = keys;
+            let refs = [&signed];
+            for (server, key_id) in crate::f3::missing_keys(c, &refs, &mut keys) {
+                let _ = (server, key_id);
+            }
+            crate::f3::import_spec_invite(c, &room, &signed, &stripped, &keys, &rfc3339())?;
+            Ok((signed, crate::rooms::member_and_invited_ids(c, &room).map_err(internal)?))
+        })
+        .await?;
+        after_ingest(&state, wake);
+        return Ok(Json(json!({ "event": signed })));
+    }
     let info = v.get("room_info").cloned().ok_or_else(|| MatrixError::bad_json("room_info"))?;
     let state_pdus = v.get("invite_room_state").and_then(Value::as_array).cloned().unwrap_or_default();
     let sender = event.get("sender").and_then(Value::as_str).unwrap_or_default();
