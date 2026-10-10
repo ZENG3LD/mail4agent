@@ -253,6 +253,7 @@ pub(crate) fn write_cmd_reply(stream: &mut SendStream, reply: &crate::CmdReply) 
 }
 
 /// Reads one request line from an accepted socket connection.
+#[cfg_attr(not(feature = "wake-grok"), allow(dead_code))]
 pub(crate) fn read_request(stream: &mut SendStream) -> Result<SendRequest, String> {
     stream
         .set_nonblocking(false)

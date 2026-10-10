@@ -63,6 +63,7 @@
 
 pub mod cli;
 mod cmd;
+#[cfg(feature = "wake-grok")]
 mod grok_listen;
 mod ipc;
 mod machine;
@@ -72,6 +73,8 @@ mod local_bus;
 #[path = "local_bus_off.rs"]
 mod local_bus;
 mod nick;
+mod webhook;
+#[cfg(feature = "wake-grok")]
 mod node;
 pub mod provider;
 mod bus_backend;
@@ -109,8 +112,10 @@ pub use mail4agent_messenger::{
 };
 pub use cmd::{CmdReply, CmdRequest};
 pub use mail4agent_messenger::EventId;
+#[cfg(feature = "wake-grok")]
 pub use grok_listen::{hear, GrokListener, Heard, ListenReport};
 pub use nick::{nick_from_display_name, routine_folder_id};
+#[cfg(feature = "wake-grok")]
 pub use node::{NodeClient, NodeTickReport, NODE_DEFAULT_SOCK_NAME};
 pub use provider::{
     plan_chain, HostEnv, HookFlavor, ResumeSpawnAdapter, SessionRecord, WakeChain, WebVendor,
@@ -657,7 +662,7 @@ fn routine_json(wake: &DecryptedWake<'_>) -> Result<Vec<u8>, ShellError> {
 
 fn bearer_header(token: &str) -> Result<reqwest::header::HeaderValue, ShellError> {
     // One rule for both delivery paths (the Grok doorbell's and the routine POST): the Grok crate's.
-    let token = mail4agent_grok::bearer_token(Some(token)).map_err(|_| ShellError::RoutineBearer)?.ok_or(ShellError::RoutineBearer)?;
+    let token = webhook::bearer_token(token).ok_or(ShellError::RoutineBearer)?;
     let mut header = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
         .map_err(|_| ShellError::RoutineBearer)?;
     header.set_sensitive(true);
@@ -692,7 +697,9 @@ fn public_reqwest(err: &reqwest::Error) -> String {
 
 fn parse_routine_url(url: &str) -> Result<reqwest::Url, ShellError> {
     // One rule for both delivery paths: the Grok crate's operator-URL check runs first.
-    mail4agent_grok::validate_webhook_url(url).map_err(|_| ShellError::RoutineUrl)?;
+    if !webhook::url_ok(url) {
+        return Err(ShellError::RoutineUrl);
+    }
     let parsed = reqwest::Url::parse(url).map_err(|_| ShellError::RoutineUrl)?;
     match parsed.scheme() {
         "http" | "https" => {}
@@ -1810,6 +1817,7 @@ impl OpenedStore {
         self.seed_leader_prompted_except_newest(&path);
     }
 
+    #[cfg_attr(not(feature = "wake-grok"), allow(unused_variables))]
     fn wake_inbound(&mut self) {
         if self.routine_url.is_none() && self.leader_sock.is_none() && self.wake_chain.is_none() {
             return;
@@ -1891,6 +1899,8 @@ impl OpenedStore {
                         self.wake_note = Some("leader cwd is empty".to_string());
                         continue;
                     };
+                    #[cfg(feature = "wake-grok")]
+                    {
                     match mail4agent_grok::wake_decrypted_room_blocking(
                         sock,
                         &session_id,
@@ -1903,6 +1913,12 @@ impl OpenedStore {
                         Err(err) => {
                             self.wake_note = Some(clip_public(err.to_string()));
                         }
+                    }
+                    #[cfg(not(feature = "wake-grok"))]
+                    {
+                        let _ = (sock, &session_id, &cwd);
+                        self.wake_note = Some("this build was made without feature wake-grok".to_string());
+                    }
                     }
                 }
             }
@@ -3255,7 +3271,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "wake-grok"))]
     #[test]
     fn inbound_room_text_prompts_the_leader_socket_once() {
         use std::os::unix::net::{UnixListener, UnixStream};

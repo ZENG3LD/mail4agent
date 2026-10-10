@@ -73,18 +73,22 @@ impl SessionResolver for AgentsDirResolver {
 }
 
 /// 3. A Grok CLI session: the row of `active_sessions.json` whose working directory is `cwd`.
+#[cfg(feature = "wake-grok")]
 pub struct GrokActiveResolver {
     index_text: String,
     sessions_root: PathBuf,
     cwd: String,
     local: Option<String>,
 }
+#[cfg(feature = "wake-grok")]
 impl GrokActiveResolver {
     pub fn new(index_text: impl Into<String>, sessions_root: impl Into<PathBuf>, cwd: impl Into<String>) -> Self {
         Self { index_text: index_text.into(), sessions_root: sessions_root.into(), cwd: cwd.into(), local: None }
     }
 }
+#[cfg(feature = "wake-grok")]
 with_local!(GrokActiveResolver);
+#[cfg(feature = "wake-grok")]
 impl SessionResolver for GrokActiveResolver {
     fn name(&self) -> &'static str {
         "grok-active"

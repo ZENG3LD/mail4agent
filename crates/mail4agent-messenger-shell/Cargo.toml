@@ -14,7 +14,7 @@ default = ["full"]
 full = ["tier-server", "tier-matrix", "local-bus", "wake-grok", "wake-claude", "wake-codex", "wake-kimi", "wake-cursor", "wake-routine", "wake-spawn"]
 # Wake providers. A provider whose feature is off is not compiled (codex, kimi, claude channel,
 # spawn) or refuses to wake with a named reason (grok, cursor, routine); see provider.rs.
-wake-grok = []
+wake-grok = ["dep:mail4agent-grok"]
 wake-claude = []
 wake-codex = []
 wake-kimi = []
@@ -32,7 +32,7 @@ m4a-seam = { workspace = true }
 m4a-agent = { path = "../m4a-agent", default-features = false, features = ["engine"] }
 mail4agent-messenger = { workspace = true  }
 mail4agent-server = { workspace = true, optional = true }
-mail4agent-grok = { workspace = true  }
+mail4agent-grok = { workspace = true, optional = true }
 sha2 = "0.10"
 zeroize = "1"
 thiserror = "2"
@@ -65,10 +65,12 @@ path = "src/bin/web_client.rs"
 [[bin]]
 name = "m4a-node-client"
 path = "src/bin/node_client.rs"
+required-features = ["wake-grok"]
 
 [[bin]]
 name = "m4a-grok-listen"
 path = "src/bin/grok_listen.rs"
+required-features = ["wake-grok"]
 
 [[bin]]
 name = "m4a-claude-channel"

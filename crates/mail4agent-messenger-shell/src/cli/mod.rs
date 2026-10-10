@@ -17,9 +17,11 @@
 #[cfg(feature = "wake-claude")]
 pub mod claude_channel;
 pub mod ensure_agent_webhooks;
+#[cfg(feature = "wake-grok")]
 pub mod grok_listen;
 pub mod inbox;
 pub mod mail;
+#[cfg(feature = "wake-grok")]
 pub mod node_client;
 pub mod send;
 pub mod web_client;
@@ -31,8 +33,12 @@ pub const COMMANDS: &[&str] = &["web-client", "node-client", "grok-listen", "cla
 pub fn dispatch(command: &str, args: Vec<String>) -> Result<(), String> {
     match command {
         "web-client" => web_client::run(args),
+        #[cfg(feature = "wake-grok")]
         "node-client" => node_client::run(args),
+        #[cfg(feature = "wake-grok")]
         "grok-listen" => grok_listen::run(args),
+        #[cfg(not(feature = "wake-grok"))]
+        "node-client" | "grok-listen" => return Err("this build was made without feature wake-grok".to_string()),
         #[cfg(feature = "wake-claude")]
         "claude-channel" => claude_channel::run(args),
         "inbox" => inbox::run(args),
