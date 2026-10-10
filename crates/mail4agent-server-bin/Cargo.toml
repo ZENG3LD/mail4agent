@@ -14,7 +14,8 @@ name = "mail4agent-server-bin"
 path = "src/main.rs"
 
 [features]
-# Rooms created while this is on are DAG rooms (hash ids, signed events). Off by default.
+# Closed rooms are DAG rooms (hash ids, signed events). On by default; turn off for legacy-id-only.
+default = ["f3-hash-ids"]
 f3-hash-ids = ["mail4agent-server/f3-hash-ids"]
 
 [dependencies]

@@ -1,10 +1,12 @@
 [package]
 name = "m4a-matrix-core"
-version = "0.0.1"
+version.workspace = true
 edition = "2021"
 license = "MIT"
-publish = false
-description = "Matrix event layer spike (F3): reference-hash event ids, content hashes, signed PDUs, auth checks and state resolution over ruma crates. No HTTP, no SQL."
+repository = "https://github.com/ZENG3LD/mail4agent"
+keywords = ["matrix","federation","state-resolution","signatures"]
+categories = ["network-programming"]
+description = "Matrix event layer (hash-id rooms, room version 11): reference-hash event ids, content hashes, signed PDUs, auth checks and state resolution over ruma crates. No HTTP, no SQL."
 
 # The ruma crates move fast and break often: pin exactly, upgrade on purpose.
 [dependencies]

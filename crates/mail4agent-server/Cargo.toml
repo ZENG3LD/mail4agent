@@ -14,7 +14,7 @@ name = "mail4agent_server"
 path = "src/lib.rs"
 
 [features]
-default = []
+default = ["f3-hash-ids"]
 # Device-bearer credentials resolve to a caller. Only the client shell's in-process local
 # bus enables it (its own private bus, no network); the server binary never does.
 local-bearer = []
@@ -23,7 +23,7 @@ local-bearer = []
 f3-hash-ids = ["dep:m4a-matrix-core"]
 
 [dependencies]
-m4a-matrix-core = { path = "../m4a-matrix-core", version = "0.0.1", optional = true }
+m4a-matrix-core = { workspace = true, optional = true }
 # Storage engine: one writer, bounded parallel readers, SQLCipher (the published crate; its
 # `cipher-native` feature selects the SQLCipher build of rusqlite, there is no plaintext build here).
 tesserax-store = { version = "0.1.1", features = ["cipher-native"] }
