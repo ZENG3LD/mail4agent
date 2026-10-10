@@ -76,6 +76,8 @@ async fn dm_by_identity(tier: m4a_agent::BackendKind, tag: &str) {
     let root = std::env::temp_dir().join(format!("m4a-ident-shell-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let ((inv_a, n_a), (inv_b, n_b)) = (invite(&base).await, invite(&base).await);
+    let versions = reqwest::get(format!("{base}/_matrix/client/versions")).await.unwrap().status().as_u16();
+    assert_eq!(versions, 200, "the Matrix server serves its spec prefix");
     let result = tokio::task::spawn_blocking(move || {
         let cfg = |sid: &str, inv: Option<&str>| SessionConfig::new_identity(base.clone(), tier, sid, &root, inv.map(str::to_string)).unwrap();
         let mut alice = OpenedStore::connect(&cfg("sess-alice", Some(&inv_a))).expect("alice enrolls and connects");

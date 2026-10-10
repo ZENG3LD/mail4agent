@@ -411,7 +411,7 @@ fn unopened_agent_sessions(
 /// in the environment.
 pub const SESSION_IDS_ENV: &str = "M4A_SESSION_IDS";
 
-fn parse_session_ids(raw: &str) -> Vec<(String, String)> {
+pub(crate) fn parse_session_ids(raw: &str) -> Vec<(String, String)> {
     raw.split(',')
         .filter_map(|pair| {
             let (agent, session) = pair.split_once('=')?;
@@ -422,7 +422,7 @@ fn parse_session_ids(raw: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-fn apply_session_ids(sessions: &mut [HostSession], aliases: &[(String, String)]) {
+pub(crate) fn apply_session_ids(sessions: &mut [HostSession], aliases: &[(String, String)]) {
     for session in sessions.iter_mut() {
         let Some(agent_id) = session.agent_id.as_deref() else {
             continue;

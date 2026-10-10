@@ -72,6 +72,7 @@ mod nick;
 mod node;
 pub mod provider;
 mod push;
+pub mod resolve;
 mod send;
 pub mod store_key;
 
