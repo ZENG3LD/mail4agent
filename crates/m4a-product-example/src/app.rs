@@ -81,6 +81,13 @@ async fn auth_blocking(app: &App, h: &HeaderMap) -> Result<Option<AuthUser>, Api
         .ok_or_else(|| ServiceError::Unauthorized.into())
 }
 
+/// Runs store-touching work on the blocking pool (the store's writer must never be waited on
+/// from the async runtime).
+async fn blk<T: Send + 'static>(app: &App, f: impl FnOnce(&ProductApp) -> T + Send + 'static) -> Result<T, ApiError> {
+    let app = Arc::clone(app);
+    tokio::task::spawn_blocking(move || f(&app)).await.map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "M_UNKNOWN", "task failed"))
+}
+
 fn hash_secret(secret: &str) -> Result<String, ApiError> {
     Argon2::default().hash_password(secret.as_bytes(), &SaltString::generate(&mut OsRng)).map(|h| h.to_string()).map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "M_UNKNOWN", "hash failed"))
 }
@@ -122,8 +129,12 @@ async fn register(State(app): State<App>, Json(body): Json<Value>) -> Result<Jso
     })
     .await
     .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "M_UNKNOWN", "task failed"))??;
-    let u = app.users.create_user(Some(&hash), now_ms())?;
-    let s = app.users.issue_session(&u, now_ms())?;
+    let (u, s) = blk(&app, move |a| -> Result<_, ServiceError> {
+        let u = a.users.create_user(Some(&hash), now_ms())?;
+        let s = a.users.issue_session(&u, now_ms())?;
+        Ok((u, s))
+    })
+    .await??;
     Ok(session_json(&u.nick, &s.token))
 }
 
@@ -131,12 +142,27 @@ async fn login(State(app): State<App>, Json(body): Json<Value>) -> Result<Json<V
     let nick = body.get("nick").and_then(Value::as_str).unwrap_or("").to_string();
     let pw = body.get("password").and_then(Value::as_str).unwrap_or("").to_string();
     let bad = || err(StatusCode::FORBIDDEN, "M_FORBIDDEN", "invalid credentials");
-    let u = app.users.store.user_by_nick(&nick).map_err(ServiceError::from)?.ok_or_else(bad)?;
-    let hash = app.users.store.secret_hash(u.id).map_err(ServiceError::from)?.ok_or_else(bad)?;
+    let (u, hash) = blk(&app, move |a| -> Result<_, ServiceError> {
+        let u = a.users.store.user_by_nick(&nick)?;
+        let hash = match &u {
+            Some(u) => a.users.store.secret_hash(u.id)?,
+            None => None,
+        };
+        Ok((u, hash))
+    })
+    .await??;
+    let (u, hash) = match (u, hash) {
+        (Some(u), Some(h)) => (u, h),
+        _ => return Err(bad()),
+    };
     if !tokio::task::spawn_blocking(move || check_secret(&hash, &pw)).await.unwrap_or(false) {
         return Err(bad());
     }
-    let s = app.users.issue_session(&u, now_ms())?;
+    let (u, s) = blk(&app, move |a| -> Result<_, ServiceError> {
+        let s = a.users.issue_session(&u, now_ms())?;
+        Ok((u, s))
+    })
+    .await??;
     Ok(session_json(&u.nick, &s.token))
 }
 
@@ -151,8 +177,12 @@ async fn door_login(State(app): State<App>, Path(id): Path<String>, Json(proof):
         DoorError::Refused(m) => err(StatusCode::FORBIDDEN, "M_FORBIDDEN", &m),
         DoorError::Unverified(m) => err(StatusCode::UNAUTHORIZED, "M_UNAUTHORIZED", &m),
     })?;
-    let u = app.users.user_for_door(&source, &subject, now_ms())?;
-    let s = app.users.issue_session(&u, now_ms())?;
+    let (u, s) = blk(&app, move |a| -> Result<_, ServiceError> {
+        let u = a.users.user_for_door(&source, &subject, now_ms())?;
+        let s = a.users.issue_session(&u, now_ms())?;
+        Ok((u, s))
+    })
+    .await??;
     Ok(session_json(&u.nick, &s.token))
 }
 
@@ -162,7 +192,9 @@ async fn need(app: &App, h: &HeaderMap) -> Result<AuthUser, ApiError> {
 
 async fn logout(State(app): State<App>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
     let who = need(&app, &headers).await?;
-    app.events.publish(app.users.revoke(&who.cred_ref)?);
+    let cred = who.cred_ref.clone();
+    let evs = blk(&app, move |a| a.users.revoke(&cred)).await??;
+    app.events.publish(evs);
     Ok(Json(json!({})))
 }
 
@@ -174,8 +206,12 @@ async fn me(State(app): State<App>, headers: HeaderMap) -> Result<Json<Value>, A
 async fn set_nick(State(app): State<App>, headers: HeaderMap, Json(body): Json<Value>) -> Result<Json<Value>, ApiError> {
     let who = need(&app, &headers).await?;
     let new = body.get("nick").and_then(Value::as_str).unwrap_or("");
-    let u = app.users.store.user_by_nick(&who.nick).map_err(ServiceError::from)?.ok_or(ServiceError::Unauthorized)?;
-    let (u, evs) = app.users.set_nick(&u, new, now_ms())?;
+    let (nick, new) = (who.nick.clone(), new.to_string());
+    let (u, evs) = blk(&app, move |a| -> Result<_, ServiceError> {
+        let u = a.users.store.user_by_nick(&nick)?.ok_or(ServiceError::Unauthorized)?;
+        a.users.set_nick(&u, &new, now_ms())
+    })
+    .await??;
     app.events.publish(evs);
     Ok(Json(json!({ "nick": u.nick })))
 }
@@ -191,7 +227,8 @@ fn admin(app: &App, h: &HeaderMap) -> Result<(), ApiError> {
 
 async fn admin_revoke(State(app): State<App>, headers: HeaderMap, Json(b): Json<Value>) -> Result<Json<Value>, ApiError> {
     admin(&app, &headers)?;
-    let evs = app.users.revoke(b.get("cred_ref").and_then(Value::as_str).unwrap_or(""))?;
+    let cred = b.get("cred_ref").and_then(Value::as_str).unwrap_or("").to_string();
+    let evs = blk(&app, move |a| a.users.revoke(&cred)).await??;
     let n = evs.len();
     app.events.publish(evs);
     Ok(Json(json!({ "revoked": n })))
@@ -199,7 +236,9 @@ async fn admin_revoke(State(app): State<App>, headers: HeaderMap, Json(b): Json<
 
 async fn admin_delete(State(app): State<App>, headers: HeaderMap, Json(b): Json<Value>) -> Result<Json<Value>, ApiError> {
     admin(&app, &headers)?;
-    app.events.publish(app.users.delete(b.get("nick").and_then(Value::as_str).unwrap_or(""))?);
+    let nick = b.get("nick").and_then(Value::as_str).unwrap_or("").to_string();
+    let evs = blk(&app, move |a| a.users.delete(&nick)).await??;
+    app.events.publish(evs);
     Ok(Json(json!({})))
 }
 
@@ -209,8 +248,13 @@ async fn admin_tier(State(app): State<App>, headers: HeaderMap, Json(b): Json<Va
     if !app.users.tiers.knows(tier) {
         return Err(err(StatusCode::BAD_REQUEST, "M_BAD_JSON", "unknown tier"));
     }
-    let u = app.users.store.user_by_nick(b.get("nick").and_then(Value::as_str).unwrap_or("")).map_err(ServiceError::from)?.ok_or(ServiceError::NotFound)?;
-    app.users.store.set_tier(u.id, tier).map_err(ServiceError::from)?;
+    let (nick, tier) = (b.get("nick").and_then(Value::as_str).unwrap_or("").to_string(), tier.to_string());
+    blk(&app, move |a| -> Result<(), ServiceError> {
+        let u = a.users.store.user_by_nick(&nick)?.ok_or(ServiceError::NotFound)?;
+        a.users.store.set_tier(u.id, &tier)?;
+        Ok(())
+    })
+    .await??;
     Ok(Json(json!({})))
 }
 

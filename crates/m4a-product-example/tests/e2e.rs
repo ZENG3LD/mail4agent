@@ -10,7 +10,7 @@ use m4a_product_kit::nick_rules::NickRules;
 use m4a_product_kit::tiers::TierTable;
 use m4a_product_kit::{EdgeLink, EventPublisher, UserService};
 use mail4agent_server::http::{edge_auth::require_edge_secret, identity::Seam, Homeserver};
-use rusqlite::Connection;
+use tesserax_store::rusqlite::Connection;
 use serde_json::{json, Value};
 
 const EDGE_SECRET: &str = "0123456789abcdef0123456789abcdef-edge";

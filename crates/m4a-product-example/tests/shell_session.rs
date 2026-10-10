@@ -14,7 +14,7 @@ use mail4agent_messenger_shell::{
     CreateRoomKind, MessageKind, MessengerCommand, OpenedStore, OutgoingMessage, ProductSecret, RoomId, SessionConfig, UserId,
 };
 use mail4agent_server::http::{edge_auth::require_edge_secret, identity::Seam, Homeserver};
-use rusqlite::Connection;
+use tesserax_store::rusqlite::Connection;
 use serde_json::{json, Value};
 
 const EDGE_SECRET: &str = "0123456789abcdef0123456789abcdef-edge";

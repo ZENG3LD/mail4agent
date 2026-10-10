@@ -1,17 +1,16 @@
 //! SQLite implementation of the kit's [`UserStore`]: the example product's own database.
-//! This is part of what a real product throws away (it has its own user database); it is
-//! the reference for how a store behaves: encrypted file, one connection behind a mutex,
-//! every trait method takes the lock for one statement and releases it before returning,
-//! so no async request ever holds it across a call to the edge.
+//! This is part of what a real product throws away (it has its own user database). The
+//! storage engine is `tesserax-store` (SQLCipher, one writer, WAL): every trait method is one
+//! short closure on the writer connection, so no lock outlives a call and no async request
+//! holds one across a call to the edge. The trait is synchronous, so callers on the async
+//! runtime reach it through `spawn_blocking`; the engine refuses to block a runtime thread.
 
-use std::sync::Mutex;
-
-use m4a_product_kit::dbkey::{open_cipher, DbKey};
 use m4a_product_kit::model::{StoreError, StoreResult, User, UserStore};
-use rusqlite::{params, Connection, OptionalExtension};
+use tesserax_store::rusqlite::{self, params, Connection, OptionalExtension};
+use tesserax_store::{Db, DbConfig};
 
 pub struct SqliteStore {
-    conn: Mutex<Connection>,
+    db: Db,
 }
 
 fn be(e: rusqlite::Error) -> StoreError {
@@ -53,59 +52,79 @@ fn user(r: &rusqlite::Row<'_>) -> rusqlite::Result<User> {
 }
 
 impl SqliteStore {
-    pub fn open(conn: Connection) -> rusqlite::Result<Self> {
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-        conn.execute_batch(SCHEMA)?;
-        Ok(Self { conn: Mutex::new(conn) })
+    /// The product database in an opened store (shared with the event queue: one writer per file).
+    pub fn new(db: Db) -> Result<Self, String> {
+        db.blocking(|c| c.execute_batch(SCHEMA)).map_err(|e| e.to_string())?;
+        Ok(Self { db })
     }
-    /// The product database: SQLCipher, key per connection, WAL, busy timeout (see `m4a_product_kit::dbkey`).
-    pub fn open_path(path: &str, key: &DbKey) -> rusqlite::Result<Self> {
-        Self::open(open_cipher(path, key)?)
+    /// Opens the store described by `cfg` (see `m4a_product_kit::dbkey`).
+    pub fn open(cfg: &DbConfig) -> Result<Self, String> {
+        Self::new(Db::open(cfg).map_err(|e| e.to_string())?)
     }
     /// Plaintext in-memory database, for tests only.
-    pub fn memory() -> rusqlite::Result<Self> {
-        Self::open(Connection::open_in_memory()?)
+    pub fn memory() -> Result<Self, String> {
+        Self::open(&DbConfig::in_memory())
     }
-    fn c(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.conn.lock().unwrap_or_else(|e| e.into_inner())
+    /// The underlying store, to share its single writer with the event queue.
+    pub fn db(&self) -> Db {
+        self.db.clone()
+    }
+    fn with<T>(&self, f: impl FnOnce(&mut Connection) -> StoreResult<T>) -> StoreResult<T> {
+        match self.db.write_blocking(|c| Ok(f(c))) {
+            Ok(r) => r,
+            Err(e) => Err(be(e)),
+        }
     }
 }
 
 impl UserStore for SqliteStore {
     fn user_by_nick(&self, nick: &str) -> StoreResult<Option<User>> {
-        self.c().query_row(&format!("SELECT {UCOLS} FROM users WHERE nick_ci = ?1"), params![nick.to_ascii_lowercase()], user).optional().map_err(be)
+        self.with(|c| {
+        c.query_row(&format!("SELECT {UCOLS} FROM users WHERE nick_ci = ?1"), params![nick.to_ascii_lowercase()], user).optional().map_err(be)
+        })
     }
     fn insert_user(&self, nick: &str, tier: &str, secret_hash: Option<&str>, now_ms: i64) -> StoreResult<User> {
-        let c = self.c();
+        self.with(|c| {
         c.execute("INSERT INTO users (nick, nick_ci, tier, secret_hash, created_ms) VALUES (?1, ?2, ?3, ?4, ?5)", params![nick, nick.to_ascii_lowercase(), tier, secret_hash, now_ms]).map_err(be)?;
         let id = c.last_insert_rowid();
         c.query_row(&format!("SELECT {UCOLS} FROM users WHERE id = ?1"), params![id], user).map_err(be)
+        })
     }
     fn secret_hash(&self, user_id: i64) -> StoreResult<Option<String>> {
-        Ok(self.c().query_row("SELECT secret_hash FROM users WHERE id = ?1", params![user_id], |r| r.get::<_, Option<String>>(0)).optional().map_err(be)?.flatten())
+        self.with(|c| {
+        Ok(c.query_row("SELECT secret_hash FROM users WHERE id = ?1", params![user_id], |r| r.get::<_, Option<String>>(0)).optional().map_err(be)?.flatten())
+        })
     }
     fn update_nick(&self, user_id: i64, new_nick: &str, now_ms: i64) -> StoreResult<User> {
-        let c = self.c();
+        self.with(|c| {
         let n = c.execute("UPDATE users SET nick = ?2, nick_ci = ?3, nick_changes = nick_changes + 1, nick_changed_ms = ?4 WHERE id = ?1", params![user_id, new_nick, new_nick.to_ascii_lowercase(), now_ms]).map_err(be)?;
         if n == 0 {
             return Err(StoreError::NotFound);
         }
         c.query_row(&format!("SELECT {UCOLS} FROM users WHERE id = ?1"), params![user_id], user).map_err(be)
+        })
     }
     fn set_tier(&self, user_id: i64, tier: &str) -> StoreResult<()> {
-        match self.c().execute("UPDATE users SET tier = ?2 WHERE id = ?1", params![user_id, tier]).map_err(be)? {
+        self.with(|c| {
+        match c.execute("UPDATE users SET tier = ?2 WHERE id = ?1", params![user_id, tier]).map_err(be)? {
             0 => Err(StoreError::NotFound),
             _ => Ok(()),
         }
+        })
     }
     fn delete_user(&self, user_id: i64) -> StoreResult<()> {
-        self.c().execute("DELETE FROM users WHERE id = ?1", params![user_id]).map_err(be).map(|_| ())
+        self.with(|c| {
+        c.execute("DELETE FROM users WHERE id = ?1", params![user_id]).map_err(be).map(|_| ())
+        })
     }
     fn add_credential(&self, user_id: i64, cred_ref: &str, token_hash: &str, now_ms: i64) -> StoreResult<()> {
-        self.c().execute("INSERT INTO credentials (cred_ref, user_id, token_hash, created_ms) VALUES (?1, ?2, ?3, ?4)", params![cred_ref, user_id, token_hash, now_ms]).map_err(be).map(|_| ())
+        self.with(|c| {
+        c.execute("INSERT INTO credentials (cred_ref, user_id, token_hash, created_ms) VALUES (?1, ?2, ?3, ?4)", params![cred_ref, user_id, token_hash, now_ms]).map_err(be).map(|_| ())
+        })
     }
     fn user_by_token_hash(&self, token_hash: &str) -> StoreResult<Option<(User, String)>> {
-        self.c()
+        self.with(|c| {
+        c
             .query_row(
                 "SELECT u.id, u.nick, u.tier, u.nick_changes, u.nick_changed_ms, c.cred_ref FROM credentials c JOIN users u ON u.id = c.user_id WHERE c.token_hash = ?1",
                 params![token_hash],
@@ -113,23 +132,26 @@ impl UserStore for SqliteStore {
             )
             .optional()
             .map_err(be)
+        })
     }
     fn delete_credential(&self, cred_ref: &str) -> StoreResult<Option<i64>> {
-        let c = self.c();
+        self.with(|c| {
         let owner: Option<i64> = c.query_row("SELECT user_id FROM credentials WHERE cred_ref = ?1", params![cred_ref], |r| r.get(0)).optional().map_err(be)?;
         if owner.is_some() {
             c.execute("DELETE FROM credentials WHERE cred_ref = ?1", params![cred_ref]).map_err(be)?;
         }
         Ok(owner)
+        })
     }
     fn credentials_of(&self, user_id: i64) -> StoreResult<Vec<String>> {
-        let c = self.c();
+        self.with(|c| {
         let mut st = c.prepare("SELECT cred_ref FROM credentials WHERE user_id = ?1").map_err(be)?;
         let rows = st.query_map(params![user_id], |r| r.get(0)).map_err(be)?;
         rows.collect::<Result<_, _>>().map_err(be)
+        })
     }
     fn live_credentials(&self) -> StoreResult<Vec<(String, Vec<String>)>> {
-        let c = self.c();
+        self.with(|c| {
         let mut out: Vec<(String, Vec<String>)> = Vec::new();
         let mut users = c.prepare("SELECT id, nick FROM users ORDER BY id").map_err(be)?;
         let rows: Vec<(i64, String)> = users.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).map_err(be)?.collect::<Result<_, _>>().map_err(be)?;
@@ -139,15 +161,20 @@ impl UserStore for SqliteStore {
             out.push((nick, list));
         }
         Ok(out)
+        })
     }
     fn user_by_door(&self, source: &str, subject: &str) -> StoreResult<Option<User>> {
-        self.c()
+        self.with(|c| {
+        c
             .query_row("SELECT u.id, u.nick, u.tier, u.nick_changes, u.nick_changed_ms FROM door_links d JOIN users u ON u.id = d.user_id WHERE d.source = ?1 AND d.subject = ?2", params![source, subject], user)
             .optional()
             .map_err(be)
+        })
     }
     fn link_door(&self, user_id: i64, source: &str, subject: &str) -> StoreResult<()> {
-        self.c().execute("INSERT INTO door_links (source, subject, user_id) VALUES (?1, ?2, ?3)", params![source, subject, user_id]).map_err(be).map(|_| ())
+        self.with(|c| {
+        c.execute("INSERT INTO door_links (source, subject, user_id) VALUES (?1, ?2, ?3)", params![source, subject, user_id]).map_err(be).map(|_| ())
+        })
     }
 }
 
@@ -155,17 +182,19 @@ impl UserStore for SqliteStore {
 mod tests {
     use super::*;
 
+    const KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    const OTHER: &str = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
+
     #[test]
     fn the_product_database_is_encrypted_and_keeps_its_users() {
-        let key = DbKey::from_hex("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff").unwrap();
-        let other = DbKey::from_hex("ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100").unwrap();
         let path = format!("/tmp/m4a-example-store-{}.db", std::process::id());
+        let open = |k: &str| SqliteStore::open(&m4a_product_kit::dbkey::config(&path, k).unwrap());
         {
-            let s = SqliteStore::open_path(&path, &key).unwrap();
+            let s = open(KEY).unwrap();
             s.insert_user("zoe_nick", "free", Some("hash"), 1).unwrap();
         }
-        assert_eq!(SqliteStore::open_path(&path, &key).unwrap().user_by_nick("zoe_nick").unwrap().unwrap().nick, "zoe_nick");
-        assert!(SqliteStore::open_path(&path, &other).is_err());
+        assert_eq!(open(KEY).unwrap().user_by_nick("zoe_nick").unwrap().unwrap().nick, "zoe_nick");
+        assert!(open(OTHER).is_err());
         let raw = std::fs::read(&path).unwrap();
         assert!(!raw.starts_with(b"SQLite format 3") && !raw.windows(8).any(|w| w == b"zoe_nick"));
         for ext in ["", "-wal", "-shm"] {

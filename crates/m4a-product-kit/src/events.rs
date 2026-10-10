@@ -33,16 +33,24 @@ pub struct Queued {
     pub next_ms: i64,
 }
 
-/// Ordered, durable-or-not queue of events waiting for delivery.
+/// A boxed future, so the queue trait stays object-safe without a macro crate.
+pub type Fut<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+/// Ordered, durable-or-not queue of events waiting for delivery. `enqueue` never blocks (it is
+/// called from request handlers); everything the delivery task does is async.
 pub trait Outbox: Send + Sync + 'static {
     fn enqueue(&self, ev: &Event) -> Result<(), String>;
+    /// Resolves once everything enqueued so far can be read back by [`Outbox::head`].
+    fn flush(&self) -> Fut<'_, ()> {
+        Box::pin(async {})
+    }
     /// The oldest pending delivery.
-    fn head(&self) -> Result<Option<Queued>, String>;
+    fn head(&self) -> Fut<'_, Result<Option<Queued>, String>>;
     /// Delivered: remove.
-    fn ack(&self, seq: i64) -> Result<(), String>;
-    fn retry(&self, seq: i64, attempts: u32, next_ms: i64) -> Result<(), String>;
+    fn ack(&self, seq: i64) -> Fut<'_, Result<(), String>>;
+    fn retry(&self, seq: i64, attempts: u32, next_ms: i64) -> Fut<'_, Result<(), String>>;
     /// Refused for good: keep out of the line.
-    fn dead(&self, seq: i64) -> Result<(), String>;
+    fn dead(&self, seq: i64) -> Fut<'_, Result<(), String>>;
     fn pending(&self) -> usize;
 }
 
@@ -60,21 +68,25 @@ impl Outbox for MemoryOutbox {
         g.1.push_back(Queued { seq, event: ev.clone(), attempts: 0, next_ms: 0 });
         Ok(())
     }
-    fn head(&self) -> Result<Option<Queued>, String> {
-        Ok(self.inner.lock().unwrap_or_else(|e| e.into_inner()).1.front().cloned())
+    fn head(&self) -> Fut<'_, Result<Option<Queued>, String>> {
+        Box::pin(async move { Ok(self.inner.lock().unwrap_or_else(|e| e.into_inner()).1.front().cloned()) })
     }
-    fn ack(&self, seq: i64) -> Result<(), String> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).1.retain(|q| q.seq != seq);
-        Ok(())
+    fn ack(&self, seq: i64) -> Fut<'_, Result<(), String>> {
+        Box::pin(async move {
+            self.inner.lock().unwrap_or_else(|e| e.into_inner()).1.retain(|q| q.seq != seq);
+            Ok(())
+        })
     }
-    fn retry(&self, seq: i64, attempts: u32, next_ms: i64) -> Result<(), String> {
-        for q in self.inner.lock().unwrap_or_else(|e| e.into_inner()).1.iter_mut().filter(|q| q.seq == seq) {
-            q.attempts = attempts;
-            q.next_ms = next_ms;
-        }
-        Ok(())
+    fn retry(&self, seq: i64, attempts: u32, next_ms: i64) -> Fut<'_, Result<(), String>> {
+        Box::pin(async move {
+            for q in self.inner.lock().unwrap_or_else(|e| e.into_inner()).1.iter_mut().filter(|q| q.seq == seq) {
+                q.attempts = attempts;
+                q.next_ms = next_ms;
+            }
+            Ok(())
+        })
     }
-    fn dead(&self, seq: i64) -> Result<(), String> {
+    fn dead(&self, seq: i64) -> Fut<'_, Result<(), String>> {
         self.ack(seq)
     }
     fn pending(&self) -> usize {
@@ -88,11 +100,17 @@ pub use sqlite::SqliteOutbox;
 #[cfg(feature = "sqlite-outbox")]
 mod sqlite {
     use super::*;
-    use rusqlite::{params, Connection, OptionalExtension};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tesserax_store::rusqlite::{params, OptionalExtension};
+    use tesserax_store::{BatchConfig, BatchWriter, Db, DbConfig};
 
-    /// Durable queue in a SQLite file (its own table; may share the product's database file).
+    /// Durable queue in the product's store (its own table; share the product's [`Db`], there is
+    /// one writer per file). Writes are batched by the engine's [`BatchWriter`]; reads and the
+    /// delivery bookkeeping go through the same writer connection.
     pub struct SqliteOutbox {
-        c: Mutex<Connection>,
+        db: Db,
+        writer: BatchWriter,
+        pending: Arc<AtomicUsize>,
     }
 
     const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS event_outbox (
@@ -103,55 +121,82 @@ mod sqlite {
         state TEXT NOT NULL DEFAULT 'pending'
     );";
 
-    fn be(e: rusqlite::Error) -> String {
+    fn de(e: tesserax_store::DbError) -> String {
         e.to_string()
     }
 
     impl SqliteOutbox {
-        /// Opens the queue in an encrypted (SQLCipher) file: key, WAL and busy timeout are set per connection.
-        pub fn open(path: &str, key: &crate::dbkey::DbKey) -> Result<Self, String> {
-            let c = crate::dbkey::open_cipher(path, key).map_err(be)?;
-            c.execute_batch(SCHEMA).map_err(be)?;
-            Ok(Self { c: Mutex::new(c) })
+        /// The queue over an opened store (create it with a [`DbConfig`] from [`crate::dbkey`]).
+        pub fn new(db: Db) -> Result<Self, String> {
+            let pending = db
+                .blocking(|c| {
+                    c.execute_batch(SCHEMA)?;
+                    c.query_row("SELECT COUNT(*) FROM event_outbox WHERE state = 'pending'", [], |r| r.get::<_, i64>(0))
+                })
+                .map_err(|e| e.to_string())?;
+            let writer = BatchWriter::new(db.clone(), BatchConfig::default());
+            Ok(Self { db, writer, pending: Arc::new(AtomicUsize::new(pending as usize)) })
         }
         /// Plaintext in-memory queue for tests only.
         pub fn memory() -> Result<Self, String> {
-            let c = Connection::open_in_memory().map_err(be)?;
-            c.execute_batch(SCHEMA).map_err(be)?;
-            Ok(Self { c: Mutex::new(c) })
+            Self::new(Db::open(&DbConfig::in_memory()).map_err(de)?)
         }
         /// Rows refused for good (kept for inspection).
-        pub fn dead_count(&self) -> usize {
-            self.c.lock().unwrap_or_else(|e| e.into_inner()).query_row("SELECT COUNT(*) FROM event_outbox WHERE state = 'dead'", [], |r| r.get::<_, i64>(0)).unwrap_or(0) as usize
+        pub async fn dead_count(&self) -> usize {
+            self.db.read(|c| c.query_row("SELECT COUNT(*) FROM event_outbox WHERE state = 'dead'", [], |r| r.get::<_, i64>(0))).await.unwrap_or(0) as usize
+        }
+        fn done(&self) {
+            let _ = self.pending.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
         }
     }
 
     impl Outbox for SqliteOutbox {
         fn enqueue(&self, ev: &Event) -> Result<(), String> {
             let body = serde_json::to_string(ev).map_err(|e| e.to_string())?;
-            self.c.lock().unwrap_or_else(|e| e.into_inner()).execute("INSERT INTO event_outbox (event) VALUES (?1)", params![body]).map_err(be).map(|_| ())
+            self.pending.fetch_add(1, Ordering::AcqRel);
+            self.writer
+                .send(Box::new(move |c| c.execute("INSERT INTO event_outbox (event) VALUES (?1)", params![body]).map(|_| ())))
+                .map_err(|e| {
+                    self.done();
+                    e.to_string()
+                })
         }
-        fn head(&self) -> Result<Option<Queued>, String> {
-            let row: Option<(i64, String, i64, i64)> = self
-                .c
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .query_row("SELECT seq, event, attempts, next_ms FROM event_outbox WHERE state = 'pending' ORDER BY seq LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
-                .optional()
-                .map_err(be)?;
-            row.map(|(seq, body, attempts, next_ms)| serde_json::from_str(&body).map(|event| Queued { seq, event, attempts: attempts as u32, next_ms }).map_err(|e| e.to_string())).transpose()
+        fn flush(&self) -> Fut<'_, ()> {
+            Box::pin(async move {
+                self.writer.barrier_async().await;
+            })
         }
-        fn ack(&self, seq: i64) -> Result<(), String> {
-            self.c.lock().unwrap_or_else(|e| e.into_inner()).execute("DELETE FROM event_outbox WHERE seq = ?1", params![seq]).map_err(be).map(|_| ())
+        fn head(&self) -> Fut<'_, Result<Option<Queued>, String>> {
+            Box::pin(async move {
+                let row: Option<(i64, String, i64, i64)> = self
+                    .db
+                    .read(|c| {
+                        c.query_row("SELECT seq, event, attempts, next_ms FROM event_outbox WHERE state = 'pending' ORDER BY seq LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional()
+                    })
+                    .await
+                    .map_err(de)?;
+                row.map(|(seq, body, attempts, next_ms)| serde_json::from_str(&body).map(|event| Queued { seq, event, attempts: attempts as u32, next_ms }).map_err(|e| e.to_string())).transpose()
+            })
         }
-        fn retry(&self, seq: i64, attempts: u32, next_ms: i64) -> Result<(), String> {
-            self.c.lock().unwrap_or_else(|e| e.into_inner()).execute("UPDATE event_outbox SET attempts = ?2, next_ms = ?3 WHERE seq = ?1", params![seq, attempts, next_ms]).map_err(be).map(|_| ())
+        fn ack(&self, seq: i64) -> Fut<'_, Result<(), String>> {
+            Box::pin(async move {
+                self.db.write(move |c| c.execute("DELETE FROM event_outbox WHERE seq = ?1", params![seq]).map(|_| ())).await.map_err(de)?;
+                self.done();
+                Ok(())
+            })
         }
-        fn dead(&self, seq: i64) -> Result<(), String> {
-            self.c.lock().unwrap_or_else(|e| e.into_inner()).execute("UPDATE event_outbox SET state = 'dead' WHERE seq = ?1", params![seq]).map_err(be).map(|_| ())
+        fn retry(&self, seq: i64, attempts: u32, next_ms: i64) -> Fut<'_, Result<(), String>> {
+            Box::pin(async move { self.db.write(move |c| c.execute("UPDATE event_outbox SET attempts = ?2, next_ms = ?3 WHERE seq = ?1", params![seq, attempts, next_ms]).map(|_| ())).await.map_err(de) })
+        }
+        fn dead(&self, seq: i64) -> Fut<'_, Result<(), String>> {
+            Box::pin(async move {
+                self.db.write(move |c| c.execute("UPDATE event_outbox SET state = 'dead' WHERE seq = ?1", params![seq]).map(|_| ())).await.map_err(de)?;
+                self.done();
+                Ok(())
+            })
         }
         fn pending(&self) -> usize {
-            self.c.lock().unwrap_or_else(|e| e.into_inner()).query_row("SELECT COUNT(*) FROM event_outbox WHERE state = 'pending'", [], |r| r.get::<_, i64>(0)).unwrap_or(0) as usize
+            self.pending.load(Ordering::Acquire)
         }
     }
 }
@@ -175,7 +220,8 @@ impl EventPublisher {
         let this = Self { outbox: Arc::clone(&outbox), wake: Arc::clone(&wake) };
         tokio::spawn(async move {
             loop {
-                let q = match outbox.head() {
+                outbox.flush().await;
+                let q = match outbox.head().await {
                     Ok(Some(q)) => q,
                     Ok(None) => {
                         wake.notified().await;
@@ -196,17 +242,17 @@ impl EventPublisher {
                 let sig = sign_body(&link.secret, &body);
                 match link.post(EVENTS_PATH, &[(header.as_str(), sig)], body).await {
                     Ok(200) => {
-                        let _ = outbox.ack(q.seq);
+                        let _ = outbox.ack(q.seq).await;
                     }
                     Ok(s) if (400..500).contains(&s) && s != 429 => {
                         tracing::error!(event = %q.event.id, status = s, "messenger refused the event; parked as dead");
-                        let _ = outbox.dead(q.seq);
+                        let _ = outbox.dead(q.seq).await;
                     }
                     other => {
                         let attempts = q.attempts + 1;
                         let delay = (base_delay * 2u32.saturating_pow(q.attempts.min(16))).min(MAX_DELAY);
                         tracing::warn!(event = %q.event.id, attempts, ?other, "event delivery failed; will retry");
-                        let _ = outbox.retry(q.seq, attempts, now_ms() + delay.as_millis() as i64);
+                        let _ = outbox.retry(q.seq, attempts, now_ms() + delay.as_millis() as i64).await;
                     }
                 }
             }
@@ -257,8 +303,9 @@ mod tests {
     use super::*;
     use axum::routing::post;
 
-    fn test_key() -> crate::dbkey::DbKey {
-        crate::dbkey::DbKey::from_hex("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff").unwrap()
+    fn open_outbox(path: &str) -> SqliteOutbox {
+        let cfg = crate::dbkey::config(path, "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff").unwrap();
+        SqliteOutbox::new(tesserax_store::Db::open(&cfg).unwrap()).unwrap()
     }
     use m4a_seam::EventKind;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -275,7 +322,7 @@ mod tests {
         // Run 1: the messenger is unreachable; two events are queued and retried in vain.
         {
             let dead = EdgeLink::new("http://127.0.0.1:9", b"0123456789abcdef".to_vec(), None);
-            let outbox = Arc::new(SqliteOutbox::open(&path, &test_key()).unwrap());
+            let outbox = Arc::new(open_outbox(&path));
             let p = EventPublisher::spawn_with(dead, None, Duration::from_millis(20), outbox);
             p.publish(vec![ev("e1"), ev("e2")]);
             tokio::time::sleep(Duration::from_millis(150)).await;
@@ -304,7 +351,7 @@ mod tests {
         let addr = l.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
         let link = EdgeLink::new(&format!("http://{addr}"), b"0123456789abcdef".to_vec(), None);
-        let p = EventPublisher::spawn_with(link, None, Duration::from_millis(20), Arc::new(SqliteOutbox::open(&path, &test_key()).unwrap()));
+        let p = EventPublisher::spawn_with(link, None, Duration::from_millis(20), Arc::new(open_outbox(&path)));
         p.publish(vec![]); // wakes the worker; the old rows are already in the file
         for _ in 0..100 {
             if p.pending() == 0 {
@@ -317,13 +364,14 @@ mod tests {
         let _ = std::fs::remove_file(&file);
     }
 
-    #[test]
-    fn a_refused_event_is_parked_not_retried_forever() {
+    #[tokio::test]
+    async fn a_refused_event_is_parked_not_retried_forever() {
         let o = SqliteOutbox::memory().unwrap();
         o.enqueue(&ev("x")).unwrap();
-        let q = o.head().unwrap().unwrap();
-        o.dead(q.seq).unwrap();
-        assert!(o.head().unwrap().is_none());
-        assert_eq!((o.pending(), o.dead_count()), (0, 1));
+        o.flush().await;
+        let q = o.head().await.unwrap().unwrap();
+        o.dead(q.seq).await.unwrap();
+        assert!(o.head().await.unwrap().is_none());
+        assert_eq!((o.pending(), o.dead_count().await), (0, 1));
     }
 }

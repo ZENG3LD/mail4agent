@@ -9,13 +9,13 @@ description = "Building blocks of a product server in front of the messenger ser
 [features]
 default = ["sqlite-outbox"]
 # Durable event queue in SQLite (survives restarts); without it only the in-memory queue exists.
-sqlite-outbox = ["dep:rusqlite"]
+sqlite-outbox = ["dep:tesserax-store"]
 # Real optional login door: a person proves a federated Matrix address by an OpenID token.
 matrix-address-door = []
 
 [dependencies]
-# SQLCipher only: never the plaintext `bundled` feature (Cargo would merge them into one plaintext build).
-rusqlite = { version = "0.32", default-features = false, features = ["bundled-sqlcipher"], optional = true }
+# Storage engine (published crate): SQLCipher via `cipher-native`, one writer, WAL, batched writes.
+tesserax-store = { version = "0.1.1", features = ["cipher-native"], optional = true }
 m4a-seam = { path = "../m4a-seam" }
 axum = { version = "0.8", features = ["json", "ws"] }
 tokio-tungstenite = "0.29"

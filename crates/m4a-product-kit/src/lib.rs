@@ -11,8 +11,8 @@
 //! * [`door`]: login doors; `matrix-address-door` is a real optional door.
 //! * [`edge_link`]: authenticate, sign, forward.
 //! * [`events`]: lifecycle event publisher (durable queue, retry/backoff) and startup reconcile.
-//! * [`dbkey`]: encrypted SQLite (SQLCipher) opener used by the durable queue; a product
-//!   that stores users in SQLite should open its database the same way.
+//! * [`dbkey`]: hex key -> `tesserax-store` SQLCipher config. The storage engine is
+//!   `tesserax-store` (one writer, parallel readers, batched writes); the durable queue sits on it.
 //!
 //! What a product CALLS from here: [`EdgeLink`], [`EventPublisher`], [`send_reconcile`],
 //! [`UserService`] over its own [`UserStore`]. What it BRINGS: the `UserStore` over its own

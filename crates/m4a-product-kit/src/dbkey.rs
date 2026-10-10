@@ -1,87 +1,62 @@
-//! Encrypted SQLite for everything this kit and its example persist.
-//!
-//! Every database is SQLCipher: `rusqlite` is built with `bundled-sqlcipher`
-//! (never `bundled`, so a consumer gets exactly one cipher build). A connection
-//! is opened with [`open_cipher`]: key first, then WAL, a busy timeout and foreign
-//! keys, then a read that proves the key is right. The key comes from the caller
-//! (normally [`DbKey::from_env`]); it is never a constant and never printed. In-memory
-//! connections (tests) are the only plaintext databases.
+//! Key handling for the encrypted stores of a product server. The storage engine itself is
+//! `tesserax-store` (SQLCipher through its `cipher-native` feature, one writer, WAL, batching);
+//! this module only turns a hex key from the environment into its [`DbConfig`], so a product
+//! does not hand-roll that glue. The key is never a constant and never printed.
 
-use std::fmt;
-use std::time::Duration;
+use std::sync::Arc;
 
-use rusqlite::Connection;
+use tesserax_store::keysource::StaticKeySource;
+use tesserax_store::DbConfig;
 
-/// Raw SQLCipher key as hex (at least 32 hex characters, even length). Debug never shows it.
-#[derive(Clone)]
-pub struct DbKey(String);
-
-impl DbKey {
-    pub fn from_hex(hex: &str) -> Result<Self, String> {
-        let h = hex.trim();
-        if h.len() < 32 || h.len() % 2 != 0 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err("database key must be even-length hex of at least 32 characters".into());
-        }
-        Ok(Self(h.to_ascii_lowercase()))
+/// Parses a raw 32-byte SQLCipher key given as 64 hex characters.
+pub fn parse_key(hex: &str) -> Result<[u8; 32], String> {
+    let h = hex.trim();
+    if h.len() != 64 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("database key must be 64 hex characters (32 bytes)".into());
     }
-
-    /// Reads the key from the environment variable `var`; the value is not echoed in errors.
-    pub fn from_env(var: &str) -> Result<Self, String> {
-        let v = std::env::var(var).map_err(|_| format!("{var} is required"))?;
-        Self::from_hex(&v).map_err(|e| format!("{var}: {e}"))
+    let mut key = [0u8; 32];
+    for (i, b) in key.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&h[2 * i..2 * i + 2], 16).map_err(|_| "database key must be hex".to_string())?;
     }
+    Ok(key)
 }
 
-impl fmt::Debug for DbKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("DbKey(<redacted>)")
-    }
+/// Encrypted store at `path`, keyed by `key_hex`.
+pub fn config(path: &str, key_hex: &str) -> Result<DbConfig, String> {
+    Ok(DbConfig::encrypted_native(path, Arc::new(StaticKeySource(parse_key(key_hex)?))))
 }
 
-/// Opens (or creates) the encrypted database at `path` for this connection.
-/// A wrong key or a plaintext/foreign file fails here, not later.
-pub fn open_cipher(path: &str, key: &DbKey) -> rusqlite::Result<Connection> {
-    let c = Connection::open(path)?;
-    // The hex alphabet is validated in `DbKey`, so this literal cannot be broken out of.
-    c.execute_batch(&format!("PRAGMA key = \"x'{}'\";", key.0))?;
-    c.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0))?;
-    c.pragma_update(None, "journal_mode", "WAL")?;
-    c.busy_timeout(Duration::from_secs(5))?;
-    c.pragma_update(None, "foreign_keys", "ON")?;
-    Ok(c)
+/// Encrypted store at `path`, keyed by the environment variable `var` (its value is not echoed in errors).
+pub fn config_from_env(path: &str, var: &str) -> Result<DbConfig, String> {
+    let v = std::env::var(var).map_err(|_| format!("{var} is required"))?;
+    config(path, &v).map_err(|e| format!("{var}: {e}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const K1: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
-    const K2: &str = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
+    const K: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
     #[test]
-    fn key_validation_and_redaction() {
-        assert!(DbKey::from_hex("abc").is_err());
-        assert!(DbKey::from_hex(&"zz".repeat(20)).is_err());
-        let k = DbKey::from_hex(K1).unwrap();
-        assert!(!format!("{k:?}").contains("0011"));
+    fn keys_are_exactly_32_bytes_of_hex() {
+        assert!(parse_key(K).is_ok());
+        assert!(parse_key("00ff").is_err());
+        assert!(parse_key(&"zz".repeat(32)).is_err());
     }
 
     #[test]
-    fn file_is_encrypted_and_needs_its_key() {
-        let path = format!("/tmp/m4a-kit-cipher-{}.db", std::process::id());
+    fn an_encrypted_store_needs_its_key() {
+        let path = format!("/tmp/m4a-kit-key-{}.db", std::process::id());
+        let other = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
         {
-            let c = open_cipher(&path, &DbKey::from_hex(K1).unwrap()).unwrap();
-            c.execute_batch("CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('secret-row');").unwrap();
-            let mode: String = c.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
-            assert_eq!(mode.to_lowercase(), "wal");
+            let db = tesserax_store::Db::open(&config(&path, K).unwrap()).unwrap();
+            db.write_blocking(|c| c.execute_batch("CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('plain-marker-value');")).unwrap();
         }
-        let c = open_cipher(&path, &DbKey::from_hex(K1).unwrap()).unwrap();
-        assert_eq!(c.query_row::<String, _, _>("SELECT v FROM t", [], |r| r.get(0)).unwrap(), "secret-row");
-        drop(c);
-        assert!(open_cipher(&path, &DbKey::from_hex(K2).unwrap()).is_err(), "wrong key must fail");
+        assert!(tesserax_store::Db::open(&config(&path, K).unwrap()).is_ok());
+        assert!(tesserax_store::Db::open(&config(&path, other).unwrap()).is_err());
         let raw = std::fs::read(&path).unwrap();
-        assert!(!raw.starts_with(b"SQLite format 3"), "header must be encrypted");
-        assert!(!raw.windows(10).any(|w| w == b"secret-row"), "row text must not be readable");
+        assert!(!raw.starts_with(b"SQLite format 3") && !raw.windows(12).any(|w| w == b"plain-marker"));
         for ext in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{path}{ext}"));
         }

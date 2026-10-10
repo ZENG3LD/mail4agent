@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use m4a_product_example::{router, ProductApp, SqliteStore};
-use m4a_product_kit::dbkey::DbKey;
+use m4a_product_kit::dbkey;
 use m4a_product_kit::door::LoginDoor;
 use m4a_product_kit::nick_rules::NickRules;
 use m4a_product_kit::tiers::TierTable;
@@ -38,11 +38,18 @@ async fn run() -> Result<(), String> {
         return Err("M4A_ASSERTION_SECRET must be at least 16 characters".into());
     }
     let db_path = req("M4A_PRODUCT_DB")?;
-    let db_key = DbKey::from_env("M4A_PRODUCT_DB_KEY_HEX")?;
-    let store = Arc::new(SqliteStore::open_path(&db_path, &db_key).map_err(|e| format!("M4A_PRODUCT_DB (wrong key or not an encrypted database?): {e}"))?);
+    let store = Arc::new(SqliteStore::open(&dbkey::config_from_env(&db_path, "M4A_PRODUCT_DB_KEY_HEX")?).map_err(|e| format!("M4A_PRODUCT_DB (wrong key or not an encrypted database?): {e}"))?);
     let link = EdgeLink::new(&req("M4A_PRODUCT_EDGE_URL")?, secret.into_bytes(), opt("M4A_ASSERTION_HEADER")).with_link_token(opt("M4A_LINK_TOKEN"));
     // Durable queue: events survive a restart of this process (own file, or the product database file).
-    let outbox = Arc::new(SqliteOutbox::open(&opt("M4A_PRODUCT_OUTBOX_DB").unwrap_or(db_path.clone()), &match opt("M4A_PRODUCT_OUTBOX_DB_KEY_HEX") { Some(_) => DbKey::from_env("M4A_PRODUCT_OUTBOX_DB_KEY_HEX")?, None => db_key.clone() }).map_err(|e| format!("event outbox: {e}"))?);
+    let outbox_db = match opt("M4A_PRODUCT_OUTBOX_DB") {
+        // Same file as the users: share its single writer.
+        None => store.db(),
+        Some(path) => {
+            let var = if opt("M4A_PRODUCT_OUTBOX_DB_KEY_HEX").is_some() { "M4A_PRODUCT_OUTBOX_DB_KEY_HEX" } else { "M4A_PRODUCT_DB_KEY_HEX" };
+            tesserax_store::Db::open(&dbkey::config_from_env(&path, var)?).map_err(|e| format!("event outbox: {e}"))?
+        }
+    };
+    let outbox = Arc::new(SqliteOutbox::new(outbox_db).map_err(|e| format!("event outbox: {e}"))?);
     let events = EventPublisher::spawn_with(link.clone(), opt("M4A_EVENT_SIG_HEADER"), Duration::from_secs(1), outbox);
     let mut doors: Vec<Arc<dyn LoginDoor>> = Vec::new();
     #[cfg(feature = "matrix-address-door")]
@@ -68,7 +75,11 @@ async fn run() -> Result<(), String> {
     if !opt("M4A_PRODUCT_RECONCILE").is_some_and(|v| v.eq_ignore_ascii_case("off")) {
         let (app, link, hdr) = (Arc::clone(&app), app.link.clone(), opt("M4A_EVENT_SIG_HEADER"));
         tokio::spawn(async move {
-            match app.users.reconcile_snapshots(2000) {
+            let snaps = {
+                let app = Arc::clone(&app);
+                tokio::task::spawn_blocking(move || app.users.reconcile_snapshots(2000)).await.unwrap_or_else(|_| Err(m4a_product_kit::service::ServiceError::Internal("task failed".into())))
+            };
+            match snaps {
                 Ok(snaps) => {
                     for snap in snaps {
                         if let Err(e) = send_reconcile(&link, hdr.clone(), &snap, Duration::from_secs(1), 12).await {
