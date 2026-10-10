@@ -235,6 +235,8 @@ pub struct UserDirectorySearchRequest {
 pub struct UserDirectoryResult {
     pub user_id: String,
     pub display_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
 }
 
 

@@ -275,7 +275,7 @@ async fn user_directory_search(
     headers: HeaderMap,
     Json(req): Json<account::UserDirectorySearchRequest>,
 ) -> Result<Json<account::UserDirectorySearchResponse>, MatrixError> {
-    super::resolve_caller(&state, &headers, None).await?;
+    let caller = super::resolve_caller(&state, &headers, None).await?;
     let term = req.search_term.trim().to_string();
     if term.is_empty() {
         return Err(MatrixError::invalid_param("search_term must not be empty"));
@@ -284,34 +284,137 @@ async fn user_directory_search(
         Some(limit) => limit.clamp(1, account::MAX_DIRECTORY_RESULTS as i64) as usize,
         None => account::DEFAULT_DIRECTORY_RESULTS,
     };
-    let response = tokio::task::spawn_blocking(move || -> Result<account::UserDirectorySearchResponse, MatrixError> {
-        state.conn_scope(|conn: &mut rusqlite::Connection| {
-        let (hits, limited) = crate::nick::search_nicks(&conn, &term, limit)?;
+    let (st, t) = (Arc::clone(&state), term.clone());
+    let mut response = tokio::task::spawn_blocking(move || -> Result<account::UserDirectorySearchResponse, MatrixError> {
+        st.conn_scope(|conn: &mut rusqlite::Connection| {
+        let (hits, limited) = crate::nick::search_nicks(&conn, &t, limit)?;
         let results = hits
             .into_iter()
-            .map(|hit| account::UserDirectoryResult { user_id: hit.mxid, display_name: hit.nick })
+            .map(|hit| {
+                let avatar_url = super::extras::local_profile(&conn, &hit.mxid).ok().flatten().and_then(|p| p.get("avatar_url").and_then(|a| a.as_str().map(str::to_string)));
+                account::UserDirectoryResult { user_id: hit.mxid, display_name: hit.nick, avatar_url }
+            })
             .collect();
         Ok(account::UserDirectorySearchResponse { results, limited })
         })
     })
     .await
     .map_err(|_| MatrixError::internal())??;
+    if federated_directory_enabled() && state.federation_enabled.get().is_some() {
+        add_remote_users(&state, caller.user_id, &term, limit, &mut response).await;
+    }
     Ok(Json(response))
+}
+
+/// Switch for asking other servers while searching users and rooms (`M4A_DIRECTORY_FEDERATION=off`).
+pub(crate) fn federated_directory_enabled() -> bool {
+    std::env::var("M4A_DIRECTORY_FEDERATION").map(|v| v != "off").unwrap_or(true)
+}
+
+/// Adds users of other servers to a directory answer: an exact `@user:server` term is looked up at
+/// that user's server (`query/profile`); otherwise remote users who share a room with the caller
+/// and match the term are listed with their own server's profile.
+async fn add_remote_users(state: &Arc<Homeserver>, caller: i64, term: &str, limit: usize, out: &mut account::UserDirectorySearchResponse) {
+    let needle = term.trim_start_matches('@').to_lowercase();
+    let mut wanted: Vec<String> = Vec::new();
+    let full = format!("@{needle}");
+    if let Some(domain) = crate::fed_rooms::domain_of(&full) {
+        if !crate::store::is_local_server_name(domain) && full.matches(':').count() == 1 && full.len() > domain.len() + 2 {
+            wanted.push(full.clone());
+        }
+    }
+    let n = needle.clone();
+    let st = Arc::clone(state);
+    let known = tokio::task::spawn_blocking(move || {
+        st.conn_scope(|conn: &mut rusqlite::Connection| {
+            let peers = crate::key_ops::peers_sharing_a_room_with(conn, caller).unwrap_or_default();
+            let mut found = Vec::new();
+            for p in peers.into_iter().filter(|p| *p < 0) {
+                if let Ok(Some(mxid)) = crate::store::mxid_of(conn, p) {
+                    if mxid.to_lowercase().contains(&n) {
+                        found.push(mxid);
+                    }
+                }
+            }
+            found
+        })
+    })
+    .await
+    .unwrap_or_default();
+    for m in known {
+        if !wanted.contains(&m) {
+            wanted.push(m);
+        }
+    }
+    for mxid in wanted.into_iter().take(8) {
+        if out.results.len() >= limit || out.results.iter().any(|r| r.user_id == mxid) {
+            continue;
+        }
+        if let Ok(p) = super::extras::profile_of(state, &mxid).await {
+            let name = p.get("displayname").and_then(|d| d.as_str()).unwrap_or_default().to_string();
+            let avatar_url = p.get("avatar_url").and_then(|a| a.as_str()).map(str::to_string);
+            out.results.push(account::UserDirectoryResult { user_id: mxid, display_name: name, avatar_url });
+        }
+    }
 }
 
 async fn get_public_rooms(
     State(state): State<Arc<Homeserver>>,
     headers: HeaderMap,
     Query(query): Query<account::PublicRoomsQuery>,
+    Query(extra): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, MatrixError> {
+    if let Some(server) = remote_server(&extra) {
+        super::resolve_caller(&state, &headers, None).await?;
+        let mut q = String::new();
+        if let Some(l) = query.limit {
+            q.push_str(&format!("limit={l}&"));
+        }
+        if let Some(s) = &query.since {
+            q.push_str(&format!("since={}&", crate::federation::enc(s)));
+        }
+        return remote_public_rooms(&state, &server, "GET", &format!("/federation/v1/publicRooms?{q}"), None).await;
+    }
     public_rooms(state, headers, query.since, query.limit, None).await
+}
+
+/// The `server` query parameter of the room directory, when it names another server.
+fn remote_server(q: &std::collections::HashMap<String, String>) -> Option<String> {
+    q.get("server").filter(|s| !s.is_empty() && !crate::store::is_local_server_name(s)).cloned()
+}
+
+/// Another server's public room directory, relayed (their answer is checked to be a room list).
+async fn remote_public_rooms(state: &Arc<Homeserver>, server: &str, method: &str, path: &str, body: Option<serde_json::Value>) -> Result<Json<serde_json::Value>, MatrixError> {
+    if !federated_directory_enabled() || state.federation_enabled.get().is_none() {
+        return Err(MatrixError::forbidden("room directories of other servers are not available here"));
+    }
+    let (status, v) = super::fed_net::fed_request(state, server, method, path, body).await?;
+    if status != 200 || !v.get("chunk").is_some_and(|c| c.is_array()) {
+        return Err(MatrixError::unknown("that server did not return a room directory"));
+    }
+    Ok(Json(v))
 }
 
 async fn post_public_rooms(
     State(state): State<Arc<Homeserver>>,
     headers: HeaderMap,
+    Query(extra): Query<std::collections::HashMap<String, String>>,
     Json(body): Json<account::PublicRoomsRequestBody>,
 ) -> Result<Json<serde_json::Value>, MatrixError> {
+    if let Some(server) = remote_server(&extra) {
+        super::resolve_caller(&state, &headers, None).await?;
+        let mut req = serde_json::json!({});
+        if let Some(l) = body.limit {
+            req["limit"] = l.into();
+        }
+        if let Some(s) = &body.since {
+            req["since"] = s.clone().into();
+        }
+        if let Some(t) = &body.filter.generic_search_term {
+            req["filter"] = serde_json::json!({ "generic_search_term": t });
+        }
+        return remote_public_rooms(&state, &server, "POST", "/federation/v1/publicRooms", Some(req)).await;
+    }
     public_rooms(state, headers, body.since, body.limit, body.filter.generic_search_term).await
 }
 
