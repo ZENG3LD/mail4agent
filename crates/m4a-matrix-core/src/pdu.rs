@@ -15,6 +15,7 @@ pub struct Pdu {
     pub state_key: Option<String>,
     pub prev_events: Vec<OwnedEventId>,
     pub auth_events: Vec<OwnedEventId>,
+    pub depth: u64,
     pub redacts: Option<OwnedEventId>,
     pub rejected: bool,
 }
@@ -42,6 +43,7 @@ impl Pdu {
             state_key: s("state_key"),
             prev_events: ids("prev_events")?,
             auth_events: ids("auth_events")?,
+            depth: v.get("depth").and_then(|x| x.as_u64()).unwrap_or(0),
             redacts: None,
             rejected: false,
         })

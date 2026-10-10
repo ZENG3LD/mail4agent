@@ -11,18 +11,21 @@
 //! behind this crate's own small surface.
 
 mod builder;
+pub mod dag;
 mod pdu;
 mod resolve;
 mod signer;
 
 pub use builder::{BuildError, RoomBuilder, SignedEvent};
 pub use pdu::Pdu;
-pub use resolve::{auth_chain, resolve_state, ResolveError};
+pub use resolve::{auth_chain, auth_chain_with, resolve_state, resolve_state_with, ResolveError};
 pub use signer::Signer;
 
 pub use ruma_common::IdParseError as IdError;
 pub use ruma_common::{OwnedEventId, OwnedRoomId, OwnedUserId, RoomVersionId};
 pub use ruma_state_res::StateMap;
+pub use ruma_signatures::PublicKeyMap;
+pub use ruma_common::{CanonicalJsonObject, room_version_rules::RoomVersionRules};
 
 /// The room version this spike emits.
 pub const ROOM_VERSION: RoomVersionId = RoomVersionId::V11;
