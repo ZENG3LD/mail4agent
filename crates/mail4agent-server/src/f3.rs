@@ -823,6 +823,24 @@ pub fn join_template(conn: &Connection, room_id: &str, user_mxid: &str, ts: i64)
     serde_json::to_value(t).map_err(|_| MatrixError::internal())
 }
 
+/// Template for a peer's leave (make_leave), like [`join_template`].
+pub fn leave_template(conn: &Connection, room_id: &str, user_mxid: &str, ts: i64) -> Result<Value, MatrixError> {
+    let room: OwnedRoomId = room_id.try_into().map_err(|_| MatrixError::bad_json("room id"))?;
+    let db = ConnDag { conn, room: room_id };
+    let t = dag::template(&rules(), &db, &room, ts.max(0) as u64, user_mxid, "m.room.member", Some(user_mxid), serde_json::json!({ "membership": "leave" })).map_err(bad)?;
+    serde_json::to_value(t).map_err(|_| MatrixError::internal())
+}
+
+/// One stored event as a wire PDU (`GET /event/{eventId}`), if it is a DAG event.
+pub fn pdu_json(conn: &Connection, event_id: &str) -> Option<Value> {
+    conn.query_row("SELECT pdu FROM dag_events WHERE event_id = ?1", [event_id], |r| r.get::<_, String>(0)).ok().and_then(|s| serde_json::from_str(&s).ok())
+}
+
+/// The room a stored DAG event belongs to.
+pub fn room_of_event(conn: &Connection, event_id: &str) -> Option<String> {
+    conn.query_row("SELECT room_id FROM dag_events WHERE event_id = ?1", [event_id], |r| r.get::<_, String>(0)).ok()
+}
+
 /// Sign a filled-in template with this server's key. Returns the event id and the wire event.
 pub fn sign_own(conn: &Connection, template: &Value, now_ms: i64) -> Result<(String, Value), MatrixError> {
     let signer = local_signer(conn, now_ms)?;

@@ -571,6 +571,7 @@ fn create_matrix_schema_tables(conn: &Connection) -> rusqlite::Result<()> {
     crate::dag_schema::create_dag_schema(conn)?;
     crate::http::extras::create_schema(conn)?;
     crate::http::presence::create_schema(conn)?;
+    crate::http::spec_rest::create_schema(conn)?;
     crate::identities::create_identities_schema(conn)
 }
 

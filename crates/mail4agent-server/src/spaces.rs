@@ -48,7 +48,7 @@ pub fn validate_space_state(event_type: &str, content: &Value) -> Result<(), Mat
     Ok(())
 }
 
-fn state_content(conn: &Connection, room_id: &str, event_type: &str, key: &str) -> Result<Option<Value>, MatrixError> {
+pub(crate) fn state_content(conn: &Connection, room_id: &str, event_type: &str, key: &str) -> Result<Option<Value>, MatrixError> {
     Ok(store::current_state_event(conn, room_id, event_type, key)?.and_then(|e| serde_json::from_str(&e.content).ok()))
 }
 
@@ -79,7 +79,7 @@ pub fn restricted_allows(conn: &Connection, room_id: &str, user_id: i64) -> Resu
     Ok(false)
 }
 
-fn join_rule_wire(conn: &Connection, room: &store::Room) -> Result<String, MatrixError> {
+pub(crate) fn join_rule_wire(conn: &Connection, room: &store::Room) -> Result<String, MatrixError> {
     Ok(state_content(conn, &room.id, "m.room.join_rules", "")?
         .and_then(|c| c.get("join_rule").and_then(Value::as_str).map(str::to_string))
         .unwrap_or_else(|| match room.join_rule {
@@ -88,7 +88,7 @@ fn join_rule_wire(conn: &Connection, room: &store::Room) -> Result<String, Matri
         }))
 }
 
-fn caller_may_see(conn: &Connection, room: &store::Room, user_id: i64) -> Result<bool, MatrixError> {
+pub(crate) fn caller_may_see(conn: &Connection, room: &store::Room, user_id: i64) -> Result<bool, MatrixError> {
     if store::room_member(conn, &room.id, user_id)?.is_some_and(|m| matches!(m.membership, Membership::Join | Membership::Invite)) {
         return Ok(true);
     }
@@ -101,7 +101,7 @@ fn caller_may_see(conn: &Connection, room: &store::Room, user_id: i64) -> Result
     restricted_allows(conn, &room.id, user_id)
 }
 
-fn joined_count(conn: &Connection, room_id: &str) -> Result<i64, MatrixError> {
+pub(crate) fn joined_count(conn: &Connection, room_id: &str) -> Result<i64, MatrixError> {
     let mut n = 0;
     for event in store::current_state_all(conn, room_id)? {
         if event.event_type == "m.room.member" {

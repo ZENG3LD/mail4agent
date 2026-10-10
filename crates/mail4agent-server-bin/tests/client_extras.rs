@@ -88,7 +88,7 @@ fn client_routes_for_stock_clients() {
     assert_eq!(v["user_id"], "@carol:a.example");
     let (st, v) = bob("POST", "/client/v3/login", Some(json!({"type":"m.login.password","identifier":{"type":"m.id.user","user":"carol"},"password":"long enough pw"})));
     assert_eq!((st, v["user_id"].as_str()), (200, Some("@carol:a.example")), "{v}");
-    assert_eq!(bob("POST", "/client/v3/account/password", Some(json!({}))).0, 403);
+    assert_eq!(bob("POST", "/client/v3/account/password", Some(json!({}))).0, 401);
     assert_eq!(bob("GET", "/client/v3/account/3pid", None).1["threepids"], json!([]));
 
     // threads in a group room.
@@ -210,4 +210,73 @@ fn simplified_sliding_sync_lists_rooms_sends_deltas_and_shows_invites() {
     assert_eq!(st, 200, "{b}");
     assert_eq!(b["lists"]["invites"]["count"], 1);
     assert!(b["rooms"][&group]["invite_state"].as_array().is_some_and(|a| !a.is_empty()), "{b}");
+}
+
+#[test]
+fn custom_profile_fields_summaries_timestamps_and_refusals() {
+    let a = start_node("a.example", "alice", free_port(), &[]);
+    let c = Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
+    let pr = support_product::Product { url: a.purl.clone() };
+    let bob_tok = support_product::product_user(&pr, "bob");
+    let bob = |m: &str, p: &str, b: Option<Value>| call_as(&a, &c, &bob_tok, m, p, b);
+    let alice = |m: &str, p: &str, b: Option<Value>| call_as(&a, &c, &a.token, m, p, b);
+    let me = enc(&a.user);
+
+    // Custom profile fields (v1.16): set, read one, read in the whole profile, delete, others cannot.
+    let (st, v) = alice("PUT", &format!("/client/v3/profile/{me}/m.tz"), Some(json!({"m.tz":"Asia/Yekaterinburg"})));
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(bob("GET", &format!("/client/v3/profile/{me}/m.tz"), None).1, json!({"m.tz":"Asia/Yekaterinburg"}));
+    assert_eq!(bob("GET", &format!("/client/v3/profile/{me}"), None).1["m.tz"], "Asia/Yekaterinburg");
+    assert_eq!(bob("PUT", &format!("/client/v3/profile/{me}/m.tz"), Some(json!({"m.tz":"x"}))).0, 403);
+    assert_eq!(alice("DELETE", &format!("/client/v3/profile/{me}/m.tz"), None).0, 200);
+    assert_eq!(bob("GET", &format!("/client/v3/profile/{me}/m.tz"), None).0, 404);
+
+    // A public channel: directory visibility, summary, timestamp lookup.
+    let (_, v) = alice("POST", "/client/v3/createRoom", Some(json!({"name":"general","visibility":"public","topic":"talk"})));
+    let chan = v["room_id"].as_str().unwrap().to_string();
+    let (_, v) = alice("PUT", &format!("/client/v3/rooms/{}/send/m.room.message/t1", enc(&chan)), Some(json!({"msgtype":"m.text","body":"hello"})));
+    let ev = v["event_id"].as_str().unwrap().to_string();
+    assert_eq!(bob("GET", &format!("/client/v3/directory/list/room/{}", enc(&chan)), None).1["visibility"], "public");
+    assert_eq!(alice("PUT", &format!("/client/v3/directory/list/room/{}", enc(&chan)), Some(json!({"visibility":"public"}))).0, 200);
+    assert_eq!(alice("PUT", &format!("/client/v3/directory/list/room/{}", enc(&chan)), Some(json!({"visibility":"private"}))).0, 403);
+    let (st, v) = bob("GET", &format!("/client/v1/room_summary/{}", enc(&chan)), None);
+    assert_eq!((st, v["name"].as_str(), v["topic"].as_str(), v["num_joined_members"].as_i64(), v["join_rule"].as_str()), (200, Some("general"), Some("talk"), Some(1), Some("public")), "{v}");
+    let (st, v) = bob("GET", &format!("/client/v1/rooms/{}/timestamp_to_event?ts=0&dir=f", enc(&chan)), None);
+    assert_eq!(st, 200, "{v}");
+    assert!(v["event_id"].is_string() && v["origin_server_ts"].is_number());
+    let (st, v) = bob("GET", &format!("/client/v1/rooms/{}/timestamp_to_event?ts=99999999999999&dir=b", enc(&chan)), None);
+    assert_eq!((st, v["event_id"].as_str()), (200, Some(ev.as_str())), "latest event before a far-future time");
+    assert_eq!(bob("GET", &format!("/client/v1/rooms/{}/timestamp_to_event?ts=99999999999999&dir=f", enc(&chan)), None).0, 404);
+    // A private room is invisible to a stranger.
+    let (_, v) = alice("POST", "/client/v3/createRoom", Some(json!({"name":"secret","visibility":"private"})));
+    let sec = v["room_id"].as_str().unwrap().to_string();
+    assert_eq!(bob("GET", &format!("/client/v1/room_summary/{}", enc(&sec)), None).0, 404);
+
+    // State with an empty key written the way clients do (trailing slash).
+    let (st, v) = alice("PUT", &format!("/client/v3/rooms/{}/state/m.room.topic/", enc(&chan)), Some(json!({"topic":"new topic"})));
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(bob("GET", &format!("/client/v3/rooms/{}/state/m.room.topic/", enc(&chan)), None).1["topic"], "new topic");
+
+    // Deliberate refusals carry the spec's errors.
+    let (st, v) = bob("POST", &format!("/client/v3/knock/{}", enc(&chan)), Some(json!({})));
+    assert_eq!((st, v["errcode"].as_str()), (403, Some("M_FORBIDDEN")));
+    let (st, v) = bob("GET", "/client/v3/thirdparty/protocol/irc", None);
+    assert_eq!((st, v["errcode"].as_str()), (404, Some("M_NOT_FOUND")));
+    assert_eq!(bob("GET", "/client/v3/thirdparty/location/irc", None).1, json!([]));
+    assert_eq!(bob("POST", &format!("/client/v3/users/{me}/report"), Some(json!({"reason":"rude"}))).0, 200);
+    assert_eq!(bob("GET", &format!("/client/v3/admin/whois/{me}"), None).0, 403);
+    let (st, v) = bob("POST", "/client/v3/account/3pid/email/requestToken", Some(json!({})));
+    assert_eq!((st, v["errcode"].as_str()), (403, Some("M_THREEPID_DENIED")));
+    assert_eq!(bob("GET", "/client/v1/register/m.login.registration_token/validity?token=x", None).1, json!({"valid": false}));
+    let w = c.get(format!("{}/.well-known/matrix/support", a.addr_http())).send().unwrap();
+    assert_eq!(w.status().as_u16(), 404);
+}
+
+trait Http {
+    fn addr_http(&self) -> String;
+}
+impl Http for Srv {
+    fn addr_http(&self) -> String {
+        format!("http://{}", self.addr)
+    }
 }

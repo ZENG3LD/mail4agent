@@ -35,6 +35,7 @@ pub(super) fn routes() -> Router<Arc<Homeserver>> {
         .route("/client/v3/rooms/{room_id}/forget", post(forget_room))
         .route("/client/v3/rooms/{room_id}/state", get(get_state_all))
         .route("/client/v3/rooms/{room_id}/state/{event_type}", get(get_state_no_key).put(put_state_no_key))
+        .route("/client/v3/rooms/{room_id}/state/{event_type}/", get(get_state_no_key).put(put_state_no_key))
         .route(
             "/client/v3/rooms/{room_id}/state/{event_type}/{state_key}",
             get(get_state).put(put_state),

@@ -23,6 +23,7 @@ pub(super) fn routes() -> Router<Arc<Homeserver>> {
         .route("/key/v2/server", get(own_keys))
         .route("/key/v2/server/{key_id}", get(own_keys_by_id))
         .route("/federation/v1/version", get(version))
+        .merge(super::fed_rest::routes())
         .route("/federation/v1/media/download/{media_id}", get(fed_media_download))
         .route("/federation/v1/media/thumbnail/{media_id}", get(fed_media_thumbnail))
         .route("/federation/v1/query/profile", get(profile))
@@ -38,6 +39,7 @@ pub(super) fn routes() -> Router<Arc<Homeserver>> {
         .route("/federation/v1/state/{room_id}", get(state_events))
         .route("/federation/v1/publicRooms", get(fed_public_rooms).post(fed_public_rooms_post))
         .route("/key/v2/query/{server_name}", get(notary_get))
+        .route("/key/v2/query/{server_name}/{key_id}", get(notary_get_key))
         .route("/key/v2/query", post(notary_post))
         .route("/federation/v1/openid/userinfo", get(openid_userinfo))
         .route("/federation/v1/user/keys/query", post(keys_query))
@@ -45,7 +47,7 @@ pub(super) fn routes() -> Router<Arc<Homeserver>> {
         .route("/federation/v1/user/devices/{user_id}", get(user_devices))
 }
 
-fn require_enabled(state: &Homeserver) -> Result<(), MatrixError> {
+pub(super) fn require_enabled(state: &Homeserver) -> Result<(), MatrixError> {
     state.federation_enabled.get().map(|_| ()).ok_or_else(MatrixError::unrecognized)
 }
 
@@ -100,12 +102,12 @@ fn rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
-fn parse_body(body: &Bytes) -> Result<Value, MatrixError> {
+pub(super) fn parse_body(body: &Bytes) -> Result<Value, MatrixError> {
     serde_json::from_slice(body).map_err(|_| MatrixError::bad_json("body is not JSON"))
 }
 
 /// Wake local users and poke the outbox (events ingested may need relaying).
-fn after_ingest(state: &Arc<Homeserver>, wake: impl IntoIterator<Item = i64>) {
+pub(super) fn after_ingest(state: &Arc<Homeserver>, wake: impl IntoIterator<Item = i64>) {
     super::wake_users(state, wake.into_iter().filter(|id| *id > 0));
     state.fed_notify.notify_one();
 }
@@ -676,6 +678,11 @@ async fn notary_doc(state: &Arc<Homeserver>, server: &str) -> Result<Value, Matr
 async fn notary_get(State(state): State<Arc<Homeserver>>, Path(server): Path<String>) -> Result<Json<Value>, MatrixError> {
     require_enabled(&state)?;
     Ok(Json(json!({ "server_keys": [notary_doc(&state, &server).await?] })))
+}
+
+/// The older form with a key id in the path: the same document (all of the server's keys).
+async fn notary_get_key(State(state): State<Arc<Homeserver>>, Path((server, _key_id)): Path<(String, String)>) -> Result<Json<Value>, MatrixError> {
+    notary_get(State(state), Path(server)).await
 }
 
 async fn notary_post(State(state): State<Arc<Homeserver>>, Json(body): Json<Value>) -> Result<Json<Value>, MatrixError> {

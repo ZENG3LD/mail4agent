@@ -26,6 +26,8 @@ mod account;
 pub(crate) mod extras;
 pub mod presence;
 mod media;
+pub(crate) mod spec_rest;
+mod fed_rest;
 mod compat;
 pub mod edge_auth;
 mod ephemeral;
@@ -243,6 +245,7 @@ pub fn router(state: Arc<Homeserver>) -> Router {
         .merge(extras::routes())
         .merge(presence::routes())
         .merge(media::routes())
+        .merge(spec_rest::routes())
         .merge(sliding::routes())
                 .merge(keys::routes())
         .merge(sync::routes())
@@ -251,6 +254,7 @@ pub fn router(state: Arc<Homeserver>) -> Router {
         .merge(federation::routes())
         .merge(identity::routes())
         .fallback(unrecognized)
+        .method_not_allowed_fallback(|| async { (axum::http::StatusCode::METHOD_NOT_ALLOWED, Json(serde_json::json!({ "errcode": "M_UNRECOGNIZED", "error": "Unrecognized request" }))) })
         .layer(axum::middleware::from_fn_with_state(state.clone(), identity::assertion_layer))
         .layer(axum::middleware::from_fn(cors))
         .with_state(state)

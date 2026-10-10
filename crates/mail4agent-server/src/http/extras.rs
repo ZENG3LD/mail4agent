@@ -307,6 +307,11 @@ pub(crate) fn local_profile(conn: &Connection, mxid: &str) -> Result<Option<Valu
     if let Some(a) = conn.query_row("SELECT avatar_url FROM user_avatar WHERE user_id = ?1", [uid], |r| r.get::<_, String>(0)).optional().map_err(|_| MatrixError::internal())? {
         v["avatar_url"] = json!(a);
     }
+    for (k, val) in super::spec_rest::profile_fields(conn, uid) {
+        if k != "displayname" && k != "avatar_url" {
+            v[k] = val;
+        }
+    }
     Ok(Some(v))
 }
 
