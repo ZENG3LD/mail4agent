@@ -1,10 +1,11 @@
 //! Example product server. Configuration is environment only:
 //!
-//! * `M4A_PRODUCT_BIND` (default `127.0.0.1:8080`), `M4A_PRODUCT_DB` (required, SQLite path)
+//! * `M4A_PRODUCT_BIND` (default `127.0.0.1:8080`), `M4A_PRODUCT_DB` (required, SQLCipher file path),
+//!   `M4A_PRODUCT_DB_KEY_HEX` (required: even-length hex, at least 32 characters; never logged)
 //! * `M4A_PRODUCT_EDGE_URL` (required: messenger edge on the private link)
 //! * `M4A_ASSERTION_SECRET` (required, >= 16 chars; must equal the core's), optional
 //!   `M4A_ASSERTION_HEADER`, `M4A_EVENT_SIG_HEADER`
-//! * `M4A_PRODUCT_OUTBOX_DB` (event queue file, default the product database), `M4A_PRODUCT_RECONCILE=off` (skip the startup snapshot), `M4A_PRODUCT_ANON_READ=on`
+//! * `M4A_PRODUCT_OUTBOX_DB` (event queue file, default the product database; `M4A_PRODUCT_OUTBOX_DB_KEY_HEX` its key, default the product key), `M4A_PRODUCT_RECONCILE=off` (skip the startup snapshot), `M4A_PRODUCT_ANON_READ=on`
 //! * `M4A_LINK_TOKEN` (optional barrier token presented to the edge/core; must equal theirs)
 //! * `M4A_PRODUCT_ADMIN_TOKEN` (optional; enables `/product/v1/admin/*`)
 //! * `M4A_PRODUCT_TIERS` (`free=0,paid=1`), `M4A_PRODUCT_NICK_LISTS`, `M4A_PRODUCT_NICK_COOLDOWN_DAYS`
@@ -16,6 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use m4a_product_example::{router, ProductApp, SqliteStore};
+use m4a_product_kit::dbkey::DbKey;
 use m4a_product_kit::door::LoginDoor;
 use m4a_product_kit::nick_rules::NickRules;
 use m4a_product_kit::tiers::TierTable;
@@ -36,10 +38,11 @@ async fn run() -> Result<(), String> {
         return Err("M4A_ASSERTION_SECRET must be at least 16 characters".into());
     }
     let db_path = req("M4A_PRODUCT_DB")?;
-    let store = Arc::new(SqliteStore::open_path(&db_path).map_err(|e| format!("M4A_PRODUCT_DB: {e}"))?);
+    let db_key = DbKey::from_env("M4A_PRODUCT_DB_KEY_HEX")?;
+    let store = Arc::new(SqliteStore::open_path(&db_path, &db_key).map_err(|e| format!("M4A_PRODUCT_DB (wrong key or not an encrypted database?): {e}"))?);
     let link = EdgeLink::new(&req("M4A_PRODUCT_EDGE_URL")?, secret.into_bytes(), opt("M4A_ASSERTION_HEADER")).with_link_token(opt("M4A_LINK_TOKEN"));
     // Durable queue: events survive a restart of this process (own file, or the product database file).
-    let outbox = Arc::new(SqliteOutbox::open(&opt("M4A_PRODUCT_OUTBOX_DB").unwrap_or(db_path.clone())).map_err(|e| format!("event outbox: {e}"))?);
+    let outbox = Arc::new(SqliteOutbox::open(&opt("M4A_PRODUCT_OUTBOX_DB").unwrap_or(db_path.clone()), &match opt("M4A_PRODUCT_OUTBOX_DB_KEY_HEX") { Some(_) => DbKey::from_env("M4A_PRODUCT_OUTBOX_DB_KEY_HEX")?, None => db_key.clone() }).map_err(|e| format!("event outbox: {e}"))?);
     let events = EventPublisher::spawn_with(link.clone(), opt("M4A_EVENT_SIG_HEADER"), Duration::from_secs(1), outbox);
     let mut doors: Vec<Arc<dyn LoginDoor>> = Vec::new();
     #[cfg(feature = "matrix-address-door")]

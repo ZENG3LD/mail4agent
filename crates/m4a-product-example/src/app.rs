@@ -69,11 +69,16 @@ fn bearer(h: &HeaderMap) -> Option<String> {
     h.get("authorization")?.to_str().ok()?.strip_prefix("Bearer ").map(|t| t.trim().to_string())
 }
 
-fn auth(app: &App, h: &HeaderMap) -> Result<Option<AuthUser>, ApiError> {
-    match bearer(h) {
-        None => Ok(None),
-        Some(t) => app.users.authenticate(&t)?.map(Some).ok_or_else(|| ServiceError::Unauthorized.into()),
-    }
+/// Authenticates on the blocking pool: database work never runs on the async request
+/// thread, and no store lock is held while the request waits on the edge.
+async fn auth_blocking(app: &App, h: &HeaderMap) -> Result<Option<AuthUser>, ApiError> {
+    let Some(t) = bearer(h) else { return Ok(None) };
+    let app = Arc::clone(app);
+    tokio::task::spawn_blocking(move || app.users.authenticate(&t))
+        .await
+        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "M_UNKNOWN", "task failed"))??
+        .map(Some)
+        .ok_or_else(|| ServiceError::Unauthorized.into())
 }
 
 fn hash_secret(secret: &str) -> Result<String, ApiError> {
@@ -151,23 +156,23 @@ async fn door_login(State(app): State<App>, Path(id): Path<String>, Json(proof):
     Ok(session_json(&u.nick, &s.token))
 }
 
-fn need(app: &App, h: &HeaderMap) -> Result<AuthUser, ApiError> {
-    auth(app, h)?.ok_or_else(|| ServiceError::Unauthorized.into())
+async fn need(app: &App, h: &HeaderMap) -> Result<AuthUser, ApiError> {
+    auth_blocking(app, h).await?.ok_or_else(|| ServiceError::Unauthorized.into())
 }
 
 async fn logout(State(app): State<App>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
-    let who = need(&app, &headers)?;
+    let who = need(&app, &headers).await?;
     app.events.publish(app.users.revoke(&who.cred_ref)?);
     Ok(Json(json!({})))
 }
 
 async fn me(State(app): State<App>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
-    let who = need(&app, &headers)?;
+    let who = need(&app, &headers).await?;
     Ok(Json(json!({ "nick": who.nick, "flag": who.flag })))
 }
 
 async fn set_nick(State(app): State<App>, headers: HeaderMap, Json(body): Json<Value>) -> Result<Json<Value>, ApiError> {
-    let who = need(&app, &headers)?;
+    let who = need(&app, &headers).await?;
     let new = body.get("nick").and_then(Value::as_str).unwrap_or("");
     let u = app.users.store.user_by_nick(&who.nick).map_err(ServiceError::from)?.ok_or(ServiceError::Unauthorized)?;
     let (u, evs) = app.users.set_nick(&u, new, now_ms())?;
@@ -213,7 +218,7 @@ async fn admin_tier(State(app): State<App>, headers: HeaderMap, Json(b): Json<Va
 /// refused here; no token forwards unasserted (the messenger decides what an
 /// unasserted caller may do).
 async fn proxy(State(app): State<App>, req: Request) -> Response {
-    let who = match auth(&app, req.headers()) {
+    let who = match auth_blocking(&app, req.headers()).await {
         Ok(w) => w,
         Err(e) => return e.into_response(),
     };
@@ -227,9 +232,13 @@ async fn proxy(State(app): State<App>, req: Request) -> Response {
 /// query), signed, and relayed to the messenger; anonymous sockets are refused.
 async fn push(State(app): State<App>, headers: HeaderMap, axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>, ws: axum::extract::WebSocketUpgrade) -> Response {
     let token = bearer(&headers).or_else(|| q.get("access_token").cloned());
-    let who = match token.map(|t| app.users.authenticate(&t)) {
-        Some(Ok(Some(w))) => w,
-        _ => return m4a_product_kit::push_relay::unauthorized(),
+    let Some(token) = token else { return m4a_product_kit::push_relay::unauthorized() };
+    let who = {
+        let app = Arc::clone(&app);
+        match tokio::task::spawn_blocking(move || app.users.authenticate(&token)).await {
+            Ok(Ok(Some(w))) => w,
+            _ => return m4a_product_kit::push_relay::unauthorized(),
+        }
     };
     app.link.relay_push(who, ws)
 }

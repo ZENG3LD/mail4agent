@@ -14,7 +14,8 @@ sqlite-outbox = ["dep:rusqlite"]
 matrix-address-door = []
 
 [dependencies]
-rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+# SQLCipher only: never the plaintext `bundled` feature (Cargo would merge them into one plaintext build).
+rusqlite = { version = "0.32", default-features = false, features = ["bundled-sqlcipher"], optional = true }
 m4a-seam = { path = "../m4a-seam" }
 axum = { version = "0.8", features = ["json", "ws"] }
 tokio-tungstenite = "0.29"

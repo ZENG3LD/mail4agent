@@ -108,13 +108,13 @@ mod sqlite {
     }
 
     impl SqliteOutbox {
-        pub fn open(path: &str) -> Result<Self, String> {
-            let c = Connection::open(path).map_err(be)?;
-            c.pragma_update(None, "journal_mode", "WAL").map_err(be)?;
-            c.busy_timeout(Duration::from_secs(5)).map_err(be)?;
+        /// Opens the queue in an encrypted (SQLCipher) file: key, WAL and busy timeout are set per connection.
+        pub fn open(path: &str, key: &crate::dbkey::DbKey) -> Result<Self, String> {
+            let c = crate::dbkey::open_cipher(path, key).map_err(be)?;
             c.execute_batch(SCHEMA).map_err(be)?;
             Ok(Self { c: Mutex::new(c) })
         }
+        /// Plaintext in-memory queue for tests only.
         pub fn memory() -> Result<Self, String> {
             let c = Connection::open_in_memory().map_err(be)?;
             c.execute_batch(SCHEMA).map_err(be)?;
@@ -256,6 +256,10 @@ pub async fn send_reconcile(link: &EdgeLink, event_sig_header: Option<String>, s
 mod tests {
     use super::*;
     use axum::routing::post;
+
+    fn test_key() -> crate::dbkey::DbKey {
+        crate::dbkey::DbKey::from_hex("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff").unwrap()
+    }
     use m4a_seam::EventKind;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -271,7 +275,7 @@ mod tests {
         // Run 1: the messenger is unreachable; two events are queued and retried in vain.
         {
             let dead = EdgeLink::new("http://127.0.0.1:9", b"0123456789abcdef".to_vec(), None);
-            let outbox = Arc::new(SqliteOutbox::open(&path).unwrap());
+            let outbox = Arc::new(SqliteOutbox::open(&path, &test_key()).unwrap());
             let p = EventPublisher::spawn_with(dead, None, Duration::from_millis(20), outbox);
             p.publish(vec![ev("e1"), ev("e2")]);
             tokio::time::sleep(Duration::from_millis(150)).await;
@@ -300,7 +304,7 @@ mod tests {
         let addr = l.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
         let link = EdgeLink::new(&format!("http://{addr}"), b"0123456789abcdef".to_vec(), None);
-        let p = EventPublisher::spawn_with(link, None, Duration::from_millis(20), Arc::new(SqliteOutbox::open(&path).unwrap()));
+        let p = EventPublisher::spawn_with(link, None, Duration::from_millis(20), Arc::new(SqliteOutbox::open(&path, &test_key()).unwrap()));
         p.publish(vec![]); // wakes the worker; the old rows are already in the file
         for _ in 0..100 {
             if p.pending() == 0 {

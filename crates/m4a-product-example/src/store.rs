@@ -1,7 +1,12 @@
 //! SQLite implementation of the kit's [`UserStore`]: the example product's own database.
+//! This is part of what a real product throws away (it has its own user database); it is
+//! the reference for how a store behaves: encrypted file, one connection behind a mutex,
+//! every trait method takes the lock for one statement and releases it before returning,
+//! so no async request ever holds it across a call to the edge.
 
 use std::sync::Mutex;
 
+use m4a_product_kit::dbkey::{open_cipher, DbKey};
 use m4a_product_kit::model::{StoreError, StoreResult, User, UserStore};
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -53,9 +58,11 @@ impl SqliteStore {
         conn.execute_batch(SCHEMA)?;
         Ok(Self { conn: Mutex::new(conn) })
     }
-    pub fn open_path(path: &str) -> rusqlite::Result<Self> {
-        Self::open(Connection::open(path)?)
+    /// The product database: SQLCipher, key per connection, WAL, busy timeout (see `m4a_product_kit::dbkey`).
+    pub fn open_path(path: &str, key: &DbKey) -> rusqlite::Result<Self> {
+        Self::open(open_cipher(path, key)?)
     }
+    /// Plaintext in-memory database, for tests only.
     pub fn memory() -> rusqlite::Result<Self> {
         Self::open(Connection::open_in_memory()?)
     }
@@ -141,5 +148,28 @@ impl UserStore for SqliteStore {
     }
     fn link_door(&self, user_id: i64, source: &str, subject: &str) -> StoreResult<()> {
         self.c().execute("INSERT INTO door_links (source, subject, user_id) VALUES (?1, ?2, ?3)", params![source, subject, user_id]).map_err(be).map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_product_database_is_encrypted_and_keeps_its_users() {
+        let key = DbKey::from_hex("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff").unwrap();
+        let other = DbKey::from_hex("ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100").unwrap();
+        let path = format!("/tmp/m4a-example-store-{}.db", std::process::id());
+        {
+            let s = SqliteStore::open_path(&path, &key).unwrap();
+            s.insert_user("zoe_nick", "free", Some("hash"), 1).unwrap();
+        }
+        assert_eq!(SqliteStore::open_path(&path, &key).unwrap().user_by_nick("zoe_nick").unwrap().unwrap().nick, "zoe_nick");
+        assert!(SqliteStore::open_path(&path, &other).is_err());
+        let raw = std::fs::read(&path).unwrap();
+        assert!(!raw.starts_with(b"SQLite format 3") && !raw.windows(8).any(|w| w == b"zoe_nick"));
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{path}{ext}"));
+        }
     }
 }
