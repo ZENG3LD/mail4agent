@@ -115,12 +115,20 @@ fn wait_until_accepts(addr: &str) {
     }
 }
 
+/// Unique per call inside one test process: parallel tests must never share a temp dir.
+fn uniq() -> u128 {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("clock").as_nanos();
+    nanos.wrapping_add(N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u128)
+}
+
 #[test]
 fn two_devices_exchange_one_private_room_message() {
     let temp = TempDb {
         dir: PathBuf::from(format!(
-            "/tmp/mail4agent-two-devices-{}",
-            std::process::id()
+            "/tmp/mail4agent-two-devices-{}-{}",
+            std::process::id(),
+            uniq()
         )),
     };
     std::fs::create_dir_all(&temp.dir).expect("tmpdir");
@@ -254,10 +262,7 @@ fn encrypted_event_is_pushed_to_session_b_and_not_session_a() {
         dir: PathBuf::from(format!(
             "/tmp/mail4agent-push-encrypted-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_millis()
+            uniq()
         )),
     };
     std::fs::create_dir_all(&temp.dir).expect("tmpdir");

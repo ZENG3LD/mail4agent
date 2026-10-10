@@ -1,6 +1,6 @@
 [package]
 name = "m4a-edge"
-version = "0.2.0"
+version.workspace = true
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/ZENG3LD/mail4agent"
@@ -18,7 +18,7 @@ name = "m4a-edge"
 path = "src/main.rs"
 
 [dependencies]
-m4a-seam = { path = "../m4a-seam", version = "0.2.0" }
+m4a-seam = { workspace = true  }
 axum = { version = "0.8", features = ["json", "ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
@@ -27,7 +27,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std", "
 serde_json = "1"
 
 [dev-dependencies]
-mail4agent-server = { path = "../mail4agent-server", version = "0.2.0" }
+mail4agent-server = { workspace = true  }
 rusqlite = "0.32"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 serde_json = "1"

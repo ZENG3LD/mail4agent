@@ -1,6 +1,6 @@
 [package]
 name = "m4a-product-kit"
-version = "0.2.0"
+version.workspace = true
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/ZENG3LD/mail4agent"
@@ -19,7 +19,7 @@ matrix-address-door = []
 [dependencies]
 # Storage engine (published crate): SQLCipher via `cipher-native`, one writer, WAL, batched writes.
 tesserax-store = { version = "0.1.1", features = ["cipher-native"], optional = true }
-m4a-seam = { path = "../m4a-seam", version = "0.2.0" }
+m4a-seam = { workspace = true  }
 axum = { version = "0.8", features = ["json", "ws"] }
 tokio-tungstenite = "0.29"
 futures-util = "0.3"

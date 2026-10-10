@@ -1,6 +1,6 @@
 [package]
 name = "mail4agent-attest"
-version = "0.1.2"
+version.workspace = true
 edition = "2021"
 description = "Attests which OS process is on the other end of a loopback TCP connection: (pid, start-time) resolved from the kernel at call time, never a value the caller can claim."
 license = "MIT"

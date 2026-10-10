@@ -1,6 +1,6 @@
 [package]
 name = "mail4agent-messenger"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/ZENG3LD/mail4agent"
@@ -14,7 +14,7 @@ name = "mail4agent_messenger"
 path = "src/lib.rs"
 
 [dependencies]
-mail4agent-vodozemac = { path = "../mail4agent-vodozemac", version = "0.1.0" }
+mail4agent-vodozemac = { workspace = true  }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2"

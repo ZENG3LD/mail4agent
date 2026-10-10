@@ -482,7 +482,7 @@ mod tests {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock")
-                .as_millis()
+                .as_nanos()
         ));
         std::fs::create_dir_all(&dir).expect("dir");
         let path = dir.join("leader.sock");

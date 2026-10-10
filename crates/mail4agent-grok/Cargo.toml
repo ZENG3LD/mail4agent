@@ -1,6 +1,6 @@
 [package]
 name = "mail4agent-grok"
-version = "0.1.3"
+version.workspace = true
 edition = "2021"
 description = "Model-less courier from a mail4agent doorbell into a Grok session, over the leader pipe or one webhook POST."
 license = "MIT"
@@ -14,8 +14,7 @@ name = "mail4agent-grok"
 path = "src/main.rs"
 
 [dependencies]
-mail4agent-api = { path = "../mail4agent-api", version = "0.1.2" }
-
+mail4agent-api = { workspace = true  }
 axum = { version = "0.8", features = ["json"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net", "io-util"] }
 reqwest = { version = "0.12", features = ["json"] }
