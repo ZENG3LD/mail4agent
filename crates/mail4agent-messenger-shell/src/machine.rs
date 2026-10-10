@@ -2669,7 +2669,7 @@ mod tests {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock")
-                .as_millis()
+                .as_nanos()
         ));
         std::fs::create_dir_all(&dir).expect("dir");
         std::fs::write(
@@ -2712,7 +2712,7 @@ mod tests {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock")
-                .as_millis()
+                .as_nanos()
         ));
         std::fs::create_dir_all(&dir).expect("dir");
         let record = dir.join("alice.json");
@@ -3226,7 +3226,7 @@ mod tests {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock")
-                .as_millis()
+                .as_nanos()
         ));
         let alice = dir.join("agent-alice");
         let chief = dir.join("agent-chief");

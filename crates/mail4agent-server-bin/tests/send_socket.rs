@@ -121,12 +121,16 @@ fn routine_mock() -> (String, mpsc::Receiver<Vec<u8>>) {
     (format!("http://{addr}/routine"), rx)
 }
 
+/// Unique per call inside one test process: parallel tests must never share a temp dir.
+fn uniq() -> u128 {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("clock").as_nanos();
+    nanos.wrapping_add(N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u128)
+}
+
 #[test]
 fn send_socket_dm_wakes_the_recipient_with_a_reply_hint() {
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock")
-        .as_millis();
+    let stamp = uniq();
     let temp = TempDb {
         dir: PathBuf::from(format!(
             "/tmp/mail4agent-send-{}-{stamp}",
