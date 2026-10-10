@@ -281,13 +281,17 @@ fn map_status(status: u16, what: &str) -> MatrixError {
 pub(crate) async fn federated_join(state: &Arc<Homeserver>, caller: &super::Caller, room_id: &str) -> Result<Vec<i64>, MatrixError> {
     let dest = room_id.split_once(':').map(|(_, d)| d.to_string()).ok_or_else(|| MatrixError::invalid_param("room id"))?;
     let local = crate::store::matrix_server_name().to_string();
-    let (status, tmpl) = fed_request(state, &dest, "GET", &format!("/federation/v1/make_join/{}/{}", enc(room_id), enc(&caller.mxid)), None).await?;
+    let (status, tmpl) = fed_request(state, &dest, "GET", &format!("/federation/v1/make_join/{}/{}{}", enc(room_id), enc(&caller.mxid), if cfg!(feature = "f3-hash-ids") { "?ver=11" } else { "" }), None).await?;
     if status != 200 {
         return Err(map_status(status, "make_join"));
     }
     #[cfg(feature = "f3-hash-ids")]
     if tmpl.get("m4a_f3").and_then(Value::as_bool) == Some(true) {
         return federated_join_f3(state, caller, room_id, &dest, &tmpl).await;
+    }
+    #[cfg(feature = "f3-hash-ids")]
+    if tmpl.get("room_version").and_then(Value::as_str).is_some() && tmpl.pointer("/event/prev_events").is_some() && tmpl.get("m4a_f3").is_none() {
+        return federated_join_spec(state, caller, room_id, &dest, &tmpl).await;
     }
     let mut ev = tmpl.get("event").and_then(Value::as_object).cloned().ok_or_else(|| MatrixError::unknown("make_join: no event"))?;
     let uid = caller.user_id;
@@ -378,6 +382,76 @@ async fn federated_join_f3(state: &Arc<Homeserver>, caller: &super::Caller, room
                 }
             }
             other => tracing::warn!("backfill after join: {:?}", other.map(|x| x.0)),
+        }
+    }
+    Ok(ids)
+}
+
+/// Join a room of a spec-following server (Synapse and kin): their make_join template is filled in
+/// and signed here, their send_join answer (state before the join, plus auth chain) is verified in
+/// full, and the replica starts from that state plus our own join. Room version 11 only.
+#[cfg(feature = "f3-hash-ids")]
+async fn federated_join_spec(state: &Arc<Homeserver>, caller: &super::Caller, room_id: &str, dest: &str, tmpl: &Value) -> Result<Vec<i64>, MatrixError> {
+    if tmpl.get("room_version").and_then(Value::as_str) != Some("11") {
+        return Err(MatrixError::new(400, "M_INCOMPATIBLE_ROOM_VERSION", "only room version 11 can be joined over federation"));
+    }
+    let t = tmpl.get("event").cloned().unwrap_or_default();
+    if t.get("sender").and_then(Value::as_str) != Some(caller.mxid.as_str()) || t.get("room_id").and_then(Value::as_str) != Some(room_id) {
+        return Err(MatrixError::unknown("make_join: template does not match the request"));
+    }
+    let uid = caller.user_id;
+    let label = with_conn_pub(state, move |c| crate::nick::effective_label(c, uid).map_err(internal)).await?;
+    let mut content = t.get("content").cloned().unwrap_or_else(|| json!({}));
+    content["membership"] = json!("join");
+    if !label.is_empty() {
+        content["displayname"] = json!(label);
+    }
+    let mut ev = json!({ "content": content, "origin_server_ts": fed::now_ms() });
+    for k in ["room_id", "sender", "type", "state_key", "prev_events", "auth_events", "depth"] {
+        if let Some(v) = t.get(k) {
+            ev[k] = v.clone();
+        }
+    }
+    let (event_id, pdu) = with_conn_pub(state, move |c| crate::f3::sign_own(c, &ev, fed::now_ms())).await?;
+    let (status, resp) = fed_request(state, dest, "PUT", &format!("/federation/v2/send_join/{}/{}", enc(room_id), enc(&event_id)), Some(pdu.clone())).await?;
+    if status != 200 {
+        return Err(map_status(status, "send_join"));
+    }
+    let list = |k: &str| resp.get(k).and_then(Value::as_array).cloned().unwrap_or_default();
+    let st = list("state");
+    if resp.get("members_omitted").and_then(Value::as_bool) == Some(true) {
+        return Err(MatrixError::unknown("send_join: partial state is not supported"));
+    }
+    let find = |ty: &str| st.iter().find(|e| e.get("type").and_then(Value::as_str) == Some(ty) && e.get("state_key").and_then(Value::as_str) == Some("")).cloned();
+    let content_of = |ty: &str, k: &str| find(ty).and_then(|e| e.pointer(&format!("/content/{k}")).and_then(Value::as_str).map(str::to_string));
+    let info = json!({
+        "kind": "group",
+        "is_encrypted": find("m.room.encryption").is_some(),
+        "join_rule": content_of("m.room.join_rules", "join_rule").unwrap_or_else(|| "invite".into()),
+        "history_visibility": content_of("m.room.history_visibility", "history_visibility").unwrap_or_else(|| "shared".into()),
+        "room_version": "11",
+        "creator": find("m.room.create").and_then(|e| e.get("sender").and_then(Value::as_str).map(str::to_string)).unwrap_or_default(),
+    });
+    let mut state_v = st.clone();
+    state_v.push(pdu.clone());
+    let snap = json!({ "state": state_v, "extremities": [pdu], "auth_chain": list("auth_chain") });
+    let all = crate::f3::snapshot_events(&snap);
+    let keys = f3_keys(state, &all).await?;
+    let room = room_id.to_string();
+    let shared = matches!(info["history_visibility"].as_str(), Some("shared") | Some("world_readable"));
+    let ids = with_conn_pub(state, move |c| {
+        crate::f3::import_snapshot(c, &room, &info, &snap, &keys, &now_rfc3339())?;
+        let ids = crate::rooms::member_and_invited_ids(c, &room).map_err(internal)?;
+        Ok(ids.into_iter().collect::<Vec<_>>())
+    })
+    .await?;
+    if shared {
+        let q = format!("/federation/v1/backfill/{}?v={}&limit=100", enc(room_id), enc(&event_id));
+        if let Ok((200, resp)) = fed_request(state, dest, "GET", &q, None).await {
+            let events = resp.get("pdus").and_then(Value::as_array).cloned().unwrap_or_default();
+            if let Err(e) = f3_store_history(state, room_id, events).await {
+                tracing::warn!("backfill after join: {}", e.error);
+            }
         }
     }
     Ok(ids)

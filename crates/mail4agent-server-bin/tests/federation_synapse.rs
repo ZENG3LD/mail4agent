@@ -76,11 +76,39 @@ fn wait_http(url: &str) {
     poll(url, || c.get(url).send().ok().filter(|r| r.status().is_success()).map(|_| ()));
 }
 
-#[test]
-fn synapse_verifies_our_keys_and_events_and_a_synapse_user_joins_a_public_dag_room() {
+struct Env {
+    _procs: Procs,
+    dir: PathBuf,
+    ours: support_fed::Srv,
+    plain: Client,
+    any_cert: Client,
+    syn_port: u16,
+    tls_port: u16,
+    syn_name: String,
+    our_name: &'static str,
+    tok: String,
+}
+
+impl Env {
+    fn syn(&self, m: &str, p: &str, b: Option<Value>) -> (u16, Value) {
+        let url = format!("http://127.0.0.1:{}/_matrix/client/v3{p}", self.syn_port);
+        let mut r = match m { "GET" => self.plain.get(url), "PUT" => self.plain.put(url), _ => self.plain.post(url) }.bearer_auth(&self.tok);
+        if let Some(b) = b {
+            r = r.json(&b);
+        }
+        let resp = r.send().unwrap();
+        (resp.status().as_u16(), resp.json().unwrap_or(Value::Null))
+    }
+    fn log_tail(&self) -> String {
+        std::fs::read_to_string(self.dir.join("syn.log")).unwrap_or_default().lines().rev().take(15).collect::<Vec<_>>().join("\n")
+    }
+}
+
+/// Synapse plus our server, wired together on localhost; `None` when Synapse is not available.
+fn setup() -> Option<Env> {
     let Ok(py) = std::env::var("M4A_SYNAPSE_PYTHON") else {
         eprintln!("skipped: M4A_SYNAPSE_PYTHON is not set");
-        return;
+        return None;
     };
     let dir = PathBuf::from(format!("/tmp/m4a-synapse-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -115,50 +143,87 @@ fn synapse_verifies_our_keys_and_events_and_a_synapse_user_joins_a_public_dag_ro
     let ours = start_node(our_name, "alice", bind_port, &[(&syn_name, syn_port)]);
     wait_http(&format!("https://127.0.0.1:{tls_port}/_matrix/key/v2/server"));
 
+
     let any_cert = Client::builder().danger_accept_invalid_certs(true).timeout(Duration::from_secs(10)).build().unwrap();
     let plain = Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
+    let login: Value = plain.post(format!("http://127.0.0.1:{syn_port}/_matrix/client/v3/login")).json(&json!({"type":"m.login.password","identifier":{"type":"m.id.user","user":"syn"},"password":"pw-interop-1"})).send().unwrap().json().unwrap();
+    let tok = login["access_token"].as_str().unwrap().to_string();
+    Some(Env { _procs: procs, dir, ours, plain, any_cert, syn_port, tls_port, syn_name, our_name, tok })
+}
 
+#[test]
+fn synapse_verifies_our_keys_and_events_and_a_synapse_user_joins_a_public_dag_room() {
+    let Some(env) = setup() else { return };
+    let Env { ours, plain, any_cert, syn_port, tls_port, syn_name, our_name, .. } = &env;
+    let (syn_port, tls_port, our_name) = (*syn_port, *tls_port, *our_name);
     // Key discovery in both directions.
     let our_keys: Value = any_cert.get(format!("https://127.0.0.1:{tls_port}/_matrix/key/v2/server")).send().unwrap().json().unwrap();
     assert_eq!(our_keys["server_name"], our_name);
     assert!(our_keys["verify_keys"].as_object().is_some_and(|k| !k.is_empty()) && our_keys["signatures"][our_name].is_object());
     let syn_keys: Value = plain.get(format!("http://127.0.0.1:{syn_port}/_matrix/key/v2/server")).send().unwrap().json().unwrap();
-    assert_eq!(syn_keys["server_name"], syn_name);
+    assert_eq!(syn_keys["server_name"], syn_name.as_str());
 
     // Our public DAG room, and Synapse's user in it.
-    let (st, v) = ours.call(&plain, "POST", "/client/v3/createRoom", Some(json!({"visibility":"private","name":"open house"})));
+    let (st, v) = ours.call(plain, "POST", "/client/v3/createRoom", Some(json!({"visibility":"private","name":"open house"})));
     assert_eq!(st, 200, "{v}");
     let room = v["room_id"].as_str().unwrap().to_string();
-    let (st, v) = ours.call(&plain, "PUT", &format!("/client/v3/rooms/{}/state/m.room.join_rules", enc(&room)), Some(json!({"join_rule":"public"})));
+    let (st, v) = ours.call(plain, "PUT", &format!("/client/v3/rooms/{}/state/m.room.join_rules", enc(&room)), Some(json!({"join_rule":"public"})));
     assert_eq!(st, 200, "join rules: {v}");
-    let login: Value = plain.post(format!("http://127.0.0.1:{syn_port}/_matrix/client/v3/login")).json(&json!({"type":"m.login.password","identifier":{"type":"m.id.user","user":"syn"},"password":"pw-interop-1"})).send().unwrap().json().unwrap();
-    let tok = login["access_token"].as_str().unwrap().to_string();
-    let syn = |m: &str, p: &str, b: Option<Value>| -> (u16, Value) {
-        let url = format!("http://127.0.0.1:{syn_port}/_matrix/client/v3{p}");
-        let mut r = match m { "GET" => plain.get(url), "PUT" => plain.put(url), _ => plain.post(url) }.bearer_auth(&tok);
-        if let Some(b) = b { r = r.json(&b); }
-        let resp = r.send().unwrap();
-        (resp.status().as_u16(), resp.json().unwrap_or(Value::Null))
-    };
-    let (st, v) = syn("POST", &format!("/join/{}?server_name={}", enc(&room), enc(our_name)), Some(json!({})));
-    assert_eq!(st, 200, "synapse joins our room: {v}\n{}", std::fs::read_to_string(d("syn.log")).unwrap_or_default().lines().rev().take(15).collect::<Vec<_>>().join("\n"));
+    let (st, v) = env.syn("POST", &format!("/join/{}?server_name={}", enc(&room), enc(our_name)), Some(json!({})));
+    assert_eq!(st, 200, "synapse joins our room: {v}\n{}", env.log_tail());
 
     // Our events reach Synapse and pass its signature and hash checks, under our ids.
-    let (st, v) = ours.call(&plain, "PUT", &format!("/client/v3/rooms/{}/send/m.room.encrypted/t1", enc(&room)), Some(json!({"algorithm":"m.megolm.v1.aes-sha2","sender_key":"k","session_id":"s","device_id":"D","ciphertext":"hello-from-us"})));
+    let (st, v) = ours.call(plain, "PUT", &format!("/client/v3/rooms/{}/send/m.room.encrypted/t1", enc(&room)), Some(json!({"algorithm":"m.megolm.v1.aes-sha2","sender_key":"k","session_id":"s","device_id":"D","ciphertext":"hello-from-us"})));
     assert_eq!(st, 200, "send: {v}");
     let ours_id = v["event_id"].as_str().unwrap().to_string();
     assert!(ours_id.starts_with('$') && ours_id.len() == 44, "reference-hash id: {ours_id}");
     poll("synapse has our message", || {
-        let (_, m) = syn("GET", &format!("/rooms/{}/messages?dir=b&limit=20", enc(&room)), None);
+        let (_, m) = env.syn("GET", &format!("/rooms/{}/messages?dir=b&limit=20", enc(&room)), None);
         m["chunk"].as_array()?.iter().find(|e| e["event_id"] == ours_id.as_str() && e["content"]["ciphertext"] == "hello-from-us").map(|_| ())
     });
 
     // And Synapse's events reach us.
-    let (st, v) = syn("PUT", &format!("/rooms/{}/send/m.room.encrypted/s1", enc(&room)), Some(json!({"algorithm":"m.megolm.v1.aes-sha2","sender_key":"k2","session_id":"s2","device_id":"E","ciphertext":"hello-from-synapse"})));
+    let (st, v) = env.syn("PUT", &format!("/rooms/{}/send/m.room.encrypted/s1", enc(&room)), Some(json!({"algorithm":"m.megolm.v1.aes-sha2","sender_key":"k2","session_id":"s2","device_id":"E","ciphertext":"hello-from-synapse"})));
     assert_eq!(st, 200, "synapse send: {v}");
     let syn_id = v["event_id"].as_str().unwrap().to_string();
     poll("we have synapse's message", || {
-        let (_, m) = ours.call(&plain, "GET", &format!("/client/v3/rooms/{}/messages?dir=b&limit=20", enc(&room)), None);
+        let (_, m) = ours.call(plain, "GET", &format!("/client/v3/rooms/{}/messages?dir=b&limit=20", enc(&room)), None);
         m["chunk"].as_array()?.iter().find(|e| e["event_id"] == syn_id.as_str()).map(|_| ())
+    });
+}
+
+/// Our user joins a public room that lives on Synapse (room version 11), over federation: their
+/// make_join template, our signature, their send_join answer verified in full, then messages both ways.
+#[test]
+fn our_user_joins_a_public_room_on_synapse_and_talks() {
+    let Some(env) = setup() else { return };
+    let (ours, plain) = (&env.ours, &env.plain);
+    let (st, v) = env.syn("POST", "/createRoom", Some(json!({"preset":"public_chat","name":"synapse side","room_version":"11"})));
+    assert_eq!(st, 200, "{v}");
+    let room = v["room_id"].as_str().unwrap().to_string();
+    let (st, _) = env.syn("PUT", &format!("/rooms/{}/send/m.room.message/old1", enc(&room)), Some(json!({"msgtype":"m.text","body":"before you came"})));
+    assert_eq!(st, 200);
+
+    let (st, v) = ours.call(plain, "POST", &format!("/client/v3/join/{}", enc(&room)), Some(json!({})));
+    assert_eq!(st, 200, "we join: {v}\n{}", env.log_tail());
+    let (_, members) = env.syn("GET", &format!("/rooms/{}/joined_members", enc(&room)), None);
+    assert!(members["joined"].get(&ours.user).is_some(), "synapse lists our user as joined: {members}");
+
+    // Both ways, under the hash ids.
+    let (st, v) = ours.call(plain, "PUT", &format!("/client/v3/rooms/{}/send/m.room.message/o1", enc(&room)), Some(json!({"msgtype":"m.text","body":"from us"})));
+    assert_eq!(st, 200, "send: {v}");
+    let our_id = v["event_id"].as_str().unwrap().to_string();
+    poll("synapse has our message", || {
+        let (_, m) = env.syn("GET", &format!("/rooms/{}/messages?dir=b&limit=20", enc(&room)), None);
+        m["chunk"].as_array()?.iter().find(|e| e["event_id"] == our_id.as_str() && e["content"]["body"] == "from us").map(|_| ())
+    });
+    let (st, v) = env.syn("PUT", &format!("/rooms/{}/send/m.room.message/s1", enc(&room)), Some(json!({"msgtype":"m.text","body":"from synapse"})));
+    assert_eq!(st, 200, "{v}");
+    let syn_id = v["event_id"].as_str().unwrap().to_string();
+    poll("we have synapse's message and the earlier history", || {
+        let (_, m) = ours.call(plain, "GET", &format!("/client/v3/rooms/{}/messages?dir=b&limit=50", enc(&room)), None);
+        let chunk = m["chunk"].as_array()?;
+        let has = |id: &str| chunk.iter().any(|e| e["event_id"] == id);
+        (has(&syn_id) && chunk.iter().any(|e| e["content"]["body"] == "before you came")).then_some(())
     });
 }

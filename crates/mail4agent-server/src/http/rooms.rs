@@ -26,6 +26,7 @@ pub(super) fn routes() -> Router<Arc<Homeserver>> {
         .route("/client/v3/createRoom", post(create_room))
         .route("/client/v3/joined_rooms", get(joined_rooms))
         .route("/client/v3/rooms/{room_id}/join", post(join_room))
+        .route("/client/v3/join/{room_id}", post(join_room))
         .route("/client/v3/rooms/{room_id}/leave", post(leave_room))
         .route("/client/v3/rooms/{room_id}/invite", post(invite_member))
         .route("/client/v3/rooms/{room_id}/kick", post(kick_member))

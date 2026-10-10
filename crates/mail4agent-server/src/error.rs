@@ -25,7 +25,7 @@ pub struct MatrixError {
 }
 
 impl MatrixError {
-    fn new(status: u16, errcode: &'static str, error: impl Into<String>) -> Self {
+    pub(crate) fn new(status: u16, errcode: &'static str, error: impl Into<String>) -> Self {
         Self {
             status,
             errcode,
