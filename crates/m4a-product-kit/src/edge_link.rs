@@ -23,6 +23,8 @@ pub struct EdgeLink {
     pub base: String,
     pub secret: Vec<u8>,
     pub assertion_header: String,
+    /// Barrier token for the link (`M4A_LINK_TOKEN`), sent in `x-m4a-link-token`.
+    pub link_token: Option<String>,
     client: reqwest::Client,
 }
 
@@ -32,8 +34,15 @@ impl EdgeLink {
             base: base.trim_end_matches('/').to_string(),
             secret,
             assertion_header: assertion_header.unwrap_or_else(|| m4a_seam::DEFAULT_ASSERTION_HEADER.into()).to_ascii_lowercase(),
+            link_token: None,
             client: reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().expect("client"),
         }
+    }
+
+    /// Present `token` on every request of this link.
+    pub fn with_link_token(mut self, token: Option<String>) -> Self {
+        self.link_token = token.filter(|t| !t.is_empty());
+        self
     }
 
     /// Assertion value for one request (`path` as the core sees it).
@@ -57,6 +66,9 @@ impl EdgeLink {
         let mut rb = self.client.request(parts.method.clone(), format!("{}{}", self.base, pq));
         for (k, v) in forwardable(&parts.headers, &self.assertion_header) {
             rb = rb.header(k, v);
+        }
+        if let Some(t) = &self.link_token {
+            rb = rb.header(m4a_seam::LINK_TOKEN_HEADER, t);
         }
         if let Some(w) = who {
             rb = rb.header(self.assertion_header.as_str(), self.assertion_for(w, parts.method.as_str(), &core_path));
@@ -86,6 +98,9 @@ impl EdgeLink {
         for (k, v) in headers {
             rb = rb.header(*k, v);
         }
+        if let Some(t) = &self.link_token {
+            rb = rb.header(m4a_seam::LINK_TOKEN_HEADER, t);
+        }
         rb.body(body).send().await.map(|r| r.status().as_u16()).map_err(|e| e.to_string())
     }
 }
@@ -98,7 +113,7 @@ fn forwardable(h: &HeaderMap, assertion_header: &str) -> Vec<(HeaderName, Header
     h.iter()
         .filter(|(k, _)| {
             let k = k.as_str();
-            !matches!(k, "host" | "content-length" | "connection" | "transfer-encoding" | "upgrade" | "authorization" | "x-m4a-resolved" | "keep-alive") && k != assertion_header
+            !matches!(k, "host" | "content-length" | "connection" | "transfer-encoding" | "upgrade" | "authorization" | "x-m4a-resolved" | "keep-alive" | m4a_seam::LINK_TOKEN_HEADER) && k != assertion_header
         })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()

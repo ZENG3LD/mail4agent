@@ -3,6 +3,9 @@
 //! carries room, sender nick, recipient nick, event id, body, and the reply
 //! command. Loopback only. No bearer is printed.
 
+#[path = "support_product.rs"]
+mod support_product;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -148,9 +151,7 @@ fn send_socket_dm_wakes_the_recipient_with_a_reply_hint() {
             "localhost",
         ])
         .env("M4A_DB_KEY_HEX", &key_hex)
-        .env_remove("M4A_BOOTSTRAP_PUBLIC_ID")
-        .env_remove("M4A_BOOTSTRAP_NICK")
-        .env_remove("M4A_BOOTSTRAP_TOKEN")
+        .env("M4A_ASSERTION_SECRET", support_product::SEAM_SECRET)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -160,9 +161,13 @@ fn send_socket_dm_wakes_the_recipient_with_a_reply_hint() {
 
     let (routine_url, routine_rx) = routine_mock();
     let root = temp.dir.join("stores");
+    let product = support_product::start_product(&base);
+    let base = product.url.clone();
+    let alice_token = support_product::product_user(&product, "alice");
     let sessions = vec![
-        HostSession::new("Alice", "web-alice"),
+        HostSession::new("Alice", "web-alice").with_product("alice", alice_token.clone()),
         HostSession::new("Привет мир", "web-chief")
+            .with_product("privet-mir", support_product::product_user(&product, "privet-mir"))
             .with_routine(routine_url, Some("test-routine-key".to_string())),
     ];
     let mut client = MachineClient::open(&base, &root, sessions).expect("client opens");
@@ -170,7 +175,7 @@ fn send_socket_dm_wakes_the_recipient_with_a_reply_hint() {
     assert!(MachineClient::open(
         &base,
         &root,
-        vec![HostSession::new("Alice", "web-alice")]
+        vec![HostSession::new("Alice", "web-alice").with_product("alice", alice_token.clone())]
     )
     .is_err());
     let sock = temp.dir.join("web-client.sock");

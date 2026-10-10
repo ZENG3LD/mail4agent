@@ -204,11 +204,16 @@ pub fn search_nicks(
         .replace('_', "\\_");
     let pattern = format!("%{escaped}%");
     let mut stmt = conn.prepare(
-        "SELECT u.mxid, s.nick
-         FROM messenger_sessions s
-         JOIN matrix_users u ON u.user_id = s.user_id
-         WHERE s.nick != '' AND LOWER(s.nick) LIKE LOWER(?1) ESCAPE '\\'
-         ORDER BY LOWER(s.nick)
+        "SELECT mxid, nick FROM (
+             SELECT u.mxid AS mxid, s.nick AS nick
+             FROM messenger_sessions s JOIN matrix_users u ON u.user_id = s.user_id
+             WHERE s.nick != ''
+             UNION
+             SELECT u.mxid, i.nick
+             FROM identities i JOIN matrix_users u ON u.user_id = i.id
+         )
+         WHERE LOWER(nick) LIKE LOWER(?1) ESCAPE '\\'
+         ORDER BY LOWER(nick)
          LIMIT ?2",
     )?;
     let rows = stmt.query_map(params![pattern, (limit as i64) + 1], |row| {

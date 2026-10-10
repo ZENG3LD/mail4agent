@@ -504,7 +504,7 @@ impl GrokListener {
         if tokens.is_empty() {
             return Ok(());
         }
-        self.push = Some(PushLink::open(&self.homeserver_url, tokens)?);
+        self.push = Some(PushLink::open(&self.homeserver_url, tokens, false)?);
         Ok(())
     }
 }

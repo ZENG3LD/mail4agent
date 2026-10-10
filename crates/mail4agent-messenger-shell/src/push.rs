@@ -40,52 +40,54 @@ struct Incoming {
 pub(crate) struct PushLink {
     inbox: Arc<Mutex<Vec<Incoming>>>,
     stop: Arc<AtomicBool>,
-    worker: Option<JoinHandle<()>>,
+    workers: Vec<JoinHandle<()>>,
 }
 
 impl Drop for PushLink {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        if let Some(worker) = self.worker.take() {
+        for worker in self.workers.drain(..) {
             let _ = worker.join();
         }
     }
 }
 
 impl PushLink {
-    pub(crate) fn open(base_url: &str, tokens: Vec<String>) -> Result<Self, ShellError> {
+    /// One socket for all `tokens`, or with `separate` (product mode: a handshake
+    /// is vouched for one identity) one socket per token sharing one inbox.
+    pub(crate) fn open(base_url: &str, tokens: Vec<String>, separate: bool) -> Result<Self, ShellError> {
         if tokens.is_empty() {
             return Err(ShellError::Http("push socket has no session".into()));
         }
         let url = push_ws_url(base_url)?;
         let inbox = Arc::new(Mutex::new(Vec::new()));
-        let ready = Arc::new(AtomicBool::new(false));
-        let failed = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
-        let worker = thread::spawn({
-            let inbox = Arc::clone(&inbox);
-            let ready = Arc::clone(&ready);
-            let failed = Arc::clone(&failed);
-            let stop = Arc::clone(&stop);
-            move || worker_main(url, tokens, inbox, ready, failed, stop)
-        });
+        let groups: Vec<Vec<String>> = if separate { tokens.into_iter().map(|t| vec![t]).collect() } else { vec![tokens] };
+        let mut link = Self { inbox: Arc::clone(&inbox), stop: Arc::clone(&stop), workers: Vec::new() };
+        let mut readies = Vec::new();
+        let mut faileds = Vec::new();
+        for group in groups {
+            let ready = Arc::new(AtomicBool::new(false));
+            let failed = Arc::new(Mutex::new(None));
+            let worker = thread::spawn({
+                let (url, inbox, ready, failed, stop) = (url.clone(), Arc::clone(&inbox), Arc::clone(&ready), Arc::clone(&failed), Arc::clone(&stop));
+                move || worker_main(url, group, inbox, ready, failed, stop)
+            });
+            link.workers.push(worker);
+            readies.push(ready);
+            faileds.push(failed);
+        }
         let start = Instant::now();
         loop {
-            if ready.load(Ordering::Acquire) {
-                return Ok(Self {
-                    inbox,
-                    stop,
-                    worker: Some(worker),
-                });
+            if readies.iter().all(|r| r.load(Ordering::Acquire)) {
+                return Ok(link);
             }
-            if let Some(err) = failed.lock().unwrap_or_else(|err| err.into_inner()).clone() {
-                stop.store(true, Ordering::Release);
-                let _ = worker.join();
-                return Err(ShellError::Http(err));
+            for failed in &faileds {
+                if let Some(err) = failed.lock().unwrap_or_else(|err| err.into_inner()).clone() {
+                    return Err(ShellError::Http(err)); // Drop stops and joins the workers
+                }
             }
             if start.elapsed() > Duration::from_secs(5) {
-                stop.store(true, Ordering::Release);
-                let _ = worker.join();
                 return Err(ShellError::Http("push socket did not register".into()));
             }
             thread::sleep(Duration::from_millis(20));
@@ -148,8 +150,17 @@ fn run_socket(
     ready: &AtomicBool,
     stop: &AtomicBool,
 ) -> Result<(), String> {
+    // The first token also rides the handshake as a bearer: a product proxy
+    // authenticates the handshake with it and signs it; a plain server ignores it.
+    let mut request = tungstenite::client::IntoClientRequest::into_client_request(url)
+        .map_err(|err| clip_public(err.to_string()))?;
+    if let Some(first) = tokens.first() {
+        if let Ok(value) = tungstenite::http::HeaderValue::from_str(&format!("Bearer {first}")) {
+            request.headers_mut().insert(tungstenite::http::header::AUTHORIZATION, value);
+        }
+    }
     let (mut socket, _response) =
-        tungstenite::connect(url).map_err(|err| clip_public(err.to_string()))?;
+        tungstenite::connect(request).map_err(|err| clip_public(err.to_string()))?;
     match socket.get_mut() {
         MaybeTlsStream::Plain(tcp) => {
             let _ = tcp.set_read_timeout(Some(Duration::from_millis(200)));

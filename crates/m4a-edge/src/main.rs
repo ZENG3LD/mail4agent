@@ -2,7 +2,7 @@
 //! Caddy sits in front), forwards to the core over the private tunnel.
 //!
 //! Flags: `--bind 127.0.0.1:18741`, `--core-url http://<core-wg-ip>:8741`.
-//! Env: `M4A_EDGE_SECRET` (shared with the core, at least 32 characters), `M4A_CORE_URL`, `M4A_EDGE_BIND` (loopback only).
+//! Env: `M4A_LINK_TOKEN` (optional barrier token the product server must present), `M4A_EDGE_SECRET` (shared with the core, at least 32 characters), `M4A_CORE_URL`, `M4A_EDGE_BIND` (loopback only).
 
 use std::net::SocketAddr;
 
@@ -35,7 +35,7 @@ fn run() -> Result<(), String> {
     if !addr.ip().is_loopback() {
         return Err("the edge listens on loopback only; a TLS proxy faces the internet".into());
     }
-    let app = m4a_edge::edge_router(m4a_edge::EdgeConfig { core_url, secret });
+    let app = m4a_edge::edge_router(m4a_edge::EdgeConfig { core_url, secret, link_token: std::env::var("M4A_LINK_TOKEN").ok().filter(|t| !t.is_empty()) });
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     rt.block_on(async move {
         let l = tokio::net::TcpListener::bind(addr).await.map_err(|e| format!("bind {addr}: {e}"))?;

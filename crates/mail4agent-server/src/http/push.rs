@@ -23,10 +23,14 @@ pub(super) fn routes() -> Router<Arc<Homeserver>> {
 async fn push_socket(
     ws: WebSocketUpgrade,
     State(state): State<Arc<Homeserver>>,
+    headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
+    // A handshake vouched for by a signed assertion registers by the verified
+    // identity: no token frame is needed or read.
+    let verified = super::identity::read_resolved(&headers).map(|(uid, _, _)| uid);
     ws.max_message_size(64 * 1024)
         .max_frame_size(64 * 1024)
-        .on_upgrade(move |socket| run_push(socket, state))
+        .on_upgrade(move |socket| run_push(socket, state, verified))
 }
 
 fn parse_register(text: &str) -> Option<Vec<String>> {
@@ -87,17 +91,23 @@ impl Drop for Unsubscribe {
     }
 }
 
-async fn run_push(mut socket: WebSocket, state: Arc<Homeserver>) {
-    let text = match socket.recv().await {
-        Some(Ok(Message::Text(text))) => text.to_string(),
-        _ => return,
-    };
-    let Some(tokens) = parse_register(&text) else {
-        return;
-    };
-    drop(text);
-    let Ok(users) = resolve_users(Arc::clone(&state), tokens).await else {
-        return;
+async fn run_push(mut socket: WebSocket, state: Arc<Homeserver>, verified: Option<i64>) {
+    let users = match verified {
+        Some(uid) => vec![uid],
+        None => {
+            let text = match socket.recv().await {
+                Some(Ok(Message::Text(text))) => text.to_string(),
+                _ => return,
+            };
+            let Some(tokens) = parse_register(&text) else {
+                return;
+            };
+            drop(text);
+            let Ok(users) = resolve_users(Arc::clone(&state), tokens).await else {
+                return;
+            };
+            users
+        }
     };
     let (id, mut rx) = state.push.subscribe(users);
     let _unsub = Unsubscribe {

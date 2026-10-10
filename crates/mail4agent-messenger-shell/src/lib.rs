@@ -460,6 +460,11 @@ impl SessionConfig {
         )
     }
 
+    /// True in product-session mode.
+    pub fn is_product(&self) -> bool {
+        self.product.is_some()
+    }
+
     /// Derived nick. Not the display name.
     pub fn nick(&self) -> &str {
         &self.nick

@@ -9,6 +9,9 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[path = "support_product.rs"]
+mod support_product;
+
 use mail4agent_messenger_shell::{
     load_session_records, session_store_dir, CreateRoomKind, MachineClient, MessageKind,
     MessengerCommand, OpenedStore, OutgoingMessage, RoomId, SessionConfig,
@@ -356,9 +359,7 @@ fn one_client_local_dm_skips_homeserver_remote_session_uses_it() {
             "localhost",
         ])
         .env("M4A_DB_KEY_HEX", &key_hex)
-        .env_remove("M4A_BOOTSTRAP_PUBLIC_ID")
-        .env_remove("M4A_BOOTSTRAP_NICK")
-        .env_remove("M4A_BOOTSTRAP_TOKEN")
+        .env("M4A_ASSERTION_SECRET", support_product::SEAM_SECRET)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -381,8 +382,17 @@ fn one_client_local_dm_skips_homeserver_remote_session_uses_it() {
     )
     .expect("chief record");
 
+    let product = support_product::start_product(&base);
+    let tokens = [("alice", support_product::product_user(&product, "alice")), ("privet-mir", support_product::product_user(&product, "privet-mir"))];
+    let courier_token = support_product::product_user(&product, "courier");
+    let base = product.url.clone();
     let mut sessions = load_session_records(&sessions_dir).expect("discover");
     assert_eq!(sessions.len(), 2);
+    for session in &mut sessions {
+        let nick = if session.bot_name == "Alice" { "alice" } else { "privet-mir" };
+        session.product_nick = Some(nick.to_string());
+        session.device_token = tokens.iter().find(|t| t.0 == nick).map(|t| t.1.clone());
+    }
     let routine_bearer = "mem-only-routine-bearer";
     for session in &mut sessions {
         if session.bot_name == "Alice" {
@@ -440,7 +450,7 @@ fn one_client_local_dm_skips_homeserver_remote_session_uses_it() {
     assert!(!local_event.is_empty());
 
     let mut courier = OpenedStore::connect(
-        &SessionConfig::new(&base, "Courier", "web-courier", &root, None).expect("courier config"),
+        &SessionConfig::new_product(&base, "courier", mail4agent_messenger_shell::ProductSecret::Token(courier_token.clone().into()), "web-courier", &root).expect("courier config"),
     )
     .expect("courier is only on the homeserver");
     assert_eq!(courier.nick(), Some("courier"));
@@ -543,9 +553,7 @@ fn one_socket_pushes_session_b_and_not_session_a() {
             "localhost",
         ])
         .env("M4A_DB_KEY_HEX", &key_hex)
-        .env_remove("M4A_BOOTSTRAP_PUBLIC_ID")
-        .env_remove("M4A_BOOTSTRAP_NICK")
-        .env_remove("M4A_BOOTSTRAP_TOKEN")
+        .env("M4A_ASSERTION_SECRET", support_product::SEAM_SECRET)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -555,17 +563,20 @@ fn one_socket_pushes_session_b_and_not_session_a() {
 
     let root = temp.dir.join("stores");
     std::fs::create_dir_all(&root).expect("store root");
+    let product = support_product::start_product(&base);
+    let base = product.url.clone();
     let sessions = vec![
-        mail4agent_messenger_shell::HostSession::new("Alice", "web-alice"),
-        mail4agent_messenger_shell::HostSession::new("Привет мир", "web-chief"),
+        mail4agent_messenger_shell::HostSession::new("Alice", "web-alice").with_product("alice", support_product::product_user(&product, "alice")),
+        mail4agent_messenger_shell::HostSession::new("Привет мир", "web-chief").with_product("privet-mir", support_product::product_user(&product, "privet-mir")),
     ];
+    let courier_token = support_product::product_user(&product, "courier");
     let mut client =
         MachineClient::open(&base, &root, sessions).expect("one client opens one socket");
     assert!(client.holds("alice"));
     assert!(client.holds("privet-mir"));
 
     let mut courier = OpenedStore::connect(
-        &SessionConfig::new(&base, "Courier", "web-courier", &root, None).expect("courier config"),
+        &SessionConfig::new_product(&base, "courier", mail4agent_messenger_shell::ProductSecret::Token(courier_token.clone().into()), "web-courier", &root).expect("courier config"),
     )
     .expect("courier");
     let mut courier_now = 10_000_i64;

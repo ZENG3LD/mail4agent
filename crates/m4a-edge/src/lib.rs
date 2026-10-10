@@ -39,6 +39,9 @@ pub struct EdgeConfig {
     pub core_url: String,
     /// Shared secret (>= 32 chars).
     pub secret: String,
+    /// Barrier token for the product -> edge link (`M4A_LINK_TOKEN`). When set, every
+    /// request except the public protocol surfaces must carry it in `x-m4a-link-token`.
+    pub link_token: Option<String>,
 }
 
 struct Limiter {
@@ -72,14 +75,30 @@ struct Edge {
     limiter: Limiter,
 }
 
+/// Host used in URLs when the core is reached over a unix socket (`unix:/path`).
+const UNIX_HOST: &str = "http://m4a-core.local";
+
+impl Edge {
+    /// URL prefix for core requests.
+    fn core_base(&self) -> &str {
+        if self.cfg.core_url.starts_with("unix:") {
+            UNIX_HOST
+        } else {
+            &self.cfg.core_url
+        }
+    }
+    fn core_socket(&self) -> Option<&str> {
+        self.cfg.core_url.strip_prefix("unix:")
+    }
+}
+
 /// Builds the edge router.
 pub fn edge_router(cfg: EdgeConfig) -> Router {
-    let http = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .no_proxy()
-        .timeout(Duration::from_secs(120))
-        .build()
-        .expect("http client");
+    let mut hb = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).no_proxy().timeout(Duration::from_secs(120));
+    if let Some(path) = cfg.core_url.strip_prefix("unix:") {
+        hb = hb.unix_socket(path.to_string());
+    }
+    let http = hb.build().expect("http client");
     let state = Arc::new(Edge { cfg, http, limiter: Limiter { buckets: Mutex::new(HashMap::new()) } });
     Router::new()
         .route("/edge/healthz", get(healthz))
@@ -87,11 +106,24 @@ pub fn edge_router(cfg: EdgeConfig) -> Router {
         .route("/_matrix/client/v3/push", get(push_relay))
         .fallback(forward)
         .layer(DefaultBodyLimit::max(MAX_BODY))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), link_gate))
         .with_state(state)
 }
 
+/// Barrier token check; the header never travels past the edge.
+async fn link_gate(State(e): State<Arc<Edge>>, mut req: Request<Body>, next: axum::middleware::Next) -> Response {
+    if let Some(expected) = e.cfg.link_token.as_deref() {
+        let presented = req.headers().get(m4a_seam::LINK_TOKEN_HEADER).and_then(|v| v.to_str().ok());
+        if !m4a_seam::link_path_is_open(req.uri().path()) && !m4a_seam::link_token_ok(presented, expected) {
+            return err(StatusCode::UNAUTHORIZED, "M4A_LINK_TOKEN_REQUIRED", "link token required");
+        }
+    }
+    req.headers_mut().remove(m4a_seam::LINK_TOKEN_HEADER);
+    next.run(req).await
+}
+
 async fn healthz(State(e): State<Arc<Edge>>) -> impl IntoResponse {
-    let ok = e.http.get(format!("{}/client/versions", e.cfg.core_url)).header(EDGE_SECRET_HEADER, &e.cfg.secret).send().await.map(|r| r.status().is_success()).unwrap_or(false);
+    let ok = e.http.get(format!("{}/client/versions", e.core_base())).header(EDGE_SECRET_HEADER, &e.cfg.secret).send().await.map(|r| r.status().is_success()).unwrap_or(false);
     (if ok { StatusCode::OK } else { StatusCode::BAD_GATEWAY }, Json(json!({ "edge": true, "core": ok })))
 }
 
@@ -138,7 +170,7 @@ async fn forward(State(e): State<Arc<Edge>>, peer: Option<axum::Extension<Connec
         Ok(b) => b,
         Err(_) => return err(StatusCode::PAYLOAD_TOO_LARGE, "M_TOO_LARGE", "body too large"),
     };
-    let url = format!("{}{}", e.cfg.core_url, core_path(&parts.uri));
+    let url = format!("{}{}", e.core_base(), core_path(&parts.uri));
     let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET);
     let mut rb = e.http.request(method, url);
     for (name, value) in &parts.headers {
@@ -175,20 +207,46 @@ async fn forward(State(e): State<Arc<Edge>>, peer: Option<axum::Extension<Connec
     r
 }
 
-async fn push_relay(State(e): State<Arc<Edge>>, ws: WebSocketUpgrade) -> Response {
-    ws.max_message_size(64 * 1024).on_upgrade(move |sock| relay(sock, e))
+async fn push_relay(State(e): State<Arc<Edge>>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
+    ws.max_message_size(64 * 1024).on_upgrade(move |sock| relay(sock, e, headers))
 }
 
-async fn relay(client: WebSocket, e: Arc<Edge>) {
-    let url = format!("{}/client/v3/push", e.cfg.core_url.replacen("http", "ws", 1));
+/// Handshake headers that may cross to the core: everything but hop-by-hop,
+/// websocket negotiation, the edge secret (set by the edge itself) and the
+/// internal hand-over header (never trusted from a client).
+fn handshake_passes(name: &str) -> bool {
+    !(HOP.contains(&name) || name.starts_with("sec-websocket-") || name == EDGE_SECRET_HEADER || name == m4a_seam::LINK_TOKEN_HEADER || name == "x-m4a-resolved" || name == "content-length" || name == "x-forwarded-for")
+}
+
+async fn relay(client: WebSocket, e: Arc<Edge>, handshake: HeaderMap) {
+    let url = format!("{}/client/v3/push", e.core_base().replacen("http", "ws", 1));
     let Ok(mut req) = url.into_client_request() else { return };
     let Ok(v) = HeaderValue::from_str(&e.cfg.secret) else { return };
+    for (name, value) in &handshake {
+        if handshake_passes(name.as_str()) {
+            if let (Ok(n), Ok(v)) = (HeaderName::from_bytes(name.as_str().as_bytes()), HeaderValue::from_bytes(value.as_bytes())) {
+                req.headers_mut().insert(n, v);
+            }
+        }
+    }
     req.headers_mut().insert(EDGE_SECRET_HEADER, v);
-    let Ok((core, _)) = tokio_tungstenite::connect_async(req).await else {
-        let mut c = client;
-        let _ = c.send(AMsg::Close(Some(CloseFrame { code: 1011, reason: "core unreachable".into() }))).await;
-        return;
-    };
+    let mut client = client;
+    if let Some(path) = e.core_socket() {
+        if let Ok(stream) = tokio::net::UnixStream::connect(path).await {
+            if let Ok((core, _)) = tokio_tungstenite::client_async(req, stream).await {
+                return pump(client, core).await;
+            }
+        }
+    } else if let Ok((core, _)) = tokio_tungstenite::connect_async(req).await {
+        return pump(client, core).await;
+    }
+    let _ = client.send(AMsg::Close(Some(CloseFrame { code: 1011, reason: "core unreachable".into() }))).await;
+}
+
+async fn pump<S>(client: WebSocket, core: tokio_tungstenite::WebSocketStream<S>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let (mut c_tx, mut c_rx) = client.split();
     let (mut k_tx, mut k_rx) = core.split();
     let up = async {

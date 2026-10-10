@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 
 const EDGE_SECRET: &str = "0123456789abcdef0123456789abcdef-edge";
 const SEAM_SECRET: &[u8] = b"seam-secret-0123456789abcdef";
+const LINK: &str = "link-token-0123456789abcdef";
 const ADMIN: &str = "admin-token-for-tests";
 
 async fn serve(app: axum::Router) -> SocketAddr {
@@ -35,6 +36,7 @@ impl LoginDoor for FakeDoor {
 }
 
 struct Stack {
+    edge: String,
     core: Arc<Homeserver>,
     product: String,
     c: reqwest::Client,
@@ -47,8 +49,8 @@ async fn stack() -> Stack {
     let core = Arc::new(Homeserver::new(conn));
     let _ = core.seam.set(Arc::new(Seam::new(vec![SEAM_SECRET.to_vec()], 30, None, None)));
     let core_addr = serve(require_edge_secret(mail4agent_server::http::router(core.clone()), EDGE_SECRET.to_string())).await;
-    let edge_addr = serve(m4a_edge::edge_router(m4a_edge::EdgeConfig { core_url: format!("http://{core_addr}"), secret: EDGE_SECRET.into() })).await;
-    let link = EdgeLink::new(&format!("http://{edge_addr}"), SEAM_SECRET.to_vec(), None);
+    let edge_addr = serve(m4a_edge::edge_router(m4a_edge::EdgeConfig { core_url: format!("http://{core_addr}"), secret: EDGE_SECRET.into(), link_token: Some(LINK.into()) })).await;
+    let link = EdgeLink::new(&format!("http://{edge_addr}"), SEAM_SECRET.to_vec(), None).with_link_token(Some(LINK.into()));
     let app = Arc::new(ProductApp {
         users: UserService::new(Arc::new(SqliteStore::memory().unwrap()), NickRules::default(), TierTable::default()),
         events: EventPublisher::spawn(link.clone(), None, Duration::from_millis(50)),
@@ -57,7 +59,7 @@ async fn stack() -> Stack {
         doors: vec![Arc::new(FakeDoor)],
     });
     let product = format!("http://{}", serve(router(app)).await);
-    Stack { core, product, c: reqwest::Client::new() }
+    Stack { edge: format!("http://{edge_addr}"), core, product, c: reqwest::Client::new() }
 }
 
 impl Stack {
@@ -200,4 +202,68 @@ async fn login_password_doors_and_tier_flag() {
     assert_eq!(s.post("/product/v1/admin/tier", Some(ADMIN), json!({"nick":n,"tier":"paid"})).await.0, 200);
     assert_eq!(s.send("GET", "/product/v1/me", Some(tok), None).await.1["flag"], 1);
     assert_eq!(s.post("/product/v1/admin/tier", Some(ADMIN), json!({"nick":n,"tier":"gold"})).await.0, 400);
+}
+
+#[tokio::test]
+async fn push_socket_is_signed_by_the_product_relayed_through_the_edge_and_registered_by_identity() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+    let s = stack().await;
+    let (_, a_tok) = s.register().await;
+    let (_, b_tok) = s.register().await;
+    let ws = s.product.replacen("http", "ws", 1);
+    // No token: refused before the upgrade. Wrong token: refused too.
+    assert!(tokio_tungstenite::connect_async(format!("{ws}/client/v3/push")).await.is_err());
+    let mut bad = format!("{ws}/_matrix/client/v3/push").into_client_request().unwrap();
+    bad.headers_mut().insert("authorization", "Bearer nope".parse().unwrap());
+    assert!(tokio_tungstenite::connect_async(bad).await.is_err());
+    // Valid token: registered at once, no token frame needed.
+    let mut req = format!("{ws}/client/v3/push").into_client_request().unwrap();
+    req.headers_mut().insert("authorization", format!("Bearer {a_tok}").parse().unwrap());
+    let (mut sock, _) = tokio_tungstenite::connect_async(req).await.expect("handshake");
+    let first = tokio::time::timeout(Duration::from_secs(5), sock.next()).await.expect("registered in time").unwrap().unwrap();
+    assert_eq!(first.into_text().unwrap().as_str(), r#"{"type":"registered"}"#);
+    // The registration is by verified identity: an event for alice reaches the socket.
+    s.send("GET", "/_matrix/client/v3/capabilities", Some(&b_tok), None).await;
+    let a_nick = s.send("GET", "/product/v1/me", Some(&a_tok), None).await.1["nick"].as_str().unwrap().to_string();
+    let (_, b) = s.post("/_matrix/client/v3/createRoom", Some(&b_tok), json!({"preset":"private_chat","name":"pub"})).await;
+    let room = b["room_id"].as_str().unwrap().to_string();
+    let (st, b) = s.post(&format!("/_matrix/client/v3/rooms/{room}/invite"), Some(&b_tok), json!({"user_id": format!("@{a_nick}:example.org")})).await;
+    assert_eq!(st, 200, "{b}");
+    let (st, _) = s.post(&format!("/_matrix/client/v3/rooms/{room}/join"), Some(&a_tok), json!({})).await;
+    assert_eq!(st, 200);
+    let (st, b) = s.send("PUT", &format!("/_matrix/client/v3/rooms/{room}/send/m.room.encrypted/p1"), Some(&b_tok), Some(json!({"algorithm":"m.megolm.v1.aes-sha2","ciphertext":"x","sender_key":"k","session_id":"s","device_id":"d"}))).await;
+    assert_eq!(st, 200, "{b}");
+    let got = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(Ok(Message::Text(t))) = sock.next().await {
+            if t.contains("\"event\"") {
+                return t.to_string();
+            }
+        }
+        String::new()
+    })
+    .await
+    .expect("push event in time");
+    assert!(got.contains(&room), "{got}");
+    let _ = sock.close(None).await;
+}
+
+#[tokio::test]
+async fn barrier_token_gates_the_edge_but_not_the_public_protocol_surfaces() {
+    let s = stack().await;
+    let c = &s.c;
+    // Without the token (or with a wrong one) the edge refuses client paths, even with a valid-looking header.
+    let r = c.get(format!("{}/_matrix/client/v3/capabilities", s.edge)).send().await.unwrap();
+    assert_eq!((r.status().as_u16(), r.json::<Value>().await.unwrap()["errcode"].as_str().map(str::to_string)), (401, Some("M4A_LINK_TOKEN_REQUIRED".into())));
+    let r = c.get(format!("{}/_matrix/client/v3/capabilities", s.edge)).header("x-m4a-link-token", "wrong-token-0123456789").send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 401);
+    // Public surfaces stay open (they are not product traffic).
+    for p in ["/_matrix/client/versions", "/.well-known/matrix/client", "/edge/healthz"] {
+        let r = c.get(format!("{}{p}", s.edge)).send().await.unwrap();
+        assert_ne!(r.status().as_u16(), 401, "{p}");
+    }
+    // Through the product, with its token configured, everything works; a client-supplied token header is dropped.
+    let (_, tok) = s.register().await;
+    let r = c.get(format!("{}/_matrix/client/v3/capabilities", s.product)).bearer_auth(&tok).header("x-m4a-link-token", "client-forged-0123456789").send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 200);
 }

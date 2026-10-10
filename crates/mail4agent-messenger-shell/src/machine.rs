@@ -124,6 +124,9 @@ pub struct HostSession {
     /// Device bearer from the host keychain, for a session that already
     /// registered. `None` on the first connect.
     pub device_token: Option<String>,
+    /// Product-session mode: the product nick. With it, `device_token` is the
+    /// product session token and every call goes through the product proxy.
+    pub product_nick: Option<String>,
 }
 
 impl HostSession {
@@ -136,6 +139,28 @@ impl HostSession {
             routine_url: None,
             routine_bearer: None,
             device_token: None,
+            product_nick: None,
+        }
+    }
+
+    /// Product-session mode for this session: log in at the product as
+    /// `nick` with an existing product session `token`.
+    pub fn with_product(mut self, nick: impl Into<String>, token: impl Into<String>) -> Self {
+        self.product_nick = Some(nick.into());
+        self.device_token = Some(token.into());
+        self
+    }
+
+    pub(crate) fn config(&self, url: &str, store_root: &Path) -> Result<SessionConfig, ShellError> {
+        match (&self.product_nick, &self.device_token) {
+            (Some(nick), Some(token)) => SessionConfig::new_product(
+                url,
+                nick,
+                crate::ProductSecret::Token(zeroize::Zeroizing::new(token.clone())),
+                &self.session_id,
+                store_root,
+            ),
+            _ => SessionConfig::new(url, &self.bot_name, &self.session_id, store_root, self.device_token.clone()),
         }
     }
 
@@ -1209,6 +1234,8 @@ struct Prepared {
 /// The sessions on one machine, and the in-process bus they use when the
 /// peer is one of them.
 pub struct MachineClient {
+    /// Product-session mode: one push socket per session (a handshake is vouched for one identity).
+    product_mode: bool,
     sessions: Vec<OpenedStore>,
     bus: Arc<LocalBus>,
     push: crate::push::PushLink,
@@ -1332,13 +1359,7 @@ impl MachineClient {
         let mut seen_nicks = Vec::new();
         let mut locks = Vec::new();
         for session in sessions {
-            let config = SessionConfig::new(
-                homeserver_url,
-                &session.bot_name,
-                &session.session_id,
-                store_root,
-                session.device_token,
-            )?;
+            let config = session.config(homeserver_url, store_root)?;
             if seen_ids.iter().any(|id: &String| id == config.session_id()) {
                 return Err(ShellError::SessionList("duplicate session id".to_string()));
             }
@@ -1433,8 +1454,10 @@ impl MachineClient {
             .iter()
             .map(|item| item.bearer.as_str().to_string())
             .collect();
-        let push = crate::push::PushLink::open(&prepared[0].config.homeserver_url, tokens)?;
+        let product_mode = prepared[0].config.is_product();
+        let push = crate::push::PushLink::open(&prepared[0].config.homeserver_url, tokens, product_mode)?;
         Ok(Self {
+            product_mode,
             sessions: opened,
             bus,
             push,
@@ -1779,13 +1802,7 @@ impl MachineClient {
                 }
             }
         }
-        let config = SessionConfig::new(
-            &self.homeserver_url,
-            &session.bot_name,
-            &session.session_id,
-            store_root,
-            session.device_token.clone(),
-        )?;
+        let config = session.config(&self.homeserver_url, store_root)?;
         let lock = lock_store(&config.store_dir())?;
         let registered = register_session(&config)?;
         if let Some(first) = self.sessions.first() {
@@ -1840,7 +1857,7 @@ impl MachineClient {
             .iter()
             .map(|store| store.device_bearer().to_string())
             .collect();
-        match crate::push::PushLink::open(&self.homeserver_url, tokens) {
+        match crate::push::PushLink::open(&self.homeserver_url, tokens, self.product_mode) {
             Ok(push) => {
                 let old = std::mem::replace(&mut self.push, push);
                 for (recipient, event) in old.drain() {

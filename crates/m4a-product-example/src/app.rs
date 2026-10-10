@@ -94,6 +94,8 @@ pub fn router(app: App) -> Router {
         .route("/product/v1/logout", post(logout))
         .route("/product/v1/me", get(me))
         .route("/product/v1/nick", put(set_nick))
+        .route("/client/v3/push", get(push))
+        .route("/_matrix/client/v3/push", get(push))
         .route("/product/v1/admin/revoke", post(admin_revoke))
         .route("/product/v1/admin/delete", post(admin_delete))
         .route("/product/v1/admin/tier", post(admin_tier))
@@ -213,4 +215,15 @@ async fn proxy(State(app): State<App>, req: Request) -> Response {
         Err(e) => return e.into_response(),
     };
     app.link.forward(who.as_ref(), req).await
+}
+
+/// Push socket: the handshake is authenticated here (Bearer header or `access_token`
+/// query), signed, and relayed to the messenger; anonymous sockets are refused.
+async fn push(State(app): State<App>, headers: HeaderMap, axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>, ws: axum::extract::WebSocketUpgrade) -> Response {
+    let token = bearer(&headers).or_else(|| q.get("access_token").cloned());
+    let who = match token.map(|t| app.users.authenticate(&t)) {
+        Some(Ok(Some(w))) => w,
+        _ => return m4a_product_kit::push_relay::unauthorized(),
+    };
+    app.link.relay_push(who, ws)
 }

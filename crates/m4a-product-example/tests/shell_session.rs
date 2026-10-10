@@ -34,7 +34,7 @@ async fn product() -> String {
     let core = Arc::new(Homeserver::new(conn));
     let _ = core.seam.set(Arc::new(Seam::new(vec![SEAM_SECRET.to_vec()], 30, None, None)));
     let core_addr = serve(require_edge_secret(mail4agent_server::http::router(core), EDGE_SECRET.to_string())).await;
-    let edge_addr = serve(m4a_edge::edge_router(m4a_edge::EdgeConfig { core_url: format!("http://{core_addr}"), secret: EDGE_SECRET.into() })).await;
+    let edge_addr = serve(m4a_edge::edge_router(m4a_edge::EdgeConfig { core_url: format!("http://{core_addr}"), secret: EDGE_SECRET.into(), link_token: None })).await;
     let link = EdgeLink::new(&format!("http://{edge_addr}"), SEAM_SECRET.to_vec(), None);
     let app = Arc::new(ProductApp {
         users: UserService::new(Arc::new(SqliteStore::memory().unwrap()), NickRules::default(), TierTable::default()),
@@ -54,7 +54,9 @@ fn settle(s: &mut OpenedStore, now: &mut i64) {
     for _ in 0..8 {
         *now += 2_000;
         s.drive(*now, false).expect("drive");
+        std::thread::sleep(Duration::from_millis(40));
     }
+
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -108,7 +110,7 @@ async fn shells_log_in_at_the_product_and_exchange_encrypted_texts_through_its_p
                 break;
             }
         }
-        assert!(texts(&bob).iter().any(|t| t.ends_with("|hello through the product")), "bob never decrypted: {:?}", texts(&bob));
+        assert!(texts(&bob).iter().any(|t| t.ends_with("|hello through the product")), "bob never decrypted: {:?} bobtrace {:?} alice {:?} alicetrace {:?}", texts(&bob), bob.http_trace(), texts(&alice), alice.http_trace());
         send(&mut bob, bn, "and back");
         for _ in 0..6 {
             settle(&mut bob, &mut bn);

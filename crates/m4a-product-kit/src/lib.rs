@@ -17,6 +17,7 @@ pub mod edge_link;
 pub mod events;
 pub mod model;
 pub mod nick_rules;
+pub mod push_relay;
 pub mod service;
 pub mod tiers;
 

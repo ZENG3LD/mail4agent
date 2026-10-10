@@ -6,8 +6,6 @@
 //! `127.0.0.1` only. The raw key is `M4A_DB_KEY_HEX` (even-length hex) from
 //! the environment. It is not stored in the repo and not printed.
 //!
-//! Optional single-user bootstrap, all three variables together:
-//! `M4A_BOOTSTRAP_PUBLIC_ID`, `M4A_BOOTSTRAP_NICK`, `M4A_BOOTSTRAP_TOKEN`.
 //! The token is a bearer. Only [`mail4agent_server::http::hash_token`] is
 //! written. There is no password, KDF, or vault.
 
@@ -27,12 +25,6 @@ use tokio::net::TcpListener;
 const DEFAULT_BIND: &str = "127.0.0.1:8741";
 const DEFAULT_DB: &str = "/tmp/mail4agent-server-bin.db";
 const DEFAULT_SERVER_NAME: &str = "localhost";
-
-struct Bootstrap {
-    public_id: String,
-    nick: String,
-    token: String,
-}
 
 fn main() {
     if let Err(err) = run() {
@@ -77,8 +69,7 @@ fn run() -> Result<(), String> {
             "--help" | "-h" => {
                 println!(
                     "usage: mail4agent-server-bin [--role standalone|core] [--bind 127.0.0.1:8741] [--db /tmp/mail4agent-server-bin.db] [--server-name localhost]\n\
-                     required env: M4A_DB_KEY_HEX (even-length hex, not printed)\n\
-                     optional bootstrap, all three or none: M4A_BOOTSTRAP_PUBLIC_ID M4A_BOOTSTRAP_NICK M4A_BOOTSTRAP_TOKEN"
+                     required env: M4A_DB_KEY_HEX (even-length hex, not printed)"
                 );
                 return Ok(());
             }
@@ -102,17 +93,12 @@ fn run() -> Result<(), String> {
     let key_hex =
         env::var("M4A_DB_KEY_HEX").map_err(|_| "M4A_DB_KEY_HEX is required".to_string())?;
     validate_key_hex(&key_hex)?;
-    let bootstrap = read_bootstrap()?;
 
     let mut conn = open_messenger(&server_name, &db_path, &key_hex)?;
     if let Ok(names) = env::var("M4A_LOCAL_NAMES") {
         mail4agent_server::store::set_local_aliases(names.split(',').map(str::to_string));
     }
     run_boot_migrations(&mut conn)?;
-    if let Some(boot) = &bootstrap {
-        seed_user(&conn, boot)?;
-        eprintln!("bootstrapped one local user");
-    }
     let hs = Arc::new(Homeserver::new(conn));
     if let Ok(url) = env::var("M4A_PUBLIC_BASE_URL") {
         let _ = hs.public_base_url.set(url.trim_end_matches('/').to_string());
@@ -134,10 +120,6 @@ fn run() -> Result<(), String> {
         }
     }
     configure_identity(&hs)?;
-    // A product that owns registration turns the open self-registration route off.
-    if env::var("M4A_SELF_REGISTER").map(|v| v.eq_ignore_ascii_case("off")).unwrap_or(false) {
-        let _ = hs.self_register_disabled.set(());
-    }
     spawn_retention(Arc::clone(&hs));
     let fed_worker = hs.federation_enabled.get().is_some().then(|| Arc::clone(&hs));
     // Served both bare (behind an edge that strips `/_matrix`) and under `/_matrix` (direct federation peers).
@@ -146,6 +128,16 @@ fn run() -> Result<(), String> {
     let app = match edge_secret {
         Some(secret) => mail4agent_server::http::edge_auth::require_edge_secret(app, secret),
         None => app,
+    };
+    // A product server reaching this process directly proves itself with the barrier token.
+    let app = match env::var("M4A_LINK_TOKEN").ok().filter(|t| !t.is_empty()) {
+        Some(token) if role != "core" => {
+            if token.len() < 16 {
+                return Err("M4A_LINK_TOKEN must be at least 16 characters".into());
+            }
+            mail4agent_server::http::edge_auth::require_link_token(app, token)
+        }
+        _ => app,
     };
 
     let runtime = tokio::runtime::Runtime::new().map_err(|err| format!("runtime: {err}"))?;
@@ -259,52 +251,36 @@ fn validate_key_hex(raw: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn read_bootstrap() -> Result<Option<Bootstrap>, String> {
-    let public_id = env::var("M4A_BOOTSTRAP_PUBLIC_ID").ok();
-    let nick_value = env::var("M4A_BOOTSTRAP_NICK").ok();
-    let token = env::var("M4A_BOOTSTRAP_TOKEN").ok();
-    match (public_id, nick_value, token) {
-        (None, None, None) => Ok(None),
-        (Some(public_id), Some(nick), Some(token)) => {
-            if public_id.is_empty() || nick.is_empty() || token.is_empty() {
-                return Err("bootstrap public id, nick, and token must be non-empty".into());
-            }
-            Ok(Some(Bootstrap {
-                public_id,
-                nick,
-                token,
-            }))
-        }
-        _ => Err(
-            "set all of M4A_BOOTSTRAP_PUBLIC_ID, M4A_BOOTSTRAP_NICK, M4A_BOOTSTRAP_TOKEN, or none"
-                .into(),
-        ),
-    }
-}
-
-fn seed_user(conn: &Connection, boot: &Bootstrap) -> Result<(), String> {
-    let now = Utc::now().to_rfc3339();
-    const USER_ID: i64 = 1;
-    store::ensure_matrix_user(conn, USER_ID, &boot.public_id, &now)
-        .map_err(|err| format!("user: {err:?}"))?;
-    nick::set_nick(conn, USER_ID, &boot.nick).map_err(|err| format!("nick: {err:?}"))?;
-    let hash = hash_token(&boot.token);
-    match keys::device_for_credential(conn, CredentialKind::Bearer, &hash)
-        .map_err(|err| format!("device lookup: {err}"))?
-    {
-        Some(device) if device.user_id == USER_ID => Ok(()),
-        Some(_) => Err("bootstrap token already belongs to another user".into()),
-        None => {
-            keys::create_device(conn, USER_ID, CredentialKind::Bearer, &hash, &now)
-                .map_err(|err| format!("device: {err}"))?;
-            Ok(())
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Bootstrap {
+        public_id: String,
+        nick: String,
+        token: String,
+    }
+
+    fn seed_user(conn: &Connection, boot: &Bootstrap) -> Result<(), String> {
+        let now = Utc::now().to_rfc3339();
+        const USER_ID: i64 = 1;
+        store::ensure_matrix_user(conn, USER_ID, &boot.public_id, &now)
+            .map_err(|err| format!("user: {err:?}"))?;
+        nick::set_nick(conn, USER_ID, &boot.nick).map_err(|err| format!("nick: {err:?}"))?;
+        let hash = hash_token(&boot.token);
+        match keys::device_for_credential(conn, CredentialKind::Bearer, &hash)
+            .map_err(|err| format!("device lookup: {err}"))?
+        {
+            Some(device) if device.user_id == USER_ID => Ok(()),
+            Some(_) => Err("bootstrap token already belongs to another user".into()),
+            None => {
+                keys::create_device(conn, USER_ID, CredentialKind::Bearer, &hash, &now)
+                    .map_err(|err| format!("device: {err}"))?;
+                Ok(())
+            }
+        }
+    }
+
     use std::io::Read;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

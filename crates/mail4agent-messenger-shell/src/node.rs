@@ -112,7 +112,7 @@ impl NodeClient {
             save_device_bearer(&dir, config.session_id(), store.device_bearer());
         }
 
-        let push = PushLink::open(config.homeserver_url(), vec![store.device_bearer().to_string()])?;
+        let push = PushLink::open(config.homeserver_url(), vec![store.device_bearer().to_string()], config.is_product())?;
         let store_root = PathBuf::from(
             nonempty_var(STORE_ROOT_ENV).ok_or(ShellError::StoreRoot)?,
         );

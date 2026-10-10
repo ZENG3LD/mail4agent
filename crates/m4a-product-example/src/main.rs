@@ -4,6 +4,7 @@
 //! * `M4A_PRODUCT_EDGE_URL` (required: messenger edge on the private link)
 //! * `M4A_ASSERTION_SECRET` (required, >= 16 chars; must equal the core's), optional
 //!   `M4A_ASSERTION_HEADER`, `M4A_EVENT_SIG_HEADER`
+//! * `M4A_LINK_TOKEN` (optional barrier token presented to the edge/core; must equal theirs)
 //! * `M4A_PRODUCT_ADMIN_TOKEN` (optional; enables `/product/v1/admin/*`)
 //! * `M4A_PRODUCT_TIERS` (`free=0,paid=1`), `M4A_PRODUCT_NICK_LISTS`, `M4A_PRODUCT_NICK_COOLDOWN_DAYS`
 //! * `M4A_PRODUCT_LOGIN_MATRIX=1` with `M4A_PRODUCT_LOCAL_NAMES` (comma list of own server names)
@@ -34,7 +35,7 @@ async fn run() -> Result<(), String> {
         return Err("M4A_ASSERTION_SECRET must be at least 16 characters".into());
     }
     let store = Arc::new(SqliteStore::open_path(&req("M4A_PRODUCT_DB")?).map_err(|e| format!("M4A_PRODUCT_DB: {e}"))?);
-    let link = EdgeLink::new(&req("M4A_PRODUCT_EDGE_URL")?, secret.into_bytes(), opt("M4A_ASSERTION_HEADER"));
+    let link = EdgeLink::new(&req("M4A_PRODUCT_EDGE_URL")?, secret.into_bytes(), opt("M4A_ASSERTION_HEADER")).with_link_token(opt("M4A_LINK_TOKEN"));
     let events = EventPublisher::spawn(link.clone(), opt("M4A_EVENT_SIG_HEADER"), Duration::from_secs(1));
     let mut doors: Vec<Arc<dyn LoginDoor>> = Vec::new();
     #[cfg(feature = "matrix-address-door")]

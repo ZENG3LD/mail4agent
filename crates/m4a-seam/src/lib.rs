@@ -50,6 +50,30 @@ pub const DEFAULT_EVENT_SIG_HEADER: &str = "x-m4a-event-sig";
 /// Lifetime of an assertion the signer makes, in seconds.
 pub const ASSERTION_TTL_S: i64 = 60;
 
+/// Header carrying the barrier token on private links (product -> edge, product -> core).
+/// Every receiver of a link checks it inside, on top of the transport (WireGuard or a
+/// unix socket) that already protects the link.
+pub const LINK_TOKEN_HEADER: &str = "x-m4a-link-token";
+
+/// Paths that stay reachable without the barrier token because they are public
+/// protocol surfaces (federation peers, key documents, discovery, health).
+pub fn link_path_is_open(path: &str) -> bool {
+    path == "/edge/healthz"
+        || path.starts_with("/_matrix/federation/")
+        || path.starts_with("/_matrix/key/")
+        || path.starts_with("/.well-known/")
+        || path == "/_matrix/client/versions"
+        || path == "/client/versions"
+}
+
+/// Constant-time comparison of a presented barrier token with the expected one.
+pub fn link_token_ok(presented: Option<&str>, expected: &str) -> bool {
+    match presented {
+        Some(p) if p.len() == expected.len() => p.bytes().zip(expected.bytes()).fold(0u8, |a, (x, y)| a | (x ^ y)) == 0,
+        _ => false,
+    }
+}
+
 /// Shared accept/reject vectors for assertion v1 (JSON; see the file).
 pub const VECTORS: &str = include_str!("../vectors/assertion_v1.json");
 
@@ -205,6 +229,14 @@ mod tests {
         assert_eq!(verify_assertion(&[s.clone()], &v, "POST", "/client/v3/x?q=1", NOW, 30_000).unwrap(), sample("n1"));
         assert_eq!(verify_assertion(&[s.clone()], &v, "GET", "/client/v3/x?q=1", NOW, 30_000), Err(SeamError::BadSignature));
         assert_eq!(verify_assertion(&[s], &v, "POST", "/client/v3/y", NOW, 30_000), Err(SeamError::BadSignature));
+    }
+
+    #[test]
+    fn link_token_is_constant_length_checked_and_public_paths_stay_open() {
+        assert!(link_token_ok(Some("abcdefgh"), "abcdefgh"));
+        assert!(!link_token_ok(Some("abcdefgX"), "abcdefgh") && !link_token_ok(Some("abc"), "abcdefgh") && !link_token_ok(None, "abcdefgh"));
+        assert!(link_path_is_open("/_matrix/federation/v1/send/1") && link_path_is_open("/.well-known/matrix/server") && link_path_is_open("/edge/healthz"));
+        assert!(!link_path_is_open("/_matrix/client/v3/sync") && !link_path_is_open("/client/v3/push"));
     }
 
     #[test]

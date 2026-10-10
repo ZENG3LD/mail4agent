@@ -41,6 +41,25 @@ pub fn require_edge_secret(router: Router, secret: String) -> Router {
     }))
 }
 
+/// Barrier token gate for a standalone core reached directly by a product server
+/// (`M4A_LINK_TOKEN`): every request outside the public protocol surfaces must carry
+/// `x-m4a-link-token`. The header is removed before routing.
+pub fn require_link_token(router: Router, token: String) -> Router {
+    let token: std::sync::Arc<str> = token.into();
+    router.layer(from_fn(move |mut req: Request, next: Next| {
+        let token = std::sync::Arc::clone(&token);
+        async move {
+            let ok = m4a_seam::link_path_is_open(req.uri().path()) || m4a_seam::link_token_ok(req.headers().get(m4a_seam::LINK_TOKEN_HEADER).and_then(|v| v.to_str().ok()), &token);
+            req.headers_mut().remove(m4a_seam::LINK_TOKEN_HEADER);
+            if ok {
+                next.run(req).await
+            } else {
+                (StatusCode::UNAUTHORIZED, axum::Json(serde_json::json!({"errcode": "M4A_LINK_TOKEN_REQUIRED", "error": "link token required"}))).into_response()
+            }
+        }
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

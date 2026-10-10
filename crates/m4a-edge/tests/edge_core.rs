@@ -34,7 +34,7 @@ fn core() -> axum::Router {
 #[tokio::test]
 async fn edge_forwards_cs_api_push_and_media_and_core_refuses_direct_access() {
     let core_addr = serve(core()).await;
-    let edge_addr = serve(m4a_edge::edge_router(m4a_edge::EdgeConfig { core_url: format!("http://{core_addr}"), secret: SECRET.into() })).await;
+    let edge_addr = serve(m4a_edge::edge_router(m4a_edge::EdgeConfig { core_url: format!("http://{core_addr}"), secret: SECRET.into(), link_token: None })).await;
     let c = reqwest::Client::new();
     let edge = format!("http://{edge_addr}");
 
@@ -74,7 +74,7 @@ async fn edge_forwards_cs_api_push_and_media_and_core_refuses_direct_access() {
 
 #[tokio::test]
 async fn edge_rate_limits_register_per_client_and_reports_core_down() {
-    let dead = m4a_edge::edge_router(m4a_edge::EdgeConfig { core_url: "http://127.0.0.1:9".into(), secret: SECRET.into() });
+    let dead = m4a_edge::edge_router(m4a_edge::EdgeConfig { core_url: "http://127.0.0.1:9".into(), secret: SECRET.into(), link_token: None });
     let addr = serve(dead).await;
     let c = reqwest::Client::new();
     assert_eq!(c.get(format!("http://{addr}/_matrix/client/versions")).send().await.unwrap().status(), 502);
@@ -100,7 +100,7 @@ async fn edge_passes_the_assertion_header_and_the_signed_path_is_the_core_path()
     let hs = Arc::new(Homeserver::new(conn));
     let _ = hs.seam.set(Arc::new(mail4agent_server::http::identity::Seam::new(vec![secret.clone()], 30, None, None)));
     let core_addr = serve(require_edge_secret(router(hs), SECRET.to_string())).await;
-    let edge_addr = serve(m4a_edge::edge_router(m4a_edge::EdgeConfig { core_url: format!("http://{core_addr}"), secret: SECRET.into() })).await;
+    let edge_addr = serve(m4a_edge::edge_router(m4a_edge::EdgeConfig { core_url: format!("http://{core_addr}"), secret: SECRET.into(), link_token: None })).await;
     let c = reqwest::Client::new();
     let now = chrono_now();
     let a = |nonce: &str| Assertion { nick: "nora".into(), cred_ref: "c1".into(), authenticated: 1, paid: 0, iat: now, exp: now + 60, nonce: nonce.into() };
