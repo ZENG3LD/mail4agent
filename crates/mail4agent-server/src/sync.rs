@@ -609,8 +609,7 @@ pub fn build_sync_response(
         "device_lists": { "changed": device_lists_changed, "left": device_lists_left },
         "device_one_time_keys_count": otk_counts,
         "device_unused_fallback_key_types": unused_fallback,
-        // No presence pushed at all in this server (plan §4/research §1.6).
-        "presence": { "events": [] },
+        "presence": { "events": crate::http::presence::sync_events(conn, caller_user_id, since_stream, upto)? },
         "rooms": {
             "join": serde_json::Value::Object(rooms_join),
             "invite": serde_json::Value::Object(rooms_invite),

@@ -59,6 +59,19 @@ pub fn enqueue_device_list(conn: &Connection, user_id: i64, stream_id: i64) {
     queue(conn, servers, &json!({ "edu_type": "m.device_list_update", "content": { "user_id": mxid, "device_id": "*", "stream_id": stream_id, "prev_id": [] } }));
 }
 
+/// A local user's presence, to every server that shares a room with them.
+pub fn enqueue_presence(conn: &Connection, user_id: i64) {
+    if user_id <= 0 || !crate::http::presence::enabled() {
+        return;
+    }
+    let (Ok(Some(mxid)), Some(c)) = (store::mxid_of(conn, user_id), crate::http::presence::content_of(conn, user_id)) else { return };
+    let mut entry = json!({ "user_id": mxid, "presence": c["presence"], "last_active_ago": c["last_active_ago"], "currently_active": c["currently_active"] });
+    if let Some(m) = c.get("status_msg") {
+        entry["status_msg"] = m.clone();
+    }
+    queue(conn, remote_servers_of_user(conn, user_id), &json!({ "edu_type": "m.presence", "content": { "push": [entry] } }));
+}
+
 /// The newest device-list change of a user (0 when there is none).
 pub fn device_list_stream(conn: &Connection, user_id: i64) -> i64 {
     conn.query_row("SELECT COALESCE(MAX(stream_id), 0) FROM device_list_changes WHERE user_id = ?1", [user_id], |r| r.get(0)).unwrap_or(0)
@@ -119,6 +132,23 @@ pub fn apply_inbound(conn: &mut Connection, typing: &crate::typing::TypingRegist
                     for room in store::rooms_for_user(conn, uid, Some(Membership::Join)).unwrap_or_default() {
                         wake.extend(store::room_members(conn, &room, Some(Membership::Join)).unwrap_or_default().into_iter().map(|m| m.user_id).filter(|u| *u > 0));
                     }
+                }
+            }
+        }
+        Some("m.presence") if crate::http::presence::enabled() => {
+            for p in content.get("push").and_then(Value::as_array).into_iter().flatten() {
+                let (Some(user), Some(state)) = (p.get("user_id").and_then(Value::as_str), p.get("presence").and_then(Value::as_str)) else { continue };
+                if !from_origin(user, origin) || !["online", "offline", "unavailable"].contains(&state) {
+                    continue;
+                }
+                let Ok(Some(uid)) = store::user_id_of(conn, user) else { continue };
+                if uid >= 0 {
+                    continue;
+                }
+                let ago = p.get("last_active_ago").and_then(Value::as_i64).unwrap_or(0).max(0);
+                let msg = p.get("status_msg").and_then(Value::as_str).map(|s| s.chars().take(256).collect::<String>());
+                if let Ok(ids) = crate::http::presence::set(conn, uid, state, msg.as_deref(), now_ms() - ago) {
+                    wake.extend(ids);
                 }
             }
         }

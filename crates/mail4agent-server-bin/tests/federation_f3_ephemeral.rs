@@ -53,4 +53,13 @@ fn typing_receipts_and_device_list_updates_cross_servers() {
     let (st, v) = b.call(&c, "POST", "/client/v3/keys/upload", Some(dk));
     assert_eq!(st, 200, "{v}");
     watch("alice learns bob's device list changed", &|s| s["device_lists"]["changed"].as_array().is_some_and(|l| l.iter().any(|x| *x == json!(b.user))));
+
+    // Presence: bob goes online with a status on server b; alice sees it in sync and by GET,
+    // and a stranger's presence is not readable.
+    let (st, v) = b.call(&c, "PUT", &format!("/client/v3/presence/{}/status", enc(&b.user)), Some(json!({"presence":"online","status_msg":"in the lab"})));
+    assert_eq!(st, 200, "{v}");
+    watch("alice sees bob's presence", &|s| s["presence"]["events"].as_array().is_some_and(|e| e.iter().any(|x| x["type"] == "m.presence" && x["sender"] == json!(b.user) && x["content"]["presence"] == "online" && x["content"]["status_msg"] == "in the lab")));
+    let (st, v) = a.call(&c, "GET", &format!("/client/v3/presence/{}/status", enc(&b.user)), None);
+    assert_eq!((st, v["presence"].as_str(), v["status_msg"].as_str()), (200, Some("online"), Some("in the lab")), "{v}");
+    assert_eq!(a.call(&c, "GET", &format!("/client/v3/presence/{}/status", enc("@nobody:b.example")), None).0, 404);
 }

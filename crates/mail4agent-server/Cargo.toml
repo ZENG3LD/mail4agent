@@ -14,7 +14,11 @@ name = "mail4agent_server"
 path = "src/lib.rs"
 
 [features]
-default = ["f3-hash-ids"]
+default = ["f3-hash-ids", "presence", "media-federation"]
+# Presence (PUT/GET status, sync section, m.presence EDUs). Env: M4A_PRESENCE=off.
+presence = []
+# Remote media (federation download, cache) and the authenticated media routes. Env: M4A_MEDIA_FEDERATION=off.
+media-federation = []
 # Device-bearer credentials resolve to a caller. Only the client shell's in-process local
 # bus enables it (its own private bus, no network); the server binary never does.
 local-bearer = []

@@ -40,7 +40,6 @@ pub(super) fn routes() -> Router<Arc<Homeserver>> {
         .route("/client/v3/pushers", get(pushers))
         .route("/client/v3/pushers/set", post(ok_empty))
         .route("/client/v3/notifications", get(notifications))
-        .route("/client/v3/presence/{user_id}/status", get(presence).put(ok_empty))
         .route("/client/v1/media/config", get(media_config))
         .route("/media/v3/config", get(media_config))
         .route("/client/v1/media/download/{server}/{media_id}", get(download))
@@ -132,10 +131,6 @@ async fn notifications(State(state): State<Arc<Homeserver>>, headers: HeaderMap)
     Ok(Json(json!({ "notifications": [] })))
 }
 
-async fn presence(State(state): State<Arc<Homeserver>>, headers: HeaderMap) -> Result<Json<Value>, MatrixError> {
-    resolve_caller(&state, &headers, None).await?;
-    Ok(Json(json!({ "presence": "offline" })))
-}
 
 async fn media_config(State(state): State<Arc<Homeserver>>, headers: HeaderMap) -> Result<Json<Value>, MatrixError> {
     resolve_caller(&state, &headers, None).await?;

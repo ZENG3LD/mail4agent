@@ -14,6 +14,8 @@ use super::{Caller, Homeserver};
 #[derive(serde::Deserialize, Default)]
 struct SyncQuery {
     #[serde(default)]
+    set_presence: Option<String>,
+    #[serde(default)]
     since: Option<String>,
     #[serde(default)]
     timeout: Option<u64>,
@@ -35,6 +37,15 @@ async fn sync_handler(
     Query(query): Query<SyncQuery>,
 ) -> Result<Json<serde_json::Value>, MatrixError> {
     let Caller { user_id, mxid, device_id, .. } = super::resolve_caller(&state, &headers, query.access_token.as_deref()).await?;
+    if super::presence::enabled() && query.set_presence.as_deref().is_none_or(|p| p == "online") {
+        // A client that is syncing is active: keep an "online" user from going idle.
+        let now = chrono::Utc::now().timestamp_millis();
+        let _ = super::with_conn_pub(&state, move |c| {
+            let _ = c.execute("UPDATE presence SET last_active_ms = ?2 WHERE user_id = ?1 AND state = 'online' AND last_active_ms < ?2 - 60000", rusqlite::params![user_id, now]);
+            Ok(())
+        })
+        .await;
+    }
     let since = query.since.as_deref().map(crate::sync_token::parse).transpose()?;
     let timeout = Duration::from_millis(query.timeout.unwrap_or(0).min(crate::sync::SYNC_MAX_TIMEOUT_MS));
     let full_state = query.full_state.unwrap_or(false);
