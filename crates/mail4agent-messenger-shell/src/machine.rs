@@ -1,14 +1,14 @@
 //! Web machine client: one process for every bot session on this machine.
 //!
 //! This is not the homeserver, and it is not the node CLI
-//! ([`crate::OpenedStore::connect_node_from_env`]). Discovery prefers the
-//! live agents directory ([`AGENTS_DIR_ENV`], or
-//! [`DEFAULT_AGENTS_DIR`] when that folder exists): each child folder is a
-//! Grok Bot agent id and `profile.json` carries the display name. The mail
-//! session id is that agent id, unless [`SESSION_IDS_ENV`] maps the agent
-//! to an existing session id. The host may still pass a list, or this
-//! process may read [`SESSIONS_DIR_ENV`] when no agents directory is
-//! present. A session record is the bot display name, the mail session id,
+//! ([`crate::OpenedStore::connect_node_from_env`]). Discovery uses
+//! [`AGENTS_DIR_ENV`] only when that variable names a directory. The home
+//! Grok Bot directory is not opened by default, and neither is its gateway
+//! file. Each child folder is a Grok Bot agent id and `profile.json`
+//! carries the display name. The mail session id is that agent id, unless
+//! [`SESSION_IDS_ENV`] maps the agent to an existing session id. The host
+//! may still pass a list, or this process reads [`SESSIONS_DIR_ENV`] when
+//! no agents directory was named. A session record is the bot display name, the mail session id,
 //! and the Grok Bot agent id when this session has one. A routine URL or a
 //! bearer in the file is refused.
 //!
@@ -82,8 +82,8 @@ pub const SESSIONS_DIR_ENV: &str = "M4A_SESSIONS_DIR";
 pub const AGENTS_DIR_ENV: &str = "M4A_AGENTS_DIR";
 
 /// Default agents directory, relative to the user's home (`$HOME` or
-/// `%USERPROFILE%`). Used when [`AGENTS_DIR_ENV`] is unset and the resolved path
-/// is a directory.
+/// `%USERPROFILE%`). The webhook command uses it when [`AGENTS_DIR_ENV`]
+/// is unset and this path is a directory. The web client does not.
 pub const DEFAULT_AGENTS_DIR: &str = "agent-data/agents";
 
 /// `<home>/<rel>`, with the home taken from the environment; a bare relative path when none is set.
@@ -287,9 +287,18 @@ pub fn load_agents_dir(dir: &Path) -> Result<Vec<HostSession>, ShellError> {
     Ok(out)
 }
 
+/// Agents directory for the web client. Only [`AGENTS_DIR_ENV`], and only
+/// when that path is a directory. An unset variable does not fall back to
+/// the home Grok Bot directory: that directory belongs to another product
+/// on the same box.
+fn explicit_agents_dir(mut get: impl FnMut(&str) -> Option<String>) -> Option<PathBuf> {
+    let path = PathBuf::from(get(AGENTS_DIR_ENV)?);
+    path.is_dir().then_some(path)
+}
+
 /// Resolves the agents directory from the environment lookup. Prefers
 /// [`AGENTS_DIR_ENV`], then [`DEFAULT_AGENTS_DIR`] when that path is a
-/// directory.
+/// directory. The webhook command uses this. The web client does not.
 fn resolve_agents_dir(mut get: impl FnMut(&str) -> Option<String>) -> Option<PathBuf> {
     if let Some(path) = get(AGENTS_DIR_ENV).filter(|value| !value.is_empty()) {
         let path = PathBuf::from(path);
@@ -658,8 +667,9 @@ fn ensure_profile_note(
 /// The listener is loopback; the `host` field in the file is not used.
 const DEFAULT_GATEWAY_FILE: &str = "agent-data/gateway.json";
 
-/// Path of the gateway file. Unset on [`MachineClient::from_env`] uses
-/// [`DEFAULT_GATEWAY_FILE`].
+/// Path of the gateway file. Unset on [`MachineClient::from_env`] means
+/// the web client does not open a gateway file. The webhook command still
+/// defaults to [`DEFAULT_GATEWAY_FILE`] when this is unset.
 pub const GATEWAY_FILE_ENV: &str = "M4A_GATEWAY_FILE";
 
 /// Gateway bearer. When set, this replaces the token in the gateway file.
@@ -1441,14 +1451,13 @@ impl MachineClient {
 
     /// Web machine client open path.
     ///
-    /// [`HOMESERVER_URL_ENV`], [`STORE_ROOT_ENV`]. Discovery prefers the
-    /// agents directory ([`AGENTS_DIR_ENV`] or [`DEFAULT_AGENTS_DIR`]) when
-    /// that folder exists; otherwise [`SESSIONS_DIR_ENV`]. One webhook
-    /// routine per agent, from the gateway file ([`GATEWAY_FILE_ENV`], or
-    /// the host gateway file when that is unset). The token is the file's
-    /// token, or [`GATEWAY_TOKEN_ENV`] when the host injected one. A missing
-    /// file leaves routines unset and does not fail this open. URLs and
-    /// keys are not read from disk and are not written back.
+    /// [`HOMESERVER_URL_ENV`], [`STORE_ROOT_ENV`]. Discovery uses
+    /// [`AGENTS_DIR_ENV`] only when it names a directory; otherwise
+    /// [`SESSIONS_DIR_ENV`]. The home Grok Bot directory is not a default.
+    /// A webhook routine is read only when [`GATEWAY_FILE_ENV`] is set.
+    /// The token is the file's token, or [`GATEWAY_TOKEN_ENV`] when the
+    /// host injected one. A missing file leaves routines unset and does
+    /// not fail this open. URLs and keys are not written back.
     /// [`crate::LEADER_SOCK_ENV`] is not read.
     pub fn from_env() -> Result<Self, ShellError> {
         Self::from_env_filtered(None)
@@ -1471,15 +1480,9 @@ impl MachineClient {
             .filter(|value| !value.is_empty())
             .ok_or(ShellError::StoreRoot)?;
         let mut get = |key: &str| -> Option<String> {
-            if key == GATEWAY_FILE_ENV {
-                return std::env::var(GATEWAY_FILE_ENV)
-                    .ok()
-                    .filter(|value| !value.is_empty())
-                    .or_else(|| Some(under_home(DEFAULT_GATEWAY_FILE).to_string_lossy().into_owned()));
-            }
             std::env::var(key).ok().filter(|value| !value.is_empty())
         };
-        let agents_dir = resolve_agents_dir(&mut get);
+        let agents_dir = explicit_agents_dir(&mut get);
         let (sessions, agents_dir) = if let Some(dir) = agents_dir {
             (load_web_agents(&dir, &mut get)?, Some(dir))
         } else {
@@ -2246,6 +2249,34 @@ fn attach_detected_chain(store: &mut OpenedStore, config: &SessionConfig, nick: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_client_agents_dir_is_only_the_env_path() {
+        assert!(explicit_agents_dir(|_| None).is_none());
+        let missing = std::env::temp_dir().join(format!(
+            "m4a-missing-agents-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&missing);
+        assert!(explicit_agents_dir(|key| {
+            (key == AGENTS_DIR_ENV).then(|| missing.display().to_string())
+        })
+        .is_none());
+        let present = std::env::temp_dir().join(format!(
+            "m4a-present-agents-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&present).expect("dir");
+        let got = explicit_agents_dir(|key| {
+            (key == AGENTS_DIR_ENV).then(|| present.display().to_string())
+        });
+        assert_eq!(got.as_deref(), Some(present.as_path()));
+        let _ = std::fs::remove_dir_all(&present);
+    }
 
     #[test]
     fn rescan_opens_only_bots_without_a_session() {

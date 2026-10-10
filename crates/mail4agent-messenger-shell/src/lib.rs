@@ -37,10 +37,10 @@
 //! Two open paths, one shell. This is not a second product.
 //!
 //! The web machine client is [`MachineClient::from_env`]. One process
-//! prefers the live agents directory ([`AGENTS_DIR_ENV`] /
-//! [`DEFAULT_AGENTS_DIR`]): each folder is an agent id (also the mail
-//! session id) and `profile.json` has the display name. When that
-//! directory is absent it reads [`SESSIONS_DIR_ENV`]. The nick is
+//! uses the agents directory only when [`AGENTS_DIR_ENV`] names one:
+//! each folder is an agent id (also the mail session id) and
+//! `profile.json` has the display name. The home Grok Bot directory is
+//! not opened by default. Otherwise it reads [`SESSIONS_DIR_ENV`]. The nick is
 //! [`nick_from_display_name`] of that display name. Mail between sessions
 //! this client holds is in process
 //! ([`MachineClient::set_local_delivery`]). A peer that is not in the list
