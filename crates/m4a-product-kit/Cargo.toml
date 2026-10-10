@@ -1,0 +1,24 @@
+[package]
+name = "m4a-product-kit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Building blocks of a product server in front of the messenger server: nick rules, user store trait and service, sessions, tiers, optional login doors, the signing link to the edge and the lifecycle event publisher."
+
+[features]
+default = []
+# Real optional login door: a person proves a federated Matrix address by an OpenID token.
+matrix-address-door = []
+
+[dependencies]
+m4a-seam = { path = "../m4a-seam" }
+axum = { version = "0.8", features = ["json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+rand = "0.8"
+sha2 = "0.10"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
