@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use crate::ipc::{SendListener, SendStream};
 use crate::machine::lock_store;
-use crate::push::PushLink;
+use m4a_agent::engine::PushLink;
 use crate::send::{send_sock_path_named, SendReply, SendRequest};
 use crate::{
     nonempty_var, OpenedStore, SessionConfig, SessionWake, ShellError,
@@ -94,7 +94,7 @@ impl NodeClient {
         let lock = lock_store(&config.store_dir())?;
         let store = OpenedStore::connect_with_wake(&config, wake)?;
 
-        let push = PushLink::open(config.homeserver_url(), vec![store.device_bearer().to_string()], true)?;
+        let push = PushLink::open(config.homeserver_url(), store.keep_prefix(), vec![store.device_bearer().to_string()], true)?;
         let store_root = PathBuf::from(
             nonempty_var(STORE_ROOT_ENV).ok_or(ShellError::StoreRoot)?,
         );

@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use crate::error::{AgentError, Result};
 
-pub trait Wire: Send {
+pub trait Wire: Send + Sync {
     /// POST JSON; the status and the JSON answer (`Null` when the body is not JSON).
     fn post(&self, path: &str, body: &Value, bearer: Option<&str>) -> Result<(u16, Value)>;
     fn get(&self, path: &str, bearer: Option<&str>) -> Result<(u16, Value)>;

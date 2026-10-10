@@ -10,7 +10,10 @@ description = "The agent-side client of the messenger: one session = one identit
 [features]
 # The full pack is the default; a light build turns features off.
 default = ["full"]
-full = ["tier-server", "tier-matrix", "vault-keychain", "bridges"]
+full = ["tier-server", "tier-matrix", "engine", "vault-keychain", "bridges"]
+# The engine driver: runs the sans-I/O messenger core against a backend (HTTP execution, sync worker,
+# push socket). Needs a tier to talk to.
+engine = ["dep:mail4agent-messenger", "dep:tungstenite", "dep:reqwest"]
 # Tier 2: our server through its own (non-Matrix) product API.
 tier-server = ["dep:reqwest"]
 # Tier 3: the Matrix client API (custom login type, same key proof).
@@ -25,6 +28,8 @@ vault-keychain = ["dep:keyring"]
 
 [dependencies]
 m4a-seam = { workspace = true }
+mail4agent-messenger = { workspace = true, optional = true }
+tungstenite = { version = "0.29", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"], optional = true }
 aes-gcm = "0.10"
 ed25519-dalek = { version = "2", features = ["std", "rand_core", "zeroize"] }
 rand = "0.8"

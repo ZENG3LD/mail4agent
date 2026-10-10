@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use crate::ipc::{SendListener, SendStream};
 use crate::machine::lock_store;
-use crate::push::PushLink;
+use m4a_agent::engine::PushLink;
 use crate::send::{self, SendReply};
 use crate::{
     nick_from_display_name, OpenedStore, SessionConfig, SessionWake, ShellError,
@@ -477,7 +477,7 @@ impl GrokListener {
         if tokens.is_empty() {
             return Ok(());
         }
-        self.push = Some(PushLink::open(&self.homeserver_url, tokens, false)?);
+        self.push = Some(PushLink::open(&self.homeserver_url, self.slots.first().is_some_and(|s| s.store.keep_prefix()), tokens, false)?);
         Ok(())
     }
 }

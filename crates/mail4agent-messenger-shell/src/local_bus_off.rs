@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use mail4agent_messenger::{HttpResponseDescriptor, OutgoingRequest};
 
 use crate::machine::Prepared;
-use crate::{perform_http, ShellError};
+use crate::ShellError;
 
 pub(crate) struct LocalBus {
     local_only: AtomicBool,
@@ -31,18 +31,16 @@ impl LocalBus {
     }
     pub(crate) fn fulfill(
         &self,
-        client: &reqwest::blocking::Client,
-        base_url: &reqwest::Url,
-        device_token: &str,
         _user_id: &str,
         request: &OutgoingRequest,
         force_local: Option<bool>,
+        remote: &dyn Fn(&OutgoingRequest) -> Result<HttpResponseDescriptor, ShellError>,
     ) -> Result<(HttpResponseDescriptor, bool), ShellError> {
         if force_local.unwrap_or_else(|| self.local_only()) {
             return Err(ShellError::Http("this build has no local bus".into()));
         }
         self.hits.fetch_add(1, Ordering::Relaxed);
-        Ok((perform_http(client, base_url, device_token, request)?, true))
+        Ok((remote(request)?, true))
     }
 }
 

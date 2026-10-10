@@ -7,6 +7,8 @@
 //! pack is the default and a light build turns features off.
 
 pub mod backend;
+#[cfg(feature = "engine")]
+pub mod engine;
 #[cfg(feature = "bridges")]
 pub mod bridge;
 pub mod error;

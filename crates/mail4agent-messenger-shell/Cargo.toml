@@ -29,7 +29,7 @@ local-bus = ["dep:mail4agent-server"]
 
 [dependencies]
 m4a-seam = { workspace = true }
-m4a-agent = { path = "../m4a-agent", default-features = false }
+m4a-agent = { path = "../m4a-agent", default-features = false, features = ["engine"] }
 mail4agent-messenger = { workspace = true  }
 mail4agent-server = { workspace = true, optional = true }
 mail4agent-grok = { workspace = true  }

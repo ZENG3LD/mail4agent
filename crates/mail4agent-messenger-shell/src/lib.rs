@@ -74,26 +74,26 @@ mod local_bus;
 mod nick;
 mod node;
 pub mod provider;
-mod push;
+mod bus_backend;
 pub mod resolve;
 mod send;
 pub mod store_key;
 
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
-use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use mail4agent_messenger::store::sealed::SealedRecordCodec;
 use mail4agent_messenger::wire::Membership;
 use mail4agent_messenger::{
-    CoreConfig, CoreSecrets, HttpResponseDescriptor, ItemContent, Jitter, MessengerCore,
+    CoreConfig, CoreSecrets, ItemContent, Jitter, MessengerCore,
     MessengerError, OutgoingRequest, OutgoingRequestKind, RecordKey, SealedRecord, SendState,
     StoreError,
 };
 use sha2::{Digest, Sha256};
+use m4a_agent::engine::Driver;
+use m4a_agent::{AgentError, Backend};
 use zeroize::Zeroizing;
 
 pub use machine::{
@@ -120,7 +120,7 @@ pub use provider::{
     SessionKind, Surface, WakeAdapter, WakeError, WakeLetter, WakeOutcome, INBOX_DIR_ENV,
     PROVIDER_ENV,
 };
-pub use push::PushedRoomEvent;
+pub use m4a_agent::engine::PushedRoomEvent;
 pub use send::{
     load_env_file, load_env_file_named, send_cmd_via_socket, send_sock_path, send_sock_path_named,
     send_via_socket,
@@ -710,17 +710,9 @@ fn parse_routine_url(url: &str) -> Result<reqwest::Url, ShellError> {
 /// memory and is zeroed when this value is dropped.
 pub struct OpenedStore {
     dir: PathBuf,
-    core: MessengerCore<SealedRecordCodec>,
-    base_url: reqwest::Url,
+    driver: Driver<SealedRecordCodec>,
     device_token: Zeroizing<String>,
-    client: reqwest::blocking::Client,
-    /// A `/sync` the engine already released, still on the wire. Idle
-    /// long-polls are not joined unless the caller is waiting for events,
-    /// so a 30s timeout does not stall key setup. The request is the one
-    /// the engine built, including its timeout.
-    sync_flight: Option<SyncFlight>,
-    /// Kind and HTTP status of calls this store performed. No bodies.
-    http_trace: Vec<(OutgoingRequestKind, u16)>,
+    base_url: String,
     /// Session id this store was opened with. Also the ACP `sessionId`
     /// when a leader socket is configured. Not a secret.
     session_id: String,
@@ -745,8 +737,6 @@ pub struct OpenedStore {
     leader_sent: HashSet<String>,
     /// Last wake failure, clipped. No bearer and no message body.
     wake_note: Option<String>,
-    /// Peer device key changes seen on `/keys/query` (M3). Plain words, no crypto jargon.
-    security_alerts: Vec<String>,
     wake_log: Vec<WakeAttempt>,
     /// Provider wake chain for a session that has no leader socket
     /// (Codex, Kimi, Claude, Cursor; Claude web / Codex cloud). Uses the
@@ -768,14 +758,6 @@ pub struct OpenedStore {
     /// Joined rooms whose tip page has already landed in this process.
     /// A `/sync` token that has moved past an event will not replay it.
     tip_pulled: HashSet<String>,
-}
-
-struct SyncFlight {
-    id: mail4agent_messenger::RequestId,
-    rx: Receiver<Result<HttpResponseDescriptor, String>>,
-    /// Kept so dropping the store does not detach a blocked poll without
-    /// a handle the process can abandon on exit. Not joined on drop.
-    _worker: JoinHandle<()>,
 }
 
 struct ZeroJitter;
@@ -825,7 +807,7 @@ impl OpenedStore {
         device_id: DeviceId,
         user_id: &str,
         server_name: &str,
-        base_url: &str,
+        backend: Arc<dyn Backend>,
         device_token: &str,
     ) -> Result<Self, ShellError> {
         if session_id.is_empty() {
@@ -838,7 +820,7 @@ impl OpenedStore {
         {
             return Err(ShellError::DeviceToken);
         }
-        let base_url = parse_base_url(base_url)?;
+        let base_url = backend.server_ref().to_string();
         fs_create_dir(dir)?;
         let user_id = UserId::parse(user_id)?;
         let secrets = CoreSecrets {
@@ -858,19 +840,14 @@ impl OpenedStore {
                 Err(err) => return Err(ShellError::Messenger(err)),
             };
         persist(dir, &mut core)?;
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(45))
-            .http1_only()
-            .build()
-            .map_err(|err| ShellError::Http(clip_public(err.to_string())))?;
         let mut opened = Self {
             dir: dir.to_path_buf(),
-            core,
+            driver: Driver::new(core, backend, {
+                let dir = dir.to_path_buf();
+                Box::new(move |core| persist(&dir, core).map_err(|e| AgentError::Store(clip_public(e.to_string()))))
+            }),
             base_url,
             device_token: Zeroizing::new(device_token.to_string()),
-            client,
-            sync_flight: None,
-            http_trace: Vec::new(),
             session_id: session_id.to_string(),
             nick: None,
             routine_url: None,
@@ -884,7 +861,6 @@ impl OpenedStore {
             wake_chain: None,
             wake_route: None,
             wake_note: None,
-            security_alerts: Vec::new(),
             wake_log: Vec::new(),
             bus: None,
             local_peers: Vec::new(),
@@ -924,7 +900,7 @@ impl OpenedStore {
             registered.device_id,
             &registered.user_id,
             server_name,
-            registered.base_url.as_str(),
+            registered.backend,
             &registered.bearer,
         )?;
         opened.nick = Some(registered.nick.clone());
@@ -962,6 +938,10 @@ impl OpenedStore {
     }
 
     /// Bearer for the host keychain. Not written to disk and not logged.
+    pub(crate) fn keep_prefix(&self) -> bool {
+        self.driver.backend().keep_prefix()
+    }
+
     pub fn device_bearer(&self) -> &str {
         self.device_token.as_str()
     }
@@ -979,7 +959,7 @@ impl OpenedStore {
 
     /// Homeserver origin this store performs Client-Server calls against.
     pub fn homeserver_url(&self) -> &str {
-        self.base_url.as_str().trim_end_matches('/')
+        self.base_url.trim_end_matches('/')
     }
 
     /// Whether an ACP leader socket is configured for wake.
@@ -1008,6 +988,8 @@ impl OpenedStore {
     }
 
     pub(crate) fn attach_bus(&mut self, bus: Arc<machine::LocalBus>) {
+        let inner = Arc::clone(self.driver.backend());
+        self.driver.set_backend(Arc::new(bus_backend::BusBackend { inner, bus: Arc::clone(&bus), user_id: self.driver.core.user_id().as_str().to_string(), force_local: None }));
         self.bus = Some(bus);
     }
 
@@ -1023,8 +1005,8 @@ impl OpenedStore {
     /// is not blocked on that poll. The engine retries the sync later. This
     /// does not start another poll.
     pub(crate) fn abandon_inflight_sync(&mut self, now_ms: i64) -> Result<(), ShellError> {
-        if let Some(flight) = self.sync_flight.take() {
-            self.core.on_transport_error(&flight.id, now_ms);
+        if self.driver.sync_inflight() {
+            self.driver.abandon_sync(now_ms);
             self.persist_core()?;
         }
         Ok(())
@@ -1032,7 +1014,7 @@ impl OpenedStore {
 
     /// This account's Matrix user id.
     pub fn user_id(&self) -> &str {
-        self.core.user_id().as_str()
+        self.driver.core.user_id().as_str()
     }
 
     /// Whether `user_id` is a joined member of `room_id` in this store.
@@ -1043,7 +1025,7 @@ impl OpenedStore {
         let Ok(user_id) = UserId::parse(user_id) else {
             return false;
         };
-        self.core.room_state(&room_id).is_some_and(|state| {
+        self.driver.core.room_state(&room_id).is_some_and(|state| {
             state
                 .members
                 .get(&user_id)
@@ -1078,7 +1060,7 @@ impl OpenedStore {
         )?;
         self.drive(now_ms, false)?;
         let mut hits: Vec<FoundSession> = self
-            .core
+            .driver.core
             .user_search_result()
             .iter()
             .filter_map(|entry| {
@@ -1114,13 +1096,13 @@ impl OpenedStore {
     /// Returns the room ids this call asked to join. A room that is not an
     /// `is_direct` invite is left alone. This does not register the inviter.
     pub fn accept_direct_invites(&mut self, mut now_ms: i64) -> Result<Vec<String>, ShellError> {
-        let me = self.core.user_id().clone();
+        let me = self.driver.core.user_id().clone();
         let invited: Vec<RoomId> = self
-            .core
+            .driver.core
             .room_ids()
             .cloned()
             .filter(|room_id| {
-                let Some(state) = self.core.room_state(room_id) else {
+                let Some(state) = self.driver.core.room_state(room_id) else {
                     return false;
                 };
                 state.members.get(&me).is_some_and(|member| {
@@ -1220,7 +1202,7 @@ impl OpenedStore {
     ) -> Result<(UserId, String), ShellError> {
         let found = self.find_nick(name_or_nick, *now_ms)?;
         let peer = UserId::parse(&found.user_id)?;
-        if &peer == self.core.user_id() {
+        if &peer == self.driver.core.user_id() {
             return Err(ShellError::UnknownNick);
         }
         let room_id = if let Some(room_id) = self.dm_room(&peer) {
@@ -1249,11 +1231,11 @@ impl OpenedStore {
     }
 
     fn dm_room(&self, peer: &UserId) -> Option<String> {
-        let me = self.core.user_id().clone();
-        let ids: Vec<RoomId> = self.core.room_ids().cloned().collect();
+        let me = self.driver.core.user_id().clone();
+        let ids: Vec<RoomId> = self.driver.core.room_ids().cloned().collect();
         for room_id in &ids {
             let (joined, has_peer) = {
-                let Some(state) = self.core.room_state(room_id) else {
+                let Some(state) = self.driver.core.room_state(room_id) else {
                     continue;
                 };
                 let joined = state
@@ -1266,7 +1248,7 @@ impl OpenedStore {
             if !joined || !has_peer {
                 continue;
             }
-            if self.core.room_kind(room_id) == Some(RoomKind::Dm) {
+            if self.driver.core.room_kind(room_id) == Some(RoomKind::Dm) {
                 return Some(room_id.as_str().to_string());
             }
         }
@@ -1345,7 +1327,7 @@ impl OpenedStore {
     /// Queues `command` on the engine. It does not perform HTTP; [`Self::drive`]
     /// does that for whatever the engine then releases.
     pub fn dispatch(&mut self, command: MessengerCommand, now_ms: i64) -> Result<(), ShellError> {
-        self.core.dispatch(command, now_ms)?;
+        self.driver.core.dispatch(command, now_ms)?;
         self.persist_core()?;
         Ok(())
     }
@@ -1363,7 +1345,7 @@ impl OpenedStore {
         now_ms: i64,
     ) -> Result<Vec<OutgoingRequest>, ShellError> {
         let room_id = RoomId::parse(room_id)?;
-        self.core.dispatch(
+        self.driver.core.dispatch(
             MessengerCommand::SendMessage {
                 room_id,
                 message: OutgoingMessage {
@@ -1377,13 +1359,13 @@ impl OpenedStore {
             now_ms,
         )?;
         self.persist_core()?;
-        let mut released = self.core.releasable_requests(now_ms);
+        let mut released = self.driver.core.releasable_requests(now_ms);
         self.persist_core()?;
         if !released
             .iter()
             .any(|request| request.kind == OutgoingRequestKind::RoomSend)
         {
-            released.extend(self.core.releasable_requests(now_ms));
+            released.extend(self.driver.core.releasable_requests(now_ms));
             self.persist_core()?;
         }
         Ok(released)
@@ -1399,48 +1381,22 @@ impl OpenedStore {
     /// A homeserver that wakes that poll (this server does) delivers the
     /// event without the shell polling twice.
     pub fn drive(&mut self, now_ms: i64, wait_for_sync: bool) -> Result<(), ShellError> {
-        self.core.decrypt_loaded_timeline();
-        let trace_at = self.http_trace.len();
+        self.driver.core.decrypt_loaded_timeline();
+        let trace_at = self.driver.http_trace.len();
         let history = self.request_missing_history(now_ms)?;
         self.pull_room_tips()?;
         let mut waited_long_poll = false;
-        if wait_for_sync && self.sync_flight.is_some() {
-            // A poll that already finished is a stale catch-up. Do not
-            // count it: the caller is waiting for whatever is current,
-            // which is the next `/sync` this call starts.
-            waited_long_poll = self.harvest_sync(now_ms, true)?;
+        if wait_for_sync && self.driver.sync_inflight() {
+            // A poll that already finished is a stale catch-up. Do not count it: the caller is
+            // waiting for whatever is current, which is the next `/sync` this call starts.
+            waited_long_poll = self.driver.harvest_sync(now_ms, true)?;
         } else {
-            self.harvest_sync(now_ms, false)?;
+            self.driver.harvest_sync(now_ms, false)?;
         }
         self.wake_inbound();
         for _ in 0..24 {
-            let released = self.release_after_flush(now_ms)?;
-            if released.is_empty() {
+            if !self.driver.step(now_ms, wait_for_sync, &mut waited_long_poll)? {
                 break;
-            }
-            let (syncs, others): (Vec<_>, Vec<_>) = released
-                .into_iter()
-                .partition(|request| request.kind == OutgoingRequestKind::Sync);
-            for request in &syncs {
-                self.spawn_sync(request.clone())?;
-            }
-            for request in others {
-                self.roundtrip(&request, now_ms)?;
-            }
-            self.persist_core()?;
-            for request in &syncs {
-                let timeout = sync_timeout_ms(request);
-                let block = timeout == 0 || (wait_for_sync && !waited_long_poll);
-                if block {
-                    self.harvest_sync(now_ms, true)?;
-                    if timeout != 0 {
-                        waited_long_poll = true;
-                    }
-                }
-            }
-            self.persist_core()?;
-            if let Some(err) = self.core.take_ingest_error() {
-                return Err(ShellError::Ingest(clip_public(err)));
             }
             self.wake_inbound();
         }
@@ -1453,21 +1409,21 @@ impl OpenedStore {
     /// Newest page of each joined room, once the timeline is still empty.
     /// [`MessengerCore::pull_latest_page`] does not use the sync token.
     fn pull_room_tips(&mut self) -> Result<(), ShellError> {
-        let me = self.core.user_id().clone();
-        let ids: Vec<RoomId> = self.core.room_ids().cloned().collect();
+        let me = self.driver.core.user_id().clone();
+        let ids: Vec<RoomId> = self.driver.core.room_ids().cloned().collect();
         for room_id in ids {
             if self.tip_pulled.contains(room_id.as_str()) {
                 continue;
             }
             if self
-                .core
+                .driver.core
                 .timeline(&room_id)
                 .is_some_and(|timeline| !timeline.items().is_empty())
             {
                 self.tip_pulled.insert(room_id.as_str().to_string());
                 continue;
             }
-            let joined = self.core.room_state(&room_id).is_some_and(|state| {
+            let joined = self.driver.core.room_state(&room_id).is_some_and(|state| {
                 state
                     .members
                     .get(&me)
@@ -1476,16 +1432,16 @@ impl OpenedStore {
             if !joined {
                 continue;
             }
-            self.core.pull_latest_page(room_id)?;
+            self.driver.core.pull_latest_page(room_id)?;
         }
         Ok(())
     }
 
     fn note_room_tips(&mut self) {
-        let ids: Vec<RoomId> = self.core.room_ids().cloned().collect();
+        let ids: Vec<RoomId> = self.driver.core.room_ids().cloned().collect();
         for room_id in ids {
             if self
-                .core
+                .driver.core
                 .timeline(&room_id)
                 .is_some_and(|timeline| !timeline.items().is_empty())
             {
@@ -1498,15 +1454,15 @@ impl OpenedStore {
     /// store timeline rows, and `/sync?since=` does not replay them. One
     /// backward `/messages` from the stored sync token loads that gap.
     fn request_missing_history(&mut self, now_ms: i64) -> Result<Vec<String>, ShellError> {
-        let me = self.core.user_id().clone();
-        let ids: Vec<RoomId> = self.core.room_ids().cloned().collect();
+        let me = self.driver.core.user_id().clone();
+        let ids: Vec<RoomId> = self.driver.core.room_ids().cloned().collect();
         let mut requested = Vec::new();
         for room_id in ids {
             if !self.room_needs_history(&room_id, &me) {
                 continue;
             }
             let label = room_id.as_str().to_string();
-            self.core
+            self.driver.core
                 .dispatch(MessengerCommand::LoadOlder { room_id }, now_ms)?;
             requested.push(label);
         }
@@ -1518,7 +1474,7 @@ impl OpenedStore {
             return false;
         }
         let joined = match self
-            .core
+            .driver.core
             .room_state(room_id)
             .and_then(|state| state.members.get(me))
         {
@@ -1528,7 +1484,7 @@ impl OpenedStore {
         if !joined {
             return false;
         }
-        match self.core.timeline(room_id) {
+        match self.driver.core.timeline(room_id) {
             Some(timeline) => timeline.items().is_empty(),
             None => true,
         }
@@ -1538,7 +1494,7 @@ impl OpenedStore {
         if requested.is_empty() {
             return;
         }
-        let ok = self.http_trace[trace_at..]
+        let ok = self.driver.http_trace[trace_at..]
             .iter()
             .filter(|(kind, status)| {
                 *kind == OutgoingRequestKind::RoomMessages && (200..300).contains(status)
@@ -1554,12 +1510,12 @@ impl OpenedStore {
 
     /// Rooms this account has state for.
     pub fn rooms(&self) -> Vec<RoomView> {
-        let me = self.core.user_id().clone();
+        let me = self.driver.core.user_id().clone();
         let mut rooms: Vec<RoomView> = self
-            .core
+            .driver.core
             .room_ids()
             .map(|room_id| {
-                let state = self.core.room_state(room_id);
+                let state = self.driver.core.room_state(room_id);
                 let membership = state
                     .and_then(|state| state.members.get(&me))
                     .map(|member| membership_name(&member.membership).to_string())
@@ -1580,8 +1536,8 @@ impl OpenedStore {
     /// are reported as `undecryptable` without their ciphertext.
     pub fn texts(&self) -> Vec<TextView> {
         let mut out = Vec::new();
-        for room_id in self.core.room_ids() {
-            let Some(timeline) = self.core.timeline(room_id) else {
+        for room_id in self.driver.core.room_ids() {
+            let Some(timeline) = self.driver.core.timeline(room_id) else {
                 continue;
             };
             for item in timeline.items() {
@@ -1611,11 +1567,11 @@ impl OpenedStore {
 
     /// HTTP status codes this store has seen, oldest first. Bodies are not kept.
     pub fn sync_inflight(&self) -> bool {
-        self.sync_flight.is_some()
+        self.driver.sync_inflight()
     }
 
     pub fn http_trace(&self) -> Vec<String> {
-        self.http_trace
+        self.driver.http_trace
             .iter()
             .map(|(kind, status)| format!("{kind:?} {status}"))
             .collect()
@@ -1623,192 +1579,23 @@ impl OpenedStore {
 
     /// The last response this core failed to ingest, once.
     pub fn take_ingest_error(&mut self) -> Option<String> {
-        self.core.take_ingest_error().map(clip_public)
+        self.driver.core.take_ingest_error().map(clip_public)
     }
 
     fn persist_core(&mut self) -> Result<(), ShellError> {
-        persist(&self.dir, &mut self.core)
-    }
-
-    fn release_after_flush(&mut self, now_ms: i64) -> Result<Vec<OutgoingRequest>, ShellError> {
-        self.persist_core()?;
-        let mut released = self.core.releasable_requests(now_ms);
-        if released.is_empty() {
-            self.persist_core()?;
-            released = self.core.releasable_requests(now_ms);
-        }
-        Ok(released)
-    }
-
-    fn note_security_events(&mut self, events: &[mail4agent_messenger::MessengerEvent]) {
-        for event in events {
-            if let mail4agent_messenger::MessengerEvent::DeviceKeyChanged { user_id, device_id } = event {
-                self.security_alerts.push(format!(
-                    "{} reset its keys (device {}); trust cleared, room keys re-shared",
-                    user_id.as_str(),
-                    device_id.as_str()
-                ));
-            }
-        }
+        self.driver.persist().map_err(ShellError::from)
     }
 
     /// Drains peer key-change alerts (M3).
     pub fn take_security_alerts(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.security_alerts)
-    }
-
-    fn roundtrip(&mut self, request: &OutgoingRequest, now_ms: i64) -> Result<(), ShellError> {
-        match self.fulfill(request) {
-            Ok(response) => {
-                self.http_trace.push((request.kind, response.status));
-                let events = self.core.on_response(request.id.clone(), response, now_ms);
-                self.note_security_events(&events);
-                Ok(())
-            }
-            Err(err) => {
-                self.core.on_transport_error(&request.id, now_ms);
-                Err(err)
-            }
-        }
-    }
-
-    fn fulfill(&self, request: &OutgoingRequest) -> Result<HttpResponseDescriptor, ShellError> {
-        if let Some(bus) = &self.bus {
-            bus.fulfill(
-                &self.client,
-                &self.base_url,
-                self.device_token.as_str(),
-                self.core.user_id().as_str(),
-                request,
-                None,
-            )
-            .map(|(response, _hit_remote)| response)
-        } else {
-            perform_http(
-                &self.client,
-                &self.base_url,
-                self.device_token.as_str(),
-                request,
-            )
-        }
-    }
-
-    fn spawn_sync(&mut self, request: OutgoingRequest) -> Result<(), ShellError> {
-        if self.sync_flight.is_some() {
-            self.core.on_transport_error(&request.id, 0);
-            return Err(ShellError::Http(
-                "a sync was already on the wire".to_string(),
-            ));
-        }
-        let client = self.client.clone();
-        let base_url = self.base_url.clone();
-        let token = self.device_token.clone();
-        let bus = self.bus.clone();
-        let force_local = self.bus.as_ref().map(|bus| bus.local_only());
-        let user_id = self.core.user_id().as_str().to_string();
-        let id = request.id.clone();
-        let (tx, rx) = mpsc::channel();
-        let worker = thread::spawn(move || {
-            let result = if let Some(bus) = &bus {
-                bus.fulfill(
-                    &client,
-                    &base_url,
-                    token.as_str(),
-                    &user_id,
-                    &request,
-                    force_local,
-                )
-                .map(|(response, _hit_remote)| response)
-            } else {
-                perform_http(&client, &base_url, token.as_str(), &request)
-            };
-            let result = result.map_err(|err| match err {
-                ShellError::Http(text) => text,
-                other => clip_public(other.to_string()),
-            });
-            let _ = tx.send(result);
-        });
-        self.sync_flight = Some(SyncFlight {
-            id,
-            rx,
-            _worker: worker,
-        });
-        Ok(())
-    }
-
-    /// `Ok(true)` only when this call blocked on a poll that had not
-    /// already finished. An already-buffered response is `Ok(false)`.
-    fn harvest_sync(&mut self, now_ms: i64, wait: bool) -> Result<bool, ShellError> {
-        let Some(flight) = self.sync_flight.as_ref() else {
-            return Ok(false);
-        };
-        let (received, blocked) = if wait {
-            match flight.rx.try_recv() {
-                Ok(result) => (Some(result), false),
-                Err(mpsc::TryRecvError::Empty) => {
-                    match flight.rx.recv_timeout(Duration::from_secs(45)) {
-                        Ok(result) => (Some(result), true),
-                        Err(mpsc::RecvTimeoutError::Timeout) => {
-                            let id = flight.id.clone();
-                            self.sync_flight = None;
-                            self.core.on_transport_error(&id, now_ms);
-                            return Err(ShellError::Http("sync timed out".to_string()));
-                        }
-                        Err(mpsc::RecvTimeoutError::Disconnected) => {
-                            let id = flight.id.clone();
-                            self.sync_flight = None;
-                            self.core.on_transport_error(&id, now_ms);
-                            return Err(ShellError::Http("sync worker dropped".to_string()));
-                        }
-                    }
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    let id = flight.id.clone();
-                    self.sync_flight = None;
-                    self.core.on_transport_error(&id, now_ms);
-                    return Err(ShellError::Http("sync worker dropped".to_string()));
-                }
-            }
-        } else {
-            match flight.rx.try_recv() {
-                Ok(result) => (Some(result), false),
-                Err(mpsc::TryRecvError::Empty) => (None, false),
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    let id = flight.id.clone();
-                    self.sync_flight = None;
-                    self.core.on_transport_error(&id, now_ms);
-                    return Err(ShellError::Http("sync worker dropped".to_string()));
-                }
-            }
-        };
-        let Some(result) = received else {
-            return Ok(false);
-        };
-        let flight = self.sync_flight.take().expect("flight present");
-        match result {
-            Ok(response) => {
-                self.http_trace
-                    .push((OutgoingRequestKind::Sync, response.status));
-                let events = self.core.on_response(flight.id, response, now_ms);
-                self.note_security_events(&events);
-            }
-            Err(err) => {
-                self.core.on_transport_error(&flight.id, now_ms);
-                return Err(ShellError::Http(err));
-            }
-        }
-        self.persist_core()?;
-        if let Some(err) = self.core.take_ingest_error() {
-            return Err(ShellError::Ingest(clip_public(err)));
-        }
-        Ok(blocked)
+        std::mem::take(&mut self.driver.security_alerts)
     }
 
     fn inbound_plaintexts(&self) -> Vec<InboundPlaintext> {
-        let me = self.core.user_id();
+        let me = self.driver.core.user_id();
         let mut out = Vec::new();
-        for room_id in self.core.room_ids() {
-            let Some(timeline) = self.core.timeline(room_id) else {
+        for room_id in self.driver.core.room_ids() {
+            let Some(timeline) = self.driver.core.timeline(room_id) else {
                 continue;
             };
             for item in timeline.items() {
@@ -1843,7 +1630,7 @@ impl OpenedStore {
     /// does not invent a nick from the mxid.
     fn sender_nick(&self, room_id: &RoomId, sender: &UserId) -> Option<String> {
         let name = self
-            .core
+            .driver.core
             .room_state(room_id)?
             .members
             .get(sender)?
@@ -2185,7 +1972,7 @@ fn parse_base_url(raw: &str) -> Result<reqwest::Url, ShellError> {
     }
     if url.host_str().is_none()
         || url.query().is_some()
-        || url.fragment().is_some_and(|f| f != KEEP_MATRIX_PREFIX)
+        || url.fragment().is_some()
         || !url.username().is_empty()
         || url.password().is_some()
     {
@@ -2200,21 +1987,23 @@ struct RegisteredSession {
     bearer: Zeroizing<String>,
     /// Identity mode: the nick the operator assigned.
     nick: String,
-    /// Identity mode: the base URL to use (it carries the prefix decision).
-    base_url: reqwest::Url,
+    /// The backend that logged in; it executes this session's requests from now on.
+    backend: Arc<dyn Backend>,
 }
 
 /// Identity mode: the client's own identity logs in by signature (enrolling first when it has to).
 #[cfg(any(feature = "tier-server", feature = "tier-matrix"))]
 fn identity_session(config: &SessionConfig, auth: &IdentityAuth) -> Result<RegisteredSession, ShellError> {
-    use m4a_agent::Backend;
-    let fail = |e: m4a_agent::AgentError| ShellError::Register(clip_public(e.to_string()));
+    let fail = |e: AgentError| ShellError::Register(clip_public(e.to_string()));
+    parse_base_url(&config.homeserver_url)?;
     let ids = m4a_agent::IdentityStore::new(store_key::vault(&config.store_root)?);
-    let mut backend: Box<dyn Backend> = match auth.tier {
+    let backend: Arc<dyn Backend> = match auth.tier {
         #[cfg(feature = "tier-server")]
-        m4a_agent::BackendKind::Server => Box::new(m4a_agent::backend::server::ServerBackend::new(&config.homeserver_url).map_err(fail)?),
+        m4a_agent::BackendKind::Server => Arc::new(m4a_agent::backend::server::ServerBackend::new(&config.homeserver_url).map_err(fail)?),
+        // The domain's `.well-known` may name the real server; the spec prefix and sliding sync are
+        // asked of the server, never assumed.
         #[cfg(feature = "tier-matrix")]
-        m4a_agent::BackendKind::Matrix => Box::new(m4a_agent::backend::matrix::MatrixBackend::new(&config.homeserver_url).map_err(fail)?),
+        m4a_agent::BackendKind::Matrix => Arc::new(m4a_agent::backend::matrix::MatrixBackend::discover(&config.homeserver_url).map_err(fail)?),
         #[allow(unreachable_patterns)]
         _ => return Err(ShellError::Register("this build does not include that tier".into())),
     };
@@ -2223,35 +2012,16 @@ fn identity_session(config: &SessionConfig, auth: &IdentityAuth) -> Result<Regis
     // The invite is spent; the file the operator left is not kept.
     let _ = std::fs::remove_file(invite_path(&config.store_root, &config.session_id));
     ids.adopt_nick(&mut id, &session.nick).map_err(fail)?;
-    let http = |e: reqwest::Error| ShellError::Http(clip_public(e.to_string()));
-    let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(10)).http1_only().build().map_err(http)?;
-    let mut base = parse_base_url(&config.homeserver_url)?;
-    // Tier 3 asks the server whether it serves the spec prefix and keeps it when it does.
-    if auth.tier == m4a_agent::BackendKind::Matrix {
-        let mut probe = base.clone();
-        probe.set_path("/_matrix/client/versions");
-        if client.get(probe).send().map(|r| r.status().is_success()).unwrap_or(false) {
-            base.set_fragment(Some(KEEP_MATRIX_PREFIX));
-        }
-    }
     let (user_id, device_raw) = match (&session.user_id, &session.device_id) {
         (Some(u), Some(d)) => (u.clone(), d.clone()),
         _ => {
-            let url = request_url(&base, "/_matrix/client/v3/account/whoami", &[])?;
-            let resp = client.get(url).header(reqwest::header::AUTHORIZATION, format!("Bearer {}", session.token.as_str())).send().map_err(http)?;
-            let status = resp.status().as_u16();
-            let bytes = resp.bytes().map_err(http)?;
-            if !(200..300).contains(&status) {
-                return Err(ShellError::Register(register_failure(status, &bytes)));
-            }
-            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
-            (v.get("user_id").and_then(|x| x.as_str()).unwrap_or("").to_string(), v.get("device_id").and_then(|x| x.as_str()).unwrap_or("").to_string())
+            backend.whoami().map_err(fail)?
         }
     };
     if user_id.is_empty() || device_raw.is_empty() {
         return Err(ShellError::Register("whoami missed an id".into()));
     }
-    Ok(RegisteredSession { user_id, device_id: DeviceId::parse(&device_raw)?, bearer: session.token.clone(), nick: session.nick, base_url: base })
+    Ok(RegisteredSession { user_id, device_id: DeviceId::parse(&device_raw)?, bearer: session.token.clone(), nick: session.nick, backend })
 }
 
 #[cfg(not(any(feature = "tier-server", feature = "tier-matrix")))]
@@ -2261,110 +2031,6 @@ fn identity_session(_: &SessionConfig, _: &IdentityAuth) -> Result<RegisteredSes
 
 fn register_session(config: &SessionConfig) -> Result<RegisteredSession, ShellError> {
     identity_session(config, &config.identity)
-}
-
-fn register_failure(status: u16, body: &[u8]) -> String {
-    let parsed: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
-    let errcode = parsed
-        .get("errcode")
-        .and_then(|value| value.as_str())
-        .unwrap_or("");
-    let error = parsed
-        .get("error")
-        .and_then(|value| value.as_str())
-        .unwrap_or("");
-    clip_public(format!("status {status} {errcode} {error}"))
-}
-
-fn sync_timeout_ms(request: &OutgoingRequest) -> u64 {
-    request
-        .query
-        .iter()
-        .find(|(name, _)| name == "timeout")
-        .and_then(|(_, value)| value.parse().ok())
-        .unwrap_or(0)
-}
-
-fn perform_http(
-    client: &reqwest::blocking::Client,
-    base_url: &reqwest::Url,
-    device_token: &str,
-    request: &OutgoingRequest,
-) -> Result<HttpResponseDescriptor, ShellError> {
-    let url = request_url(base_url, &request.path, &request.query)?;
-    let method = reqwest::Method::from_bytes(request.method.as_str().as_bytes())
-        .map_err(|_| ShellError::Http("unsupported method".to_string()))?;
-    let mut header = reqwest::header::HeaderValue::from_str(&format!("Bearer {device_token}"))
-        .map_err(|_| ShellError::DeviceToken)?;
-    header.set_sensitive(true);
-    let mut builder = client
-        .request(method, url)
-        .header(reqwest::header::AUTHORIZATION, header);
-    if let Some(body) = &request.body {
-        let bytes = serde_json::to_vec(body).map_err(|err| ShellError::Http(err.to_string()))?;
-        builder = builder
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(bytes);
-    }
-    let response = builder
-        .send()
-        .map_err(|err| ShellError::Http(clip_public(err.to_string())))?;
-    let status = response.status().as_u16();
-    let body = response
-        .bytes()
-        .map_err(|err| ShellError::Http(clip_public(err.to_string())))?
-        .to_vec();
-    Ok(HttpResponseDescriptor { status, body })
-}
-
-/// Marker (as the URL fragment of the base URL) that the server serves the Matrix paths under their
-/// spec prefix `/_matrix`. Without it the prefix is dropped, which is what our own mounts expect.
-/// The client decides by asking the server (`GET /_matrix/client/versions`), never by assuming.
-const KEEP_MATRIX_PREFIX: &str = "keep-matrix-prefix";
-
-/// `/_matrix/client/v3/...` becomes `/client/v3/...` on `base_url`. The
-/// server binary mounts the router at `/client/v3` and does not nest it
-/// under `/_matrix`. A path that is already unprefixed is left alone.
-fn request_url(
-    base_url: &reqwest::Url,
-    path: &str,
-    query: &[(String, String)],
-) -> Result<reqwest::Url, ShellError> {
-    // A server that serves the spec prefix is addressed with it kept (see `KEEP_MATRIX_PREFIX`).
-    let keep_prefix = base_url.fragment() == Some(KEEP_MATRIX_PREFIX);
-    let path = if keep_prefix { path } else { path.strip_prefix("/_matrix").unwrap_or(path) };
-    if !path.starts_with('/') {
-        return Err(ShellError::BaseUrl);
-    }
-    let mut base = base_url.clone();
-    base.set_fragment(None);
-    let mut raw = base.as_str().trim_end_matches('/').to_string();
-    raw.push_str(path);
-    if !query.is_empty() {
-        raw.push('?');
-        for (index, (name, value)) in query.iter().enumerate() {
-            if index > 0 {
-                raw.push('&');
-            }
-            raw.push_str(&percent_encode(name));
-            raw.push('=');
-            raw.push_str(&percent_encode(value));
-        }
-    }
-    reqwest::Url::parse(&raw).map_err(|_| ShellError::BaseUrl)
-}
-
-fn percent_encode(value: &str) -> String {
-    let mut out = String::new();
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char)
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
 }
 
 fn clip_public(text: String) -> String {
@@ -2464,6 +2130,16 @@ pub enum ShellError {
     /// The engine rejected the command or could not load the Olm account.
     #[error(transparent)]
     Messenger(#[from] MessengerError),
+}
+
+impl From<AgentError> for ShellError {
+    fn from(err: AgentError) -> Self {
+        match err {
+            AgentError::Transport(text) => ShellError::Http(text),
+            AgentError::Ingest(text) => ShellError::Ingest(text),
+            other => ShellError::Register(clip_public(other.to_string())),
+        }
+    }
 }
 
 fn persist(dir: &Path, core: &mut MessengerCore<SealedRecordCodec>) -> Result<(), ShellError> {
@@ -2597,7 +2273,12 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::thread;
     use std::time::Instant;
+
+    fn plain(base: &str, token: &str) -> Arc<dyn Backend> {
+        Arc::new(m4a_agent::backend::attached::AttachedBackend::with_prefix(m4a_agent::BackendKind::Server, base, token, false).expect("backend"))
+    }
 
     struct TempDir(PathBuf);
 
@@ -2624,7 +2305,7 @@ mod tests {
             device,
             "@alice:localhost",
             "localhost",
-            "http://127.0.0.1:9",
+            plain("http://127.0.0.1:9", "fake-token"),
             "fake-token",
         )
         .expect("open")
@@ -2643,7 +2324,7 @@ mod tests {
             device,
             "@alice:localhost",
             "localhost",
-            "http://127.0.0.1:9",
+            plain("http://127.0.0.1:9", "fake-token"),
             "fake-token",
         ) {
             Err(ShellError::Store(StoreError::CodecOpen { .. })) => {}
@@ -2676,7 +2357,7 @@ mod tests {
                 device.clone(),
                 "@alice:localhost",
                 "localhost",
-                "http://127.0.0.1:9",
+                plain("http://127.0.0.1:9", bearer),
                 bearer,
             )
         };
@@ -2888,30 +2569,11 @@ mod tests {
     }
 
     #[test]
-    fn the_spec_prefix_is_kept_only_when_the_server_was_found_to_serve_it() {
-        let mut base = parse_base_url("http://127.0.0.1:9").expect("base");
-        let q = [("timeout".to_string(), "5".to_string())];
-        assert_eq!(request_url(&base, "/_matrix/client/v3/sync", &q).unwrap().as_str(), "http://127.0.0.1:9/client/v3/sync?timeout=5");
-        base.set_fragment(Some(KEEP_MATRIX_PREFIX));
-        assert_eq!(request_url(&base, "/_matrix/client/v3/sync", &q).unwrap().as_str(), "http://127.0.0.1:9/_matrix/client/v3/sync?timeout=5");
-        assert!(parse_base_url(base.as_str()).is_ok());
+    fn a_base_url_carries_no_fragment_credentials_or_query() {
+        assert!(parse_base_url("http://127.0.0.1:9").is_ok());
         assert!(parse_base_url("http://127.0.0.1:9/#other").is_err());
-    }
-
-    #[test]
-    fn matrix_path_drops_the_underscore_matrix_prefix() {
-        let base = reqwest::Url::parse("http://127.0.0.1:9").expect("base");
-        let url = request_url(
-            &base,
-            "/_matrix/client/v3/sync",
-            &[("timeout".to_string(), "0".to_string())],
-        )
-        .expect("url");
-        assert_eq!(url.path(), "/client/v3/sync");
-        assert!(!url.path().contains("_matrix"));
-        assert_eq!(url.query(), Some("timeout=0"));
-        let untouched = request_url(&base, "/client/v3/sync", &[]).expect("url");
-        assert_eq!(untouched.path(), "/client/v3/sync");
+        assert!(parse_base_url("http://u:p@127.0.0.1:9").is_err());
+        assert!(parse_base_url("ftp://127.0.0.1:9").is_err());
     }
 
     #[test]
@@ -3035,7 +2697,7 @@ mod tests {
             device,
             "@alice:localhost",
             "localhost",
-            &format!("http://{addr}"),
+            plain(&format!("http://{addr}"), "fake-token"),
             "fake-token",
         )
         .expect("open");
@@ -3275,7 +2937,7 @@ mod tests {
             device,
             "@alice:localhost",
             "localhost",
-            base,
+            plain(base, "fake-token"),
             "fake-token",
         )
         .expect("open")
