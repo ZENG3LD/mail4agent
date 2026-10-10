@@ -74,6 +74,7 @@ mod local_bus;
 mod local_bus;
 mod nick;
 mod webhook;
+pub mod wake_policy;
 #[cfg(feature = "wake-grok")]
 mod node;
 pub mod provider;
@@ -1832,6 +1833,14 @@ impl OpenedStore {
         self.seed_leader_prompted_except_newest(&path);
     }
 
+    /// A one-to-one conversation: at most two joined or invited members and no name.
+    fn room_is_direct(&self, room_id: &str) -> bool {
+        let Some(id) = self.driver.core.room_ids().find(|r| r.as_str() == room_id) else { return false };
+        let Some(state) = self.driver.core.room_state(id) else { return false };
+        let live = state.members.values().filter(|m| matches!(membership_name(&m.membership), "join" | "invite")).count();
+        state.name.is_none() && live <= 2
+    }
+
     #[cfg_attr(not(feature = "wake-grok"), allow(unused_variables))]
     fn wake_inbound(&mut self) {
         if self.routine_url.is_none() && self.leader_sock.is_none() && self.wake_chain.is_none() {
@@ -1859,7 +1868,21 @@ impl OpenedStore {
         let sock = self.leader_sock.clone();
         let cwd = self.leader_cwd.clone();
         let session_id = self.session_id.clone();
-        let items = self.inbound_plaintexts();
+        let policy = crate::wake_policy::WakePolicy::load(self.store_dir());
+        let me_id = self.driver.core.user_id().as_str().to_string();
+        let mut items = self.inbound_plaintexts();
+        // The owner's policy: a message that does not qualify is marked handled, so turning the
+        // wake on later does not replay it.
+        items.retain(|item| {
+            let direct = self.room_is_direct(&item.room_id);
+            let mentioned = crate::wake_policy::addresses(&item.body, self.nick.as_deref(), &me_id);
+            if policy.allows(direct, mentioned) {
+                return true;
+            }
+            self.remember_routine_wake(&item.key);
+            self.remember_leader_prompt(&item.key);
+            false
+        });
         for item in items {
             if let Some(url) = url.as_deref() {
                 // Restart catch-up already remembered keys; skip POSTs.
@@ -1884,6 +1907,7 @@ impl OpenedStore {
                     ) {
                         Ok(()) => {
                             self.remember_routine_wake(&item.key);
+                            crate::wake_policy::note_attempt(self.store_dir(), Some(200));
                             self.wake_log.push(WakeAttempt {
                                 event_id: item.event_id.clone(),
                                 status: Some(200),
@@ -1894,6 +1918,7 @@ impl OpenedStore {
                                 ShellError::RoutineStatus(code) => Some(*code),
                                 _ => None,
                             };
+                            crate::wake_policy::note_attempt(self.store_dir(), status);
                             self.wake_log.push(WakeAttempt {
                                 event_id: item.event_id.clone(),
                                 status,
@@ -3151,6 +3176,28 @@ mod tests {
             "$m1:localhost",
             Some("Alice"),
         );
+    }
+
+    #[test]
+    fn the_owners_policy_silences_a_wake_and_the_silenced_message_is_never_replayed() {
+        let (base, home_done, home) = spawn_homeserver("wake-plain");
+        let (routine, hits, routine_done, routine_thread) = spawn_routine();
+        let dir = temp_dir("wake-policy");
+        let mut store = open_against(&base, &dir.0, "session-a");
+        store.set_wake(SessionWake { routine_url: Some(routine), ..SessionWake::default() });
+        let off = wake_policy::WakePolicy { enabled: false, mode: wake_policy::WakeMode::Mention };
+        off.save(store.store_dir()).expect("policy");
+        store.drive(1_000, false).expect("drive");
+        assert!(store.texts().iter().any(|t| t.body == "wake-plain"), "the text still arrives and can be read");
+        assert!(hits.lock().expect("hits").is_empty(), "a disabled wake posted");
+        // Turning it back on later does not replay what was silenced.
+        wake_policy::WakePolicy::default().save(store.store_dir()).expect("policy");
+        store.drive(3_000, false).expect("drive again");
+        let hits_now = hits.lock().expect("hits").len();
+        drop(store);
+        stop(&routine_done, routine_thread);
+        stop(&home_done, home);
+        assert_eq!(hits_now, 0, "the silenced message was replayed");
     }
 
     #[test]

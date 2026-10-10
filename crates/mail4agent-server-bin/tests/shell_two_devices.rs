@@ -743,6 +743,10 @@ fn three_local_shells_exchange_one_text_in_an_encrypted_group() {
         routine_url: Some(routine.url.clone()),
         ..SessionWake::default()
     });
+    // The owner opted these sessions into waking on every room message (the default is DMs and mentions only).
+    for shell in [&bob, &carol] {
+        mail4agent_messenger_shell::wake_policy::WakePolicy { enabled: true, mode: mail4agent_messenger_shell::wake_policy::WakeMode::All }.save(shell.store_dir()).expect("policy");
+    }
     let mut alice_now = 1_000_000_i64;
     let mut bob_now = 1_000_000_i64;
     let mut carol_now = 1_000_000_i64;
@@ -842,6 +846,10 @@ fn three_local_shells_exchange_one_text_in_a_public_plaintext_channel() {
         routine_url: Some(routine.url.clone()),
         ..SessionWake::default()
     });
+    // The owner opted these sessions into waking on every room message (the default is DMs and mentions only).
+    for shell in [&bob, &carol] {
+        mail4agent_messenger_shell::wake_policy::WakePolicy { enabled: true, mode: mail4agent_messenger_shell::wake_policy::WakeMode::All }.save(shell.store_dir()).expect("policy");
+    }
     let mut alice_now = 2_000_000_i64;
     let mut bob_now = 2_000_000_i64;
     let mut carol_now = 2_000_000_i64;

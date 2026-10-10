@@ -764,7 +764,7 @@ struct StoredWake {
 /// so `Alice` -> `alice`, `Привет мир` -> `privet-mir`).
 /// The routine name and folder are the same string.
 /// `None` when no nick derives.
-fn routine_name_for(session: &HostSession) -> Option<String> {
+pub(crate) fn routine_name_for(session: &HostSession) -> Option<String> {
     crate::nick::nick_from_display_name(session.bot_name.trim()).ok()
 }
 
@@ -932,6 +932,7 @@ fn attach_webhook_routines(
             WakeOutcome::Ready { url, key } => {
                 if let Some(root) = store_root {
                     save_wake(root, &session.session_id, &folder, &url, &key);
+                    crate::wake_policy::note_state(&crate::session_store_dir(root, &session.session_id), "ready", "gateway");
                 }
                 session.routine_url = Some(url);
                 session.routine_bearer = Some(key);
@@ -941,9 +942,14 @@ fn attach_webhook_routines(
                 // says the routine has none.
                 if let Some(root) = store_root {
                     clear_wake(root, &session.session_id);
+                    crate::wake_policy::note_state(&crate::session_store_dir(root, &session.session_id), "awaiting", "gateway");
                 }
             }
-            WakeOutcome::Failed(_) => {}
+            WakeOutcome::Failed(_) => {
+                if let Some(root) = store_root {
+                    crate::wake_policy::note_state(&crate::session_store_dir(root, &session.session_id), "failed", "gateway");
+                }
+            }
         }
     }
     Ok(())
@@ -957,7 +963,7 @@ struct RoutineFile {
 }
 
 /// Reads the owner-placed routine file. The error text names the problem, never a value.
-fn read_routine_file(path: &Path) -> Result<(String, String), String> {
+pub(crate) fn read_routine_file(path: &Path) -> Result<(String, String), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -994,6 +1000,50 @@ fn attach_routine_files(sessions: &mut [HostSession]) {
             Err(reason) => eprintln!("mail4agent: wake {label}: {reason}"),
         }
     }
+}
+
+/// The vault label under which `m4a-agent wake import` keeps a session's webhook `{"url","key"}`.
+pub(crate) fn wake_label(session_id: &str) -> String {
+    format!("wake/{session_id}")
+}
+
+/// Gives every session that still has no wake the one the owner imported into the vault. The
+/// secret never leaves the vault except into this process. A vault that cannot open is logged
+/// without values and leaves the sessions as they are.
+fn attach_vault_wakes(sessions: &mut [HostSession], store_root: &Path) {
+    let pending = |s: &HostSession| !(s.routine_url.is_some() && s.routine_bearer.is_some());
+    if !sessions.iter().any(pending) {
+        return;
+    }
+    let vault = match crate::store_key::vault(store_root) {
+        Ok(v) => v,
+        Err(err) => {
+            eprintln!("mail4agent: wake vault not read: {err}");
+            return;
+        }
+    };
+    for session in sessions.iter_mut().filter(|s| pending(s)) {
+        let Ok(Some(raw)) = vault.get(&wake_label(&session.session_id)) else { continue };
+        #[derive(serde::Deserialize)]
+        struct Held {
+            url: String,
+            key: String,
+        }
+        match serde_json::from_slice::<Held>(&raw) {
+            Ok(h) if !h.key.is_empty() && crate::webhook::url_ok(&h.url) => {
+                session.routine_url = Some(h.url);
+                session.routine_bearer = Some(h.key);
+                crate::wake_policy::note_state(&crate::session_store_dir(store_root, &session.session_id), "ready", "vault");
+                eprintln!("mail4agent: wake {}: taken from the vault", routine_name_for(session).unwrap_or_else(|| session.session_id.clone()));
+            }
+            _ => eprintln!("mail4agent: wake {}: the vault entry is unusable", session.session_id),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn attach_vault_wakes_for_test(sessions: &mut [HostSession], store_root: &Path) {
+    attach_vault_wakes(sessions, store_root)
 }
 
 /// Lock file in each sealed session directory. [`MachineClient::open`]
@@ -1276,6 +1326,8 @@ pub struct MachineClient {
     gateway_token: Option<String>,
     last_agent_poll: std::time::Instant,
     agent_rescan_secs: u64,
+    /// The session record directory this client was opened from (when not from an agents directory).
+    sessions_dir: Option<PathBuf>,
     /// Root for per-session keychain files ([`WAKE_KEYCHAIN_FILE`]).
     store_root: Option<PathBuf>,
     /// [`SKIP_NICKS_ENV`] as read at open.
@@ -1380,6 +1432,7 @@ impl MachineClient {
     ) -> Result<Self, ShellError> {
         let mut sessions = sessions;
         attach_routine_files(&mut sessions);
+        attach_vault_wakes(&mut sessions, store_root);
         if sessions.is_empty() {
             return Err(ShellError::SessionList("session list is empty".to_string()));
         }
@@ -1494,6 +1547,7 @@ impl MachineClient {
             gateway_token: None,
             last_agent_poll: std::time::Instant::now(),
             agent_rescan_secs: 0,
+            sessions_dir: None,
             store_root: None,
             skip_nicks: Vec::new(),
             profile_note: false,
@@ -1556,11 +1610,13 @@ impl MachineClient {
             std::env::var(key).ok().filter(|value| !value.is_empty())
         };
         let agents_dir = explicit_agents_dir(&mut get);
+        let mut sessions_dir_seen: Option<PathBuf> = None;
         let (sessions, agents_dir) = if let Some(dir) = agents_dir {
             (load_web_agents(&dir, &mut get)?, Some(dir))
         } else {
             let sessions_dir = get(SESSIONS_DIR_ENV)
                 .ok_or_else(|| ShellError::SessionList("session directory is unset".to_string()))?;
+            sessions_dir_seen = Some(PathBuf::from(&sessions_dir));
             (load_web_sessions(Path::new(&sessions_dir), &mut get)?, None)
         };
         let sessions = match only {
@@ -1580,6 +1636,10 @@ impl MachineClient {
             }
             None => sessions,
         };
+        // A wake from a file or the vault is known now, so such a session is not "pending".
+        let mut sessions = sessions;
+        attach_routine_files(&mut sessions);
+        attach_vault_wakes(&mut sessions, Path::new(&store_root));
         let gateway_file = get(GATEWAY_FILE_ENV).map(PathBuf::from);
         let gateway_token = get(GATEWAY_TOKEN_ENV);
         let agent_rescan_secs = get(AGENT_RESCAN_SECS_ENV)
@@ -1615,6 +1675,7 @@ impl MachineClient {
         client.gateway_file = gateway_file;
         client.gateway_token = gateway_token;
         client.agent_rescan_secs = agent_rescan_secs;
+        client.sessions_dir = sessions_dir_seen;
         client.last_agent_poll = std::time::Instant::now();
         Ok(client)
     }
@@ -1631,7 +1692,7 @@ impl MachineClient {
     /// passed since the last poll. Reports carry no URL and no key.
     pub fn poll_agent_directory(&mut self) -> Result<Vec<RoutineReport>, ShellError> {
         let Some(agents_dir) = self.agents_dir.clone() else {
-            return Ok(Vec::new());
+            return self.poll_session_dir_wakes();
         };
         if self.agent_rescan_secs > 0 {
             let elapsed = self.last_agent_poll.elapsed().as_secs();
@@ -1717,6 +1778,73 @@ impl MachineClient {
                 folder_id,
                 status: outcome.status(),
             });
+        }
+        Ok(reports)
+    }
+
+    /// For a client opened from a session directory: asks the gateway again, at the rescan interval
+    /// (60 s when none is set), for every session whose agent has no wake yet, so a routine whose key
+    /// the owner (or the agent) provides later starts waking without a restart. Without a gateway
+    /// file or token nothing is asked. Reports carry no URL and no key.
+    fn poll_session_dir_wakes(&mut self) -> Result<Vec<RoutineReport>, ShellError> {
+        let Some(dir) = self.sessions_dir.clone() else {
+            return Ok(Vec::new());
+        };
+        if self.pending_wakes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let every = if self.agent_rescan_secs > 0 { self.agent_rescan_secs } else { 60 };
+        if self.last_agent_poll.elapsed().as_secs() < every {
+            return Ok(Vec::new());
+        }
+        self.last_agent_poll = std::time::Instant::now();
+        let Some(gateway) = self.gateway_file.clone() else {
+            return Ok(Vec::new());
+        };
+        let Some(gate) = open_gateway(&gateway, self.gateway_token.as_deref())? else {
+            return Ok(Vec::new());
+        };
+        let mut sessions = load_session_records(&dir)?;
+        apply_session_ids(&mut sessions, &self.session_ids);
+        let mut reports = Vec::new();
+        for session in &sessions {
+            let Some(agent_id) = session.agent_id.clone() else { continue };
+            if !self.pending_wakes.iter().any(|p| p.agent_id == agent_id) {
+                continue;
+            }
+            let Some(nick) = routine_name_for(session) else { continue };
+            let folder_id = crate::nick::routine_folder_id(&nick).unwrap_or_default();
+            let outcome = ensure_wake(&gate, &agent_id, &nick);
+            log_outcome(&nick, &folder_id, &outcome);
+            let dir_of = self.store_root.as_ref().map(|r| crate::session_store_dir(r, &session.session_id));
+            match &outcome {
+                WakeOutcome::Ready { url, key } => {
+                    if let Some(root) = &self.store_root {
+                        save_wake(root, &session.session_id, &folder_id, url, key);
+                    }
+                    if let Some(d) = &dir_of {
+                        crate::wake_policy::note_state(d, "ready", "gateway");
+                    }
+                    if let Some(index) = self.pending_wakes.iter().position(|p| p.agent_id == agent_id) {
+                        let pending = self.pending_wakes.remove(index);
+                        if let Some(store) = self.sessions.iter_mut().find(|s| s.store_dir() == pending.store_dir) {
+                            store.set_wake(SessionWake { routine_url: Some(url.clone()), routine_bearer: Some(key.clone()), leader_sock: None, leader_cwd: None });
+                        }
+                    }
+                    self.ready_agents.insert(agent_id.clone());
+                }
+                WakeOutcome::AwaitingBackend => {
+                    if let Some(d) = &dir_of {
+                        crate::wake_policy::note_state(d, "awaiting", "gateway");
+                    }
+                }
+                WakeOutcome::Failed(_) => {
+                    if let Some(d) = &dir_of {
+                        crate::wake_policy::note_state(d, "failed", "gateway");
+                    }
+                }
+            }
+            reports.push(RoutineReport { agent_id, nick, folder_id, status: outcome.status() });
         }
         Ok(reports)
     }
