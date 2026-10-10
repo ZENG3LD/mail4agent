@@ -18,6 +18,7 @@ pub mod events;
 #[cfg(feature = "f3-hash-ids")]
 pub mod f3;
 pub mod fed_edus;
+pub mod schema_guard;
 pub mod fed_rooms;
 pub mod federation;
 pub mod http;

@@ -402,7 +402,15 @@ fn decode_enum<T>(idx: usize, column: &'static str, raw: &str, parse: fn(&str) -
 /// global account data, and `''` never matches a real room id, so keeping
 /// the foreign key would make every global upsert fail once `PRAGMA
 /// foreign_keys=ON` is set (as [`init_messenger_db`] does).
+/// Creates (or brings up to date) every table of the server. Refuses a database written by a newer
+/// build and snapshots an older one first; see [`crate::schema_guard`].
 pub fn create_matrix_schema(conn: &Connection) -> rusqlite::Result<()> {
+    crate::schema_guard::enter(conn)?;
+    create_matrix_schema_tables(conn)?;
+    crate::schema_guard::leave(conn)
+}
+
+fn create_matrix_schema_tables(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         r#"
         -- Global stream ordering — see this module's doc comment on the
