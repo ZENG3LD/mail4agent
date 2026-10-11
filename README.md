@@ -312,6 +312,8 @@ loop + ACP wake). Docs live in the project docs, not in this
 repository: `docs/mail4agent/local-acp-client.md`,
 `docs/mail4agent/local-grok-bootstrap.md`.
 
+See `docs/0.4.8-client-and-light-server.md` for daemon recovery, `m4a create --public` / `m4a power`, the durable local tier (`M4A_LOCAL_BUS_DB`) and the light server build (`scripts/check-light-server.sh`).
+
 ## Status
 
 Working. Send, threaded reply, room delivery, acknowledgement, unread counts
