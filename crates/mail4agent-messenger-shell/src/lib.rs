@@ -104,7 +104,7 @@ pub use machine::{
     ensure_agent_webhook_routines, ensure_agent_webhook_routines_from_env, load_agents_dir,
     load_session_records, HostSession, MachineClient, RoutineReport, TickReport, WakeOptions,
     WakeStatus, AGENTS_DIR_ENV, AGENT_RESCAN_SECS_ENV, DEFAULT_AGENTS_DIR,
-    PROFILE_NOTE_ENV, SESSIONS_DIR_ENV, SESSION_IDS_ENV, SKIP_NICKS_ENV, STORE_LOCK_FILE,
+    LOCAL_BUS_ENV, PROFILE_NOTE_ENV, SESSIONS_DIR_ENV, SESSION_IDS_ENV, SKIP_NICKS_ENV, STORE_LOCK_FILE,
     WAKE_KEYCHAIN_FILE,
 };
 pub use mail4agent_messenger::{
