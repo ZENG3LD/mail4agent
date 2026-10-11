@@ -1327,6 +1327,11 @@ pub(crate) struct Prepared {
 
 /// The sessions on one machine, and the in-process bus they use when the
 /// peer is one of them.
+/// A dead push socket is tried again no sooner than this many seconds after the last try.
+const PUSH_RETRY_SECS: u64 = 5;
+/// After this many consecutive ticks with a failing session the push socket is rebuilt too.
+const HEAL_AFTER_FAILED_TICKS: u32 = 5;
+
 pub struct MachineClient {
     /// Product-session mode: one push socket per session (a handshake is vouched for one identity).
     product_mode: bool,
@@ -1373,6 +1378,10 @@ pub struct MachineClient {
     /// Session ids whose late open failed, and when. Retried after
     /// [`LATE_OPEN_RETRY_SECS`].
     failed_opens: HashMap<String, std::time::Instant>,
+    /// When a dead push socket was last tried again ([`PUSH_RETRY_SECS`] apart).
+    last_push_retry: std::time::Instant,
+    /// Consecutive [`Self::tick`]s in which at least one session failed to drive.
+    error_streak: u32,
 }
 
 /// How long [`MachineClient::poll_agent_directory`] waits before trying
@@ -1577,6 +1586,8 @@ impl MachineClient {
             homeserver_url: homeserver_url.to_string(),
             bus_next_user: prepared.len() as i64 + 1,
             failed_opens: HashMap::new(),
+            last_push_retry: std::time::Instant::now(),
+            error_streak: 0,
         })
     }
 
@@ -1985,27 +1996,8 @@ impl MachineClient {
         self.sessions.push(store);
         self._locks.push(lock);
         self.refresh_local_peers();
-        let tokens: Vec<String> = self
-            .sessions
-            .iter()
-            .map(|store| store.device_bearer().to_string())
-            .collect();
-        match m4a_agent::engine::PushLink::open(&self.homeserver_url, self.sessions.first().is_some_and(|s| s.keep_prefix()), tokens, self.product_mode) {
-            Ok(push) => {
-                let old = std::mem::replace(&mut self.push, push);
-                for (recipient, event) in old.drain() {
-                    if let Some(store) = self
-                        .sessions
-                        .iter_mut()
-                        .find(|store| store.user_id() == recipient)
-                    {
-                        store.record_push(event);
-                    }
-                }
-            }
-            Err(err) => {
-                eprintln!("mail4agent: push socket not reopened for {nick}: {err}");
-            }
+        if let Err(err) = self.reopen_push() {
+            eprintln!("mail4agent: push socket not reopened for {nick}: {err}");
         }
         if let Some(agent_id) = session.agent_id.clone() {
             if item.routine_url.is_some() && item.routine_bearer.is_some() {
@@ -2023,6 +2015,40 @@ impl MachineClient {
             }
         }
         Ok(())
+    }
+
+    /// Opens a fresh push socket for every open session and swaps it in; what the old one still
+    /// held is handed to its sessions first. The old socket stays if the new one fails.
+    fn reopen_push(&mut self) -> Result<(), ShellError> {
+        let tokens: Vec<String> = self.sessions.iter().map(|store| store.device_bearer().to_string()).collect();
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        let keep_prefix = self.sessions.first().is_some_and(|s| s.keep_prefix());
+        let push = m4a_agent::engine::PushLink::open(&self.homeserver_url, keep_prefix, tokens, self.product_mode)?;
+        let old = std::mem::replace(&mut self.push, push);
+        for (recipient, event) in old.drain() {
+            if let Some(store) = self.sessions.iter_mut().find(|store| store.user_id() == recipient) {
+                store.record_push(event);
+            }
+        }
+        Ok(())
+    }
+
+    /// Brings the push socket back when it died (server restart, network loss) or when sessions
+    /// keep failing to drive; tried at most every [`PUSH_RETRY_SECS`]. Returns true on a new socket.
+    fn heal_push(&mut self) -> bool {
+        let wanted = !self.push.is_alive() || self.error_streak >= HEAL_AFTER_FAILED_TICKS;
+        if !wanted || self.bus.local_only() || self.last_push_retry.elapsed().as_secs() < PUSH_RETRY_SECS {
+            return false;
+        }
+        self.last_push_retry = std::time::Instant::now();
+        self.reopen_push().is_ok()
+    }
+
+    /// Consecutive failed ticks seen so far (zero after a clean one); the daemon backs off on it.
+    pub fn error_streak(&self) -> u32 {
+        self.error_streak
     }
 
     /// Every open session sees every other one as a local peer.
@@ -2172,6 +2198,9 @@ impl MachineClient {
     pub fn tick(&mut self, now_ms: i64, full_drive_secs: u64) -> TickReport {
         let mut report = TickReport::default();
         let mut due: Vec<usize> = Vec::new();
+        if self.heal_push() {
+            report.alerts.push((String::new(), "push socket was down and is open again".to_string()));
+        }
         for (recipient, event) in self.push.drain() {
             let Some(index) = self
                 .sessions
@@ -2217,6 +2246,7 @@ impl MachineClient {
                 Err(err) => report.errors.push((nick, err.to_string())),
             }
         }
+        self.error_streak = if report.errors.is_empty() { 0 } else { self.error_streak.saturating_add(1) };
         self.serve_sends(now_ms, &mut report);
         if self.bus.local_only() {
             // A send or a join just changed the local room: let every session see it now.

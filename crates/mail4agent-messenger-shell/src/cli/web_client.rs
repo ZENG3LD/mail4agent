@@ -16,6 +16,9 @@
 use crate::MachineClient;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// Streak at which the log says once more that the daemon is still retrying.
+const HEAL_LOG_STREAK: u32 = 10;
+
 fn env_secs(key: &str, default: u64) -> u64 {
     std::env::var(key)
         .ok()
@@ -88,6 +91,13 @@ pub fn run(_args: Vec<String>) {
             println!("run time reached; exiting");
             break;
         }
-        std::thread::sleep(Duration::from_millis(250));
+        // Sessions keep failing (homeserver down or restarting): back off instead of hammering it,
+        // up to 10 s. The client rebuilds its push socket itself and the next clean tick resets this.
+        let streak = client.error_streak();
+        if streak == 1 || streak == HEAL_LOG_STREAK {
+            eprintln!("homeserver unreachable or failing; backing off and retrying on its own");
+        }
+        let pause_ms = if streak == 0 { 250 } else { (250u64 << streak.min(6)).min(10_000) };
+        std::thread::sleep(Duration::from_millis(pause_ms));
     }
 }
