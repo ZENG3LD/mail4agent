@@ -157,6 +157,7 @@ pub fn note_attempt(store_dir: &Path, status: Option<u16>) {
     let mut s = WakeStatusFile::load(store_dir).unwrap_or_default();
     if s.state.is_empty() {
         s.state = "ready".into();
+        s.source = "config".into();
     }
     s.last_status = status;
     s.last_event_ms = Some(now_ms());

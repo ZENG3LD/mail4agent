@@ -105,6 +105,10 @@ pub(crate) fn under_home(rel: &str) -> PathBuf {
 
 /// Optional rescan period in seconds for [`MachineClient::poll_agent_directory`].
 /// Unset or `0` means the caller decides when to poll; open still scans once.
+/// `1`/`on`: the sessions this client holds reach each other through the in-process bus and the
+/// homeserver is not called after opening (registration at open still uses it). A peer that is not a
+/// session of this client is then unreachable; leave it off for ordinary operation.
+pub const LOCAL_BUS_ENV: &str = "M4A_LOCAL_BUS";
 pub const AGENT_RESCAN_SECS_ENV: &str = "M4A_AGENT_RESCAN_SECS";
 
 /// One bot session the host says lives on this machine.
@@ -992,7 +996,7 @@ pub(crate) fn read_routine_file(path: &Path) -> Result<(String, String), String>
 /// Gives every session that names a `routine_file` its wake from that file. A session that already
 /// holds a URL and a bearer is left alone. A refusal is logged without values and leaves the
 /// session without a wake (messages still arrive and can be read).
-fn attach_routine_files(sessions: &mut [HostSession]) {
+fn attach_routine_files(sessions: &mut [HostSession], store_root: Option<&Path>) {
     for session in sessions.iter_mut() {
         let Some(path) = session.routine_file.clone() else { continue };
         if session.routine_url.is_some() && session.routine_bearer.is_some() {
@@ -1003,6 +1007,9 @@ fn attach_routine_files(sessions: &mut [HostSession]) {
             Ok((url, key)) => {
                 session.routine_url = Some(url);
                 session.routine_bearer = Some(key);
+                if let Some(root) = store_root {
+                    crate::wake_policy::note_state(&crate::session_store_dir(root, &session.session_id), "ready", "file");
+                }
                 eprintln!("mail4agent: wake {label}: routine file read");
             }
             Err(reason) => eprintln!("mail4agent: wake {label}: {reason}"),
@@ -1439,7 +1446,7 @@ impl MachineClient {
         lenient: bool,
     ) -> Result<Self, ShellError> {
         let mut sessions = sessions;
-        attach_routine_files(&mut sessions);
+        attach_routine_files(&mut sessions, Some(store_root));
         attach_vault_wakes(&mut sessions, store_root);
         if sessions.is_empty() {
             return Err(ShellError::SessionList("session list is empty".to_string()));
@@ -1646,7 +1653,7 @@ impl MachineClient {
         };
         // A wake from a file or the vault is known now, so such a session is not "pending".
         let mut sessions = sessions;
-        attach_routine_files(&mut sessions);
+        attach_routine_files(&mut sessions, Some(Path::new(&store_root)));
         attach_vault_wakes(&mut sessions, Path::new(&store_root));
         let gateway_file = get(GATEWAY_FILE_ENV).map(PathBuf::from);
         let gateway_token = get(GATEWAY_TOKEN_ENV);
@@ -1684,6 +1691,12 @@ impl MachineClient {
         client.gateway_token = gateway_token;
         client.agent_rescan_secs = agent_rescan_secs;
         client.sessions_dir = sessions_dir_seen;
+        if get(LOCAL_BUS_ENV).is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes")) {
+            #[cfg(feature = "local-bus")]
+            client.set_local_delivery(true);
+            #[cfg(not(feature = "local-bus"))]
+            return Err(ShellError::SessionList("M4A_LOCAL_BUS needs a build with feature local-bus".to_string()));
+        }
         client.last_agent_poll = std::time::Instant::now();
         Ok(client)
     }
@@ -2471,7 +2484,7 @@ mod tests {
 
         // Owner-only file with a good pair: the session gets URL and bearer.
         write(r#"{"url":"http://127.0.0.1:9/hook","key":"k-secret"}"#, 0o600);
-        attach_routine_files(&mut set);
+        attach_routine_files(&mut set, None);
         assert_eq!(set[0].routine_url.as_deref(), Some("http://127.0.0.1:9/hook"));
         assert_eq!(set[0].routine_bearer.as_deref(), Some("k-secret"));
         assert!(!format!("{:?}", set[0]).contains("k-secret"), "Debug must not show the key");
@@ -2482,14 +2495,28 @@ mod tests {
             let err = read_routine_file(&file).expect_err("refused");
             assert!(!err.contains("k-secret") && !err.contains("127.0.0.1"), "{err}");
             let mut one = vec![HostSession::new("Courier", "web-courier").with_routine_file(&file)];
-            attach_routine_files(&mut one);
+            attach_routine_files(&mut one, None);
             assert!(one[0].routine_url.is_none() && one[0].routine_bearer.is_none());
         }
         // A session that already holds a wake keeps it.
         write(r#"{"url":"http://127.0.0.1:9/other","key":"k2"}"#, 0o600);
         let mut held = vec![HostSession::new("Courier", "web-courier").with_routine_file(&file).with_routine("http://127.0.0.1:9/mine", Some("mine".into()))];
-        attach_routine_files(&mut held);
+        attach_routine_files(&mut held, None);
         assert_eq!(held[0].routine_url.as_deref(), Some("http://127.0.0.1:9/mine"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_wake_from_a_routine_file_is_recorded_with_its_source() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("dir");
+        let file = dir.path().join("wake.json");
+        std::fs::write(&file, r#"{"url":"http://127.0.0.1:9/hook","key":"k"}"#).expect("write");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).expect("mode");
+        let mut set = vec![HostSession::new("Courier", "web-courier").with_routine_file(&file)];
+        attach_routine_files(&mut set, Some(dir.path()));
+        let status = crate::wake_policy::WakeStatusFile::load(&crate::session_store_dir(dir.path(), "web-courier")).expect("status");
+        assert_eq!((status.state.as_str(), status.source.as_str()), ("ready", "file"));
     }
 
     #[test]
