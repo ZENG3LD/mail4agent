@@ -295,6 +295,13 @@ impl OlmAccountState {
         Ok(Some(OutgoingRequest::keys_upload(id, Value::Object(body))))
     }
 
+    /// Makes the next upload carry the device identity keys again. A server that has never seen this
+    /// device (a second homeserver, such as an in-process one) needs them before it can answer a
+    /// `keys/query` or hand out a one-time key for it.
+    pub fn forget_published_device_keys(&mut self) {
+        self.device_keys_published = false;
+    }
+
     /// Marks every one-time/fallback key currently unpublished as published,
     /// and marks `device_keys_published` `true` -- call once a
     /// `/keys/upload` response has actually arrived successfully. The
