@@ -166,7 +166,7 @@ impl OpenedStore {
                     return CmdReply::ok(json!({ "room": room.as_str(), "event_id": row.event_id }));
                 }
                 if row.outcome.starts_with("failed") {
-                    return CmdReply::failed("send failed");
+                    return CmdReply::failed(format!("send {}", row.outcome));
                 }
             }
         }

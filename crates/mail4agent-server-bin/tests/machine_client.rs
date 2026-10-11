@@ -444,6 +444,25 @@ fn one_client_local_dm_skips_homeserver_remote_session_uses_it() {
         "privet-mir",
         "local-dm-plaintext",
     );
+    // The way back: the peer answers into the same encrypted room and the first sender decrypts it.
+    let back = {
+        let mut now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+        client.session_mut("privet-mir").expect("chief").write_to_nick("alice", "local-dm-answer", now).unwrap_or_else(|err| panic!("local answer: {err}"));
+        let mut found = None;
+        for _ in 0..12 {
+            // As the daemon does: its tick drives every session without waiting.
+            now += 1_000;
+            let _ = client.tick(now, 0);
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let alice = client.session_mut("alice").expect("alice");
+            if let Some(row) = alice.texts().iter().find(|t| t.body == "local-dm-answer") {
+                found = row.event_id.clone();
+                break;
+            }
+        }
+        found.unwrap_or_else(|| panic!("the way back did not decrypt; {}", describe(client.session_mut("alice").expect("alice"))))
+    };
+    println!("local_answer_event_id={back}");
     let hits_after_local = client.homeserver_hits();
     client.set_local_delivery(false);
     assert_eq!(

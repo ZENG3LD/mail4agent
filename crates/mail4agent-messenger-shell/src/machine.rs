@@ -2180,7 +2180,9 @@ impl MachineClient {
                 due.push(index);
             }
         }
-        let full = self.last_full_drive.elapsed().as_secs() >= full_drive_secs;
+        // With the in-process bus nothing waits on a network, so every tick is a full drive: an answer
+        // needs several rounds (invite, join, device keys, room key) and one round per period took minutes.
+        let full = self.last_full_drive.elapsed().as_secs() >= full_drive_secs || self.bus.local_only();
         if full {
             self.last_full_drive = std::time::Instant::now();
         }
@@ -2209,6 +2211,15 @@ impl MachineClient {
             }
         }
         self.serve_sends(now_ms, &mut report);
+        if self.bus.local_only() {
+            // A send or a join just changed the local room: let every session see it now.
+            for round in 1..=4 {
+                for store in self.sessions.iter_mut() {
+                    let _ = store.drive(now_ms + round, false);
+                    let _ = store.accept_direct_invites(now_ms + round);
+                }
+            }
+        }
         report
     }
 
