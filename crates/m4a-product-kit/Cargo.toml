@@ -18,7 +18,7 @@ matrix-address-door = []
 
 [dependencies]
 # Storage engine (published crate): SQLCipher via `cipher-native`, one writer, WAL, batched writes.
-tesserax-store = { version = "0.1.1", features = ["cipher-native"], optional = true }
+tesserax-store = { version = "0.1.2", features = ["cipher-native"], optional = true }
 m4a-seam = { workspace = true  }
 axum = { version = "0.8", features = ["json", "ws"] }
 tokio-tungstenite = "0.29"
