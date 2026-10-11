@@ -27,7 +27,7 @@ m4a-product-kit = { workspace = true  }
 m4a-seam = { workspace = true  }
 axum = { version = "0.8", features = ["json"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal"] }
-tesserax-store = { version = "0.1.1", features = ["cipher-native"] }
+tesserax-store = { version = "0.1.2", features = ["cipher-native"] }
 argon2 = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -29,8 +29,8 @@ f3-hash-ids = ["dep:m4a-matrix-core"]
 m4a-matrix-core = { workspace = true, optional = true }
 # Storage engine: one writer, bounded parallel readers, SQLCipher (the published crate; its
 # `cipher-native` feature selects the SQLCipher build of rusqlite, there is no plaintext build here).
-tesserax-store = { version = "0.1.1", features = ["cipher-native"] }
-rusqlite = { version = "0.32", features = ["backup"] }
+tesserax-store = { version = "0.1.2", features = ["cipher-native"] }
+rusqlite = { version = "0.36", features = ["backup"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"

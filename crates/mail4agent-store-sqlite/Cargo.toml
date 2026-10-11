@@ -12,7 +12,7 @@ mail4agent-core = { workspace = true  }
 # pragmas, versioned migrations, blocking read/write helpers. No longer
 # borrowed from an internal build-framework dependency (see `db.rs`'s own
 # module doc comment) -- `bundled` so a consumer needs no system SQLite.
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.36", features = ["bundled"] }
 # `Db`'s single connection is guarded by a `tokio::sync::Mutex` so
 # `read_blocking`/`write_blocking` can wait on it from a plain sync thread
 # (the daemon reaches them through `tokio::task::spawn_blocking`) without
