@@ -91,6 +91,11 @@ impl Live {
     pub fn wait_for_news(&self, timeout: Duration) -> Result<News> {
         {
             let mut slot = self.push.lock().unwrap_or_else(|e| e.into_inner());
+            // A socket that died is dropped and opened again below (it never revives by itself).
+            if slot.as_ref().is_some_and(|link| !link.is_alive()) {
+                *slot = None;
+                *self.push_unavailable.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
             if slot.is_none() {
                 // A failed attempt is not repeated for a while.
                 if self.push_unavailable.lock().unwrap_or_else(|e| e.into_inner()).is_some_and(|t| t.elapsed() < Duration::from_secs(60)) {
