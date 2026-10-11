@@ -2594,6 +2594,12 @@ impl<C: RecordCodec> MessengerCore<C> {
         }
     }
 
+    /// Asks for the device identity keys to be published again with the next sync. See
+    /// [`crate::crypto::account::OlmAccountState::forget_published_device_keys`].
+    pub fn republish_device_keys(&mut self) {
+        self.account.forget_published_device_keys();
+    }
+
     fn ingest_sync(&mut self, response: &crate::wire::sync::SyncResponse) -> Result<(), MessengerError> {
         let mut newly_received_sessions: Vec<(RoomId, String)> = Vec::new();
 

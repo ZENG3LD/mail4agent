@@ -2095,8 +2095,15 @@ impl MachineClient {
     /// and a group with a remote member already do. An encrypted direct
     /// room between two local sessions uses the bus while this is on, and
     /// the room stays encrypted.
-    pub fn set_local_delivery(&self, enabled: bool) {
+    pub fn set_local_delivery(&mut self, enabled: bool) {
         self.bus.set_local_only(enabled);
+        if enabled {
+            // The in-process homeserver has never seen the device keys these sessions published to the
+            // real one; without them it cannot answer a key query, so no room key could be sent.
+            for store in self.sessions.iter_mut() {
+                store.driver.core.republish_device_keys();
+            }
+        }
     }
 
     /// Homeserver calls counted across every session since [`Self::open`].

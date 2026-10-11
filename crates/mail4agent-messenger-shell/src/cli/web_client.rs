@@ -47,7 +47,7 @@ pub fn run(_args: Vec<String>) {
     let drive_secs = env_secs("M4A_DRIVE_SECS", 15);
     let run_secs = env_secs("M4A_RUN_SECS", 0);
     let started = Instant::now();
-    let mut seen = 0usize;
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     loop {
         let report = client.tick(now_ms(), drive_secs);
         for (nick, event_id) in &report.pushed {
@@ -69,15 +69,18 @@ pub fn run(_args: Vec<String>) {
         for (nick, err) in &report.errors {
             eprintln!("drive {nick}: {err}");
         }
+        // The log is per session, flattened: count what was printed for each nick, not overall.
         let log = client.wake_log();
-        for (nick, attempt) in log.iter().skip(seen) {
-            let status = attempt
-                .status
-                .map(|code| code.to_string())
-                .unwrap_or_else(|| "none".to_string());
-            println!("wake {nick} event={} status={status}", attempt.event_id);
+        let mut now_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for (nick, attempt) in &log {
+            let n = now_counts.entry(nick.clone()).or_insert(0);
+            *n += 1;
+            if *n > seen.get(nick).copied().unwrap_or(0) {
+                let status = attempt.status.map(|code| code.to_string()).unwrap_or_else(|| "none".to_string());
+                println!("wake {nick} event={} status={status}", attempt.event_id);
+            }
         }
-        seen = log.len();
+        seen = now_counts;
         if let Err(err) = client.poll_agent_directory() {
             eprintln!("agent poll: {err}");
         }
