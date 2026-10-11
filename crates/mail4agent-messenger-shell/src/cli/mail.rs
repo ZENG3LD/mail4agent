@@ -65,6 +65,8 @@ pub fn run(args: Vec<String>) {
     let mut as_json = false;
     let mut n: Option<u64> = None;
     let mut channel = false;
+    let mut public = false;
+    let mut default_level: Option<i64> = None;
     let mut invite: Vec<String> = Vec::new();
     let mut pos: Vec<String> = Vec::new();
     let mut args = args.clone().into_iter();
@@ -74,9 +76,11 @@ pub fn run(args: Vec<String>) {
             "--json" => as_json = true,
             "-n" => n = args.next().and_then(|v| v.parse().ok()),
             "--channel" => channel = true,
+            "--public" => public = true,
+            "--default" => default_level = args.next().and_then(|v| v.parse().ok()),
             "--invite" => invite = args.next().unwrap_or_default().split(',').map(str::to_string).collect(),
             "-h" | "--help" => {
-                println!("usage: m4a [--as NICK] [--json] rooms | read <room> [-n N] | send <room> <text> | reply <room> <event> <text> | mentions | thread <room> <event> | join|leave <room> | create <name> [--channel] [--invite ids] | invite <room> <user>");
+                println!("usage: m4a [--as NICK] [--json] rooms | read <room> [-n N] | send <room> <text> | reply <room> <event> <text> | mentions | thread <room> <event> | join|leave <room> | create <name> [--channel | --public] [--invite ids] | power <room> [--default N] [<user> <level>] | invite <room> <user>");
                 return;
             }
             _ => pos.push(arg),
@@ -84,7 +88,7 @@ pub fn run(args: Vec<String>) {
     }
     let Some(as_nick) = as_nick else { fail(2, "--as NICK (or M4A_AS) is required") };
     if pos.is_empty() {
-        fail(2, "command is required (rooms, read, send, reply, mentions, thread, join, leave, create, invite)");
+        fail(2, "command is required (rooms, read, send, reply, mentions, thread, join, leave, create, power, invite)");
     }
     let sub = pos.remove(0);
     let need = |i: usize, what: &str| -> String {
@@ -99,7 +103,19 @@ pub fn run(args: Vec<String>) {
         "thread" => ("threads.read", json!({ "room": need(0, "room"), "event": need(1, "event id") })),
         "join" => ("rooms.join", json!({ "room": need(0, "room") })),
         "leave" => ("rooms.leave", json!({ "room": need(0, "room") })),
-        "create" => ("rooms.create", json!({ "name": need(0, "name"), "kind": if channel { "channel" } else { "group" }, "invite": invite })),
+        "create" => ("rooms.create", json!({ "name": need(0, "name"), "kind": if public { "public" } else if channel { "channel" } else { "group" }, "invite": invite })),
+        "power" => {
+            let mut a = json!({ "room": need(0, "room") });
+            if let Some(level) = default_level {
+                a["events_default"] = json!(level);
+            }
+            if pos.len() > 1 {
+                let level: i64 = need(2, "level").parse().unwrap_or_else(|_| fail(2, "level must be a number"));
+                a["user"] = json!(need(1, "user"));
+                a["level"] = json!(level);
+            }
+            ("rooms.power", a)
+        }
         "invite" => ("rooms.invite", json!({ "room": need(0, "room"), "user": need(1, "user") })),
         other => fail(2, &format!("unknown command {other}")),
     };

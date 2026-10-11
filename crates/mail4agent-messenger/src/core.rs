@@ -444,6 +444,20 @@ pub enum MessengerCommand {
         /// Why, if given.
         reason: Option<String>,
     },
+    /// Changes a room's power levels (`PUT .../state/m.room.power_levels`):
+    /// the room's current content is copied, `events_default` and the listed
+    /// users' levels are replaced, everything else stays. Needs the room's
+    /// state to be known and the caller to have the power to do it; the
+    /// server decides, a refusal comes back as an HTTP failure.
+    SetPowerLevels {
+        /// The room whose levels change.
+        room_id: RoomId,
+        /// New level required to send an ordinary event (`0` lets everyone
+        /// write, `50` makes the room announcement-only); `None` keeps it.
+        events_default: Option<i64>,
+        /// Per-user levels to set (a user at `users_default` is dropped).
+        users: Vec<(UserId, i64)>,
+    },
     /// Adds (or updates) an `m.tag` room-account-data tag.
     SetTag {
         /// The room being tagged.
@@ -2226,6 +2240,26 @@ impl<C: RecordCodec> MessengerCore<C> {
             MessengerCommand::Kick { room_id, user_id, reason } => {
                 let request_id = self.next_request_id()?;
                 let request = OutgoingRequest::kick(request_id, &room_id, &user_id, reason.as_deref());
+                self.enqueue_request(request, Lane::Other)?;
+            }
+            MessengerCommand::SetPowerLevels { room_id, events_default, users } => {
+                let Some(state) = self.rooms.get(&room_id) else {
+                    return Err(MessengerError::IntentRefused(format!("room {room_id} is unknown, its power levels cannot be changed")));
+                };
+                let mut levels = state.power_levels.clone();
+                if let Some(level) = events_default {
+                    levels.events_default = level;
+                }
+                for (user, level) in users {
+                    if level == levels.users_default {
+                        levels.users.remove(&user);
+                    } else {
+                        levels.users.insert(user, level);
+                    }
+                }
+                let body = serde_json::to_value(&levels)?;
+                let request_id = self.next_request_id()?;
+                let request = OutgoingRequest::room_state(request_id, &room_id, "m.room.power_levels", "", body);
                 self.enqueue_request(request, Lane::Other)?;
             }
             MessengerCommand::SetTag { room_id, tag, order } => {
@@ -4514,6 +4548,40 @@ mod tests {
         }
         let echo = last_item(&core, &target);
         assert_eq!(echo.forwarded, Some(Forwarded::Hidden), "the forwarder's own echo shows the same marker");
+    }
+
+    #[test]
+    fn set_power_levels_puts_the_changed_copy_of_the_rooms_levels() {
+        let mut core = open_fresh_core();
+        let chan = room("!chan:example.org");
+        add_room(&mut core, &chan, false, Some("Talk"));
+        mark_as_channel(&mut core, &chan);
+        let carol = UserId::parse("@carol:example.org").expect("valid user id");
+        core.dispatch(MessengerCommand::SetPowerLevels {
+            room_id: chan.clone(),
+            events_default: Some(0),
+            users: vec![(carol.clone(), 50)],
+        }, 1_000)
+        .expect("dispatch");
+        // The first call dirties the counter record, which must be flushed and acked before release.
+        core.releasable_requests(1_000);
+        flush_and_ack(&mut core);
+        let sent = core.releasable_requests(1_000);
+        let put = sent.iter().find(|r| r.kind == OutgoingRequestKind::RoomState).expect("a state PUT");
+        assert!(put.path.ends_with("/state/m.room.power_levels/"), "{}", put.path);
+        let body = put.body.clone().expect("body");
+        assert_eq!(body["events_default"], 0);
+        assert_eq!(body["users"]["@carol:example.org"], 50);
+        assert_eq!(body["users_default"], 0);
+    }
+
+    #[test]
+    fn set_power_levels_refuses_an_unknown_room() {
+        let mut core = open_fresh_core();
+        let err = core
+            .dispatch(MessengerCommand::SetPowerLevels { room_id: room("!nope:example.org"), events_default: Some(0), users: vec![] }, 1_000)
+            .expect_err("unknown room");
+        assert!(err.to_string().contains("unknown"));
     }
 
     #[test]

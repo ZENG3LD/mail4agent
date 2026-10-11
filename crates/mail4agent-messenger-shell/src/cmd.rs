@@ -244,10 +244,14 @@ impl OpenedStore {
                     .and_then(Value::as_array)
                     .map(|v| v.iter().filter_map(Value::as_str).filter_map(|u| UserId::parse(u).ok()).collect())
                     .unwrap_or_default();
-                let kind = match arg_str(a, "kind").unwrap_or("group") {
-                    "channel" => CreateRoomKind::Channel { name: name.to_string(), topic: arg_str(a, "topic").map(str::to_string) },
+                let wanted = arg_str(a, "kind").unwrap_or("group");
+                // `public` is an ordinary public room: the server's public shape (a channel) with the
+                // write level lowered to 0 once the room exists, so everyone who joins can write.
+                let open_for_all = wanted == "public";
+                let kind = match wanted {
+                    "channel" | "public" => CreateRoomKind::Channel { name: name.to_string(), topic: arg_str(a, "topic").map(str::to_string) },
                     "group" => CreateRoomKind::Group { name: name.to_string(), invite, members_can_invite: true },
-                    other => return CmdReply::failed(format!("kind must be channel or group, not {other}")),
+                    other => return CmdReply::failed(format!("kind must be group, channel or public, not {other}")),
                 };
                 match self.dispatch(MessengerCommand::CreateRoom { kind }, now_ms) {
                     Ok(()) => {
@@ -263,7 +267,51 @@ impl OpenedStore {
                                 break;
                             }
                         }
+                        if open_for_all {
+                            let Some(room) = found.as_ref().and_then(|r| RoomId::parse(&r.room_id).ok()) else {
+                                return CmdReply::failed("the room was created but did not show up; set its write level with rooms.power");
+                            };
+                            let lowered = MessengerCommand::SetPowerLevels { room_id: room, events_default: Some(0), users: Vec::new() };
+                            if let Err(e) = self.dispatch(lowered, now_ms) {
+                                return CmdReply::failed(format!("the room was created but its write level was not lowered: {e}"));
+                            }
+                            self.settle_cmd(now_ms);
+                        }
                         CmdReply::ok(json!({ "room": found.map(|r| r.room_id) }))
+                    }
+                    Err(e) => CmdReply::failed(e.to_string()),
+                }
+            }
+            "rooms.power" => {
+                let Some(spec) = arg_str(a, "room") else { return CmdReply::failed("room is required") };
+                let id = match self.resolve_room(spec, now_ms) {
+                    Ok(id) => id,
+                    Err(e) => return CmdReply::failed(e),
+                };
+                let events_default = a.get("events_default").and_then(Value::as_i64);
+                let mut users: Vec<(UserId, i64)> = Vec::new();
+                if let Some(who) = arg_str(a, "user") {
+                    let Some(level) = a.get("level").and_then(Value::as_i64) else {
+                        return CmdReply::failed("level is required with user");
+                    };
+                    let user = if who.starts_with('@') && who.contains(':') {
+                        who.to_string()
+                    } else {
+                        match self.find_nick(who, now_ms) {
+                            Ok(found) => found.user_id,
+                            Err(e) => return CmdReply::failed(format!("{who}: {e}")),
+                        }
+                    };
+                    let Ok(user_id) = UserId::parse(&user) else { return CmdReply::failed("bad user id") };
+                    users.push((user_id, level));
+                }
+                if events_default.is_none() && users.is_empty() {
+                    return CmdReply::failed("nothing to change: give events_default, or user and level");
+                }
+                match self.dispatch(MessengerCommand::SetPowerLevels { room_id: id.clone(), events_default, users }, now_ms) {
+                    Ok(()) => {
+                        self.settle_cmd(now_ms);
+                        CmdReply::ok(json!({ "room": id.as_str() }))
                     }
                     Err(e) => CmdReply::failed(e.to_string()),
                 }
