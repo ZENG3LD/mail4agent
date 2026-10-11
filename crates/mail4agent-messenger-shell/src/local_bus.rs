@@ -67,7 +67,10 @@ pub(crate) struct LocalBus {
 
 impl LocalBus {
     pub(crate) fn open(prepared: &[Prepared]) -> Result<Self, ShellError> {
-        let mut conn = open_keyed_memory()?;
+        let mut conn = match persistent_db_path() {
+            Some(path) => open_persistent(&path)?,
+            None => open_keyed_memory()?,
+        };
         create_matrix_schema(&conn)
             .map_err(|_| ShellError::Http("local bus schema failed".into()))?;
         mail4agent_server::keys::create_matrix_keys_schema(&conn)
@@ -297,6 +300,55 @@ fn local_uri(path: &str, query: &[(String, String)]) -> Result<String, ShellErro
     Ok(raw)
 }
 
+/// Opt-in durable storage for the local tier: `M4A_LOCAL_BUS_DB` names a database file. Unset (the
+/// default) keeps the bus in memory and it starts empty on every restart.
+pub(crate) const LOCAL_BUS_DB_ENV: &str = "M4A_LOCAL_BUS_DB";
+
+fn persistent_db_path() -> Option<std::path::PathBuf> {
+    std::env::var_os(LOCAL_BUS_DB_ENV).filter(|v| !v.is_empty()).map(std::path::PathBuf::from)
+}
+
+/// Opens (creating it owner-only) the local bus database file, so rooms and messages of the local
+/// tier survive a restart. The key pragma is sent too; it protects the file only when the SQLite
+/// build is SQLCipher, otherwise the file mode (0600, directory 0700) is the protection.
+fn open_persistent(path: &std::path::Path) -> Result<Connection, ShellError> {
+    #[cfg(unix)]
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(ShellError::Io)?;
+        #[cfg(unix)]
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let mut key_path = path.as_os_str().to_owned();
+    key_path.push(".key");
+    let key_path = std::path::PathBuf::from(key_path);
+    let hex = match std::fs::read_to_string(&key_path) {
+        Ok(text) if text.trim().len() == 64 => Zeroizing::new(text.trim().to_string()),
+        _ => {
+            let mut bytes = [0u8; 32];
+            File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes)).map_err(ShellError::Io)?;
+            let hex = Zeroizing::new(crate::hex_encode(&bytes));
+            zeroize::Zeroize::zeroize(&mut bytes);
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            std::io::Write::write_all(&mut options.open(&key_path).map_err(ShellError::Io)?, hex.as_bytes()).map_err(ShellError::Io)?;
+            hex
+        }
+    };
+    #[cfg(unix)]
+    {
+        // Create the database file owner-only before SQLite does it with the umask.
+        let _ = std::fs::OpenOptions::new().write(true).create(true).mode(0o600).open(path);
+    }
+    let conn = Connection::open(path).map_err(|_| ShellError::Http("local bus database failed".into()))?;
+    let pragma = Zeroizing::new(format!("PRAGMA key = \"x'{}'\";", hex.as_str()));
+    conn.execute_batch(pragma.as_str()).map_err(|_| ShellError::Http("local bus could not be keyed".into()))?;
+    let _ = conn.execute_batch("PRAGMA journal_mode = WAL;");
+    Ok(conn)
+}
+
 fn open_keyed_memory() -> Result<Connection, ShellError> {
     let mut bytes = [0u8; 32];
     File::open("/dev/urandom")
@@ -331,9 +383,37 @@ fn seed_session(conn: &mut Connection, item: &Prepared) -> Result<(), ShellError
     )
     .map_err(|_| ShellError::Http("local bus could not seed a device".into()))?;
     conn.execute(
-        "INSERT INTO messenger_sessions (session_id, user_id, device_id, nick) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT OR REPLACE INTO messenger_sessions (session_id, user_id, device_id, nick) VALUES (?1, ?2, ?3, ?4)",
         params![item.config.session_id(), resolved.identity.id, item.device_id.as_str(), item.nick],
     )
     .map_err(|_| ShellError::Http("local bus could not seed a session".into()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+
+    #[test]
+    fn the_persistent_database_keeps_its_rows_across_a_reopen_and_is_owner_only() {
+        let dir = std::env::temp_dir().join(format!("m4a-bus-persist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("bus.db");
+        {
+            let conn = open_persistent(&path).expect("open");
+            conn.execute_batch("CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('kept');").expect("write");
+        }
+        let conn = open_persistent(&path).expect("reopen");
+        let v: String = conn.query_row("SELECT v FROM t", [], |r| r.get(0)).expect("read");
+        assert_eq!(v, "kept");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for file in [path.clone(), dir.join("bus.db.key")] {
+                let mode = std::fs::metadata(&file).expect("meta").permissions().mode() & 0o777;
+                assert_eq!(mode & 0o077, 0, "{} is not owner-only", file.display());
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
