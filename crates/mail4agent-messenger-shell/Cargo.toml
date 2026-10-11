@@ -37,7 +37,7 @@ local-bus = ["dep:mail4agent-server"]
 m4a-seam = { workspace = true }
 m4a-agent = { workspace = true, features = ["engine"] }
 mail4agent-messenger = { workspace = true  }
-mail4agent-server = { workspace = true, optional = true }
+mail4agent-server = { workspace = true, optional = true, features = ["f3-hash-ids", "presence", "media-federation", "media-thumbnails"] }
 mail4agent-grok = { workspace = true, optional = true }
 sha2 = "0.10"
 zeroize = "1"

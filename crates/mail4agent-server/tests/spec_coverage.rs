@@ -136,7 +136,12 @@ fn served() -> Vec<(&'static str, String)> {
 async fn every_endpoint_of_the_spec_is_served_by_a_handler() {
     let state = hs();
     let mut missing = Vec::new();
+    // Without `f3-hash-ids` (the light server) the three room-state federation reads are not served.
+    let light_gaps: &[&str] = if cfg!(feature = "f3-hash-ids") { &[] } else { &["/state_ids/", "/state/", "/event_auth/"] };
     for (m, p) in served() {
+        if light_gaps.iter().any(|gap| p.contains(gap)) {
+            continue;
+        }
         let path = p.clone();
         let (st, body) = probe(&state, m, &path).await;
         if st == 404 && body["errcode"] == "M_UNRECOGNIZED" || st == 405 {
