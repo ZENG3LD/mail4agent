@@ -15,6 +15,15 @@ For a client opened from a session directory, a session whose gateway routine ha
 asked again every `M4A_AGENT_RESCAN_SECS` seconds (60 when unset), so a routine created or minted
 later starts working without a restart. `m4a-agent wake status` shows the state.
 
+### The disabled local routine with the same name is not a stub to remove
+
+A bot's real routine lives in the backend; the box keeps no copy of it. The client creates one
+disabled local routine named like the nick (a "mirror") only because the gateway looks the folder up
+locally before it hands out the webhook credential; the credential belongs to the backend routine of
+that folder. If the bot has created its real routine (`UpdateRoutine`, same name), the credential is
+ready at once and `wake status` says `ready (from gateway)`; if not, it stays `awaiting` and is asked
+again. Never delete the mirror, and never edit it: its prompt and its disabled flag are not used.
+
 ### Prompt convention for the routine
 
 The routine's prompt should be short and stable: the payload is the wake's JSON body with `body`

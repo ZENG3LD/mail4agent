@@ -92,23 +92,23 @@ members = [
 # One version for the whole set: every crate below ships under the same number, always.
 # See docs/versioning.md.
 [workspace.package]
-version = "0.4.5"
+version = "0.4.6"
 
 [workspace.dependencies]
-mail4agent-api = { path = "crates/mail4agent-api", version = "=0.4.5" }
-mail4agent-attest = { path = "crates/mail4agent-attest", version = "=0.4.5" }
-mail4agent-core = { path = "crates/mail4agent-core", version = "=0.4.5" }
-mail4agent-store-sqlite = { path = "crates/mail4agent-store-sqlite", version = "=0.4.5" }
-mail4agent-client = { path = "crates/mail4agent-client", version = "=0.4.5" }
-mail4agent-grok = { path = "crates/mail4agent-grok", version = "=0.4.5" }
-mail4agent-vodozemac = { path = "crates/mail4agent-vodozemac", version = "=0.4.5" }
-mail4agent-messenger = { path = "crates/mail4agent-messenger", version = "=0.4.5" }
-mail4agent-messenger-shell = { path = "crates/mail4agent-messenger-shell", version = "=0.4.5" }
-mail4agent-server = { path = "crates/mail4agent-server", version = "=0.4.5" }
-mail4agent-server-bin = { path = "crates/mail4agent-server-bin", version = "=0.4.5" }
-m4a-edge = { path = "crates/m4a-edge", version = "=0.4.5" }
-m4a-matrix-core = { path = "crates/m4a-matrix-core", version = "=0.4.5" }
-m4a-agent = { path = "crates/m4a-agent", version = "=0.4.5", default-features = false }
-m4a-seam = { path = "crates/m4a-seam", version = "=0.4.5" }
-m4a-product-kit = { path = "crates/m4a-product-kit", version = "=0.4.5" }
-m4a-product-example = { path = "crates/m4a-product-example", version = "=0.4.5" }
+mail4agent-api = { path = "crates/mail4agent-api", version = "=0.4.6" }
+mail4agent-attest = { path = "crates/mail4agent-attest", version = "=0.4.6" }
+mail4agent-core = { path = "crates/mail4agent-core", version = "=0.4.6" }
+mail4agent-store-sqlite = { path = "crates/mail4agent-store-sqlite", version = "=0.4.6" }
+mail4agent-client = { path = "crates/mail4agent-client", version = "=0.4.6" }
+mail4agent-grok = { path = "crates/mail4agent-grok", version = "=0.4.6" }
+mail4agent-vodozemac = { path = "crates/mail4agent-vodozemac", version = "=0.4.6" }
+mail4agent-messenger = { path = "crates/mail4agent-messenger", version = "=0.4.6" }
+mail4agent-messenger-shell = { path = "crates/mail4agent-messenger-shell", version = "=0.4.6" }
+mail4agent-server = { path = "crates/mail4agent-server", version = "=0.4.6" }
+mail4agent-server-bin = { path = "crates/mail4agent-server-bin", version = "=0.4.6" }
+m4a-edge = { path = "crates/m4a-edge", version = "=0.4.6" }
+m4a-matrix-core = { path = "crates/m4a-matrix-core", version = "=0.4.6" }
+m4a-agent = { path = "crates/m4a-agent", version = "=0.4.6", default-features = false }
+m4a-seam = { path = "crates/m4a-seam", version = "=0.4.6" }
+m4a-product-kit = { path = "crates/m4a-product-kit", version = "=0.4.6" }
+m4a-product-example = { path = "crates/m4a-product-example", version = "=0.4.6" }
