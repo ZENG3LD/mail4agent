@@ -28,6 +28,7 @@ struct Mailbox {
     account: String,
     session: String,
     http: reqwest::blocking::Client,
+    threads: HashSet<String>,
 }
 #[derive(Deserialize)]
 struct Doorbell { account: String, message_id: String, to: Value, from: Value }
@@ -42,13 +43,19 @@ fn slug(value: &str) -> bool {
 }
 
 fn deliver(courier: &mut Courier, letter: Delivery) -> (StatusCode, Json<Value>) {
+    let thread = courier.session.session_id.clone();
+    deliver_to(courier, letter, &thread)
+}
+
+fn deliver_to(courier: &mut Courier, letter: Delivery, thread: &str) -> (StatusCode, Json<Value>) {
     if letter.to != courier.session.nick || !slug(&letter.from_nick)
         || letter.event_id.is_empty() || letter.event_id.len() > 512
         || letter.event_id.chars().any(char::is_whitespace) {
         return (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid delivery address or event"})));
     }
-    let key = format!("{} {}", letter.from_nick, letter.event_id);
-    if courier.seen.contains(&key) {
+    let legacy_key = format!("{} {}", letter.from_nick, letter.event_id);
+    let key = format!("{thread} {legacy_key}");
+    if courier.seen.contains(&key) || (thread == courier.session.session_id && courier.seen.contains(&legacy_key)) {
         return (StatusCode::OK, Json(json!({"status": "duplicate"})));
     }
     if courier.seen.len() >= 100_000 {
@@ -56,7 +63,9 @@ fn deliver(courier: &mut Courier, letter: Delivery) -> (StatusCode, Json<Value>)
     }
     let letter = WakeLetter { body: &letter.body, from_nick: &letter.from_nick,
         event_id: &letter.event_id, room: letter.room.as_deref() };
-    match courier.adapter.wake(&courier.session, &letter) {
+    let mut session = courier.session.clone();
+    session.session_id = thread.into();
+    match courier.adapter.wake(&session, &letter) {
         Ok(_) => {
             courier.seen.insert(key.clone());
             if writeln!(courier.state, "{key}").and_then(|_| courier.state.sync_all()).is_err() {
@@ -119,6 +128,10 @@ async fn mail_delivery(State(shared): State<Shared>, Json(note): Json<Doorbell>)
             && letter["to"] == note.to && letter["from"] == note.from) else {
             return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "mailbox letter not verified"})));
         };
+        let thread = match mail_thread(&letter, &mailbox.threads, &courier.session.session_id) {
+            Ok(thread) => thread,
+            Err(()) => return (StatusCode::BAD_REQUEST, Json(json!({"error": "mailbox thread route not allowed"}))),
+        };
         let Some(from) = letter.pointer("/from/participant").and_then(Value::as_str) else {
             return (StatusCode::BAD_REQUEST, Json(json!({"error": "mailbox sender missing"})));
         };
@@ -130,14 +143,25 @@ async fn mail_delivery(State(shared): State<Shared>, Json(note): Json<Doorbell>)
             letter["subject"].as_str().unwrap_or(""), reply, note.message_id, body);
         let delivery = Delivery { body, from_nick: from.into(), to: courier.session.nick.clone(),
             event_id: note.message_id, room: None };
-        deliver(&mut courier, delivery)
+        deliver_to(&mut courier, delivery, &thread)
     }).await.unwrap_or((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "courier worker failed"}))))
+}
+
+// Explicit references route a shared Desktop MCP address to one allowed thread.
+// Never infer the destination from subject/body or accept arbitrary thread ids.
+fn mail_thread(letter: &Value, allowed: &HashSet<String>, default: &str) -> Result<String, ()> {
+    let refs = letter["refs"].as_array();
+    let mut routes = refs.into_iter().flatten().filter(|item| item["kind"] == "codex-thread");
+    let Some(route) = routes.next() else { return Ok(default.into()); };
+    let thread = route["locator"].as_str().ok_or(())?;
+    if routes.next().is_some() || !allowed.contains(thread) { return Err(()); }
+    Ok(thread.into())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--help") {
-        println!("m4a-codex-listen --session THREAD --nick NICK --state FILE [--endpoint desktop|ws://127.0.0.1:PORT|unix:///PATH|desktop:///PATH] [--bind 127.0.0.1:PORT] [--mailbox http://127.0.0.1:PORT --mail-session ID --account ACCOUNT --mail-key-file FILE]");
+        println!("m4a-codex-listen --session THREAD --nick NICK --state FILE [--endpoint desktop|ws://127.0.0.1:PORT|unix:///PATH|desktop:///PATH] [--bind 127.0.0.1:PORT] [--mailbox http://127.0.0.1:PORT --mail-session ID --account ACCOUNT --mail-key-file FILE --mail-thread THREAD (repeatable)]");
         return Ok(());
     }
     let thread = option(&args, "--session").ok_or("--session required")?;
@@ -166,6 +190,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shared = Arc::new(Mutex::new(Courier { adapter: CodexAppServerAdapter::new(Some(endpoint)),
         session, seen: existing.lines().map(str::to_owned).collect(), state, mailbox: None }));
     if let Some(url) = option(&args, "--mailbox") {
+        let mut threads = HashSet::from([shared.lock().map_err(|_| "courier lock failed")?.session.session_id.clone()]);
+        for pair in args.windows(2).filter(|pair| pair[0] == "--mail-thread") {
+            if !slug(&pair[1]) || threads.len() >= 64 { return Err("invalid or excessive mailbox thread routes".into()); }
+            threads.insert(pair[1].clone());
+        }
         let parsed = reqwest::Url::parse(&url)?;
         if parsed.scheme() != "http" || !matches!(parsed.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
             || !parsed.username().is_empty() || parsed.password().is_some() {
@@ -185,7 +214,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .json(&json!({"account": account, "url": format!("http://{bind}/mail-delivery")})).send()?;
         if !response.status().is_success() { return Err("mailbox listener registration refused".into()); }
         shared.lock().map_err(|_| "courier lock failed")?.mailbox = Some(Mailbox {
-            url: url.trim_end_matches('/').into(), key, account, session, http });
+            url: url.trim_end_matches('/').into(), key, account, session, http, threads });
     }
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
@@ -202,6 +231,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shared_mailbox_routes_only_explicit_allowed_thread_references() {
+        let allowed = HashSet::from(["first".into(), "second".into()]);
+        assert_eq!(mail_thread(&json!({"body":"second", "subject":"second"}), &allowed, "first"), Ok("first".into()));
+        assert_eq!(mail_thread(&json!({"refs":[{"kind":"codex-thread","locator":"second"}]}), &allowed, "first"), Ok("second".into()));
+        for refs in [json!([{"kind":"codex-thread","locator":"unknown"}]),
+            json!([{"kind":"codex-thread","locator":"first"},{"kind":"codex-thread","locator":"second"}]),
+            json!([{"kind":"codex-thread"}])] {
+            assert!(mail_thread(&json!({"refs":refs}), &allowed, "first").is_err());
+        }
+    }
     #[test]
     fn wrong_recipient_is_rejected_and_seen_event_is_not_woken() {
         let file = tempfile::tempfile().unwrap();
