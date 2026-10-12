@@ -17,6 +17,7 @@
 //! | `wake`                 | — (owner control of wakes) |
 //! | `vault`                | — (status, backup, restore)|
 //! | `element-open`         | — (open Element, logged in)|
+//! | `door-listen`          | — (wake on hatchery node mail)|
 
 #[cfg(feature = "wake-claude")]
 pub mod claude_channel;
@@ -35,9 +36,10 @@ pub mod mail;
 pub mod node_client;
 pub mod send;
 pub mod web_client;
+pub mod door_listen;
 
 /// The subcommand names, in the order of the table above.
-pub const COMMANDS: &[&str] = &["web-client", "node-client", "grok-listen", "claude-channel", "inbox", "send", "mail", "ensure-agent-webhooks", "enroll", "wake", "vault", "element-open"];
+pub const COMMANDS: &[&str] = &["web-client", "node-client", "grok-listen", "claude-channel", "inbox", "send", "mail", "ensure-agent-webhooks", "enroll", "wake", "vault", "element-open", "door-listen"];
 
 /// Runs `command` with its arguments. `Err` names an unknown command (or one this build lacks).
 pub fn dispatch(command: &str, args: Vec<String>) -> Result<(), String> {
@@ -58,6 +60,7 @@ pub fn dispatch(command: &str, args: Vec<String>) -> Result<(), String> {
         "enroll" => enroll::run(args),
         "wake" => wake::run(args),
         "vault" => vault::run(args),
+        "door-listen" => door_listen::run(args),
         #[cfg(feature = "element-open")]
         "element-open" => element_open::run(args),
         #[cfg(not(feature = "element-open"))]

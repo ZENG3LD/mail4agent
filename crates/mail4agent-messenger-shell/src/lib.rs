@@ -62,6 +62,7 @@
 //! from the environment.
 
 pub mod cli;
+pub mod door_listen;
 mod cmd;
 #[cfg(feature = "wake-grok")]
 mod grok_listen;
