@@ -52,6 +52,15 @@ mod tests {
     }
 
     #[test]
+    fn local_kimi_letter_chain_uses_g4a_deliver_then_inbox() {
+        let cfg = AdapterConfig { kimi_acp_bin: None, ..Default::default() };
+        let chain = letter_chain(SessionKind::local(ProviderKind::KimiCode), None, &cfg);
+        assert_eq!(chain.ids(), vec!["deliver", "inbox-queue"]);
+        // The deliver link is g4a's adapter (server when ACP ungated); m4a has no kimi ACP code.
+        assert!(cfg.kimi_acp_bin.is_none());
+    }
+
+    #[test]
     fn a_letter_the_hook_delivered_is_not_delivered_again_by_g4a() {
         use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
         for (hook_ok, want_deliver) in [(true, 0), (false, 1)] {
