@@ -182,6 +182,23 @@ impl AccountRegistry {
         }
     }
 
+    /// Every account: (account_ref, entry).
+    pub fn accounts(&self) -> impl Iterator<Item = (&str, &AccountEntry)> {
+        self.file.accounts.iter().map(|(r, e)| (r.as_str(), e))
+    }
+
+    /// Store root of the account `account_ref`.
+    pub fn store_root_of(&self, account_ref: &str) -> PathBuf {
+        self.base.join("accounts").join(account_ref)
+    }
+
+    /// Sets the server state of `account_ref`.
+    pub fn set_state_ref(&mut self, account_ref: &str, state: ServerState) -> Result<(), AccountError> {
+        let e = self.file.accounts.get_mut(account_ref).ok_or(AccountError::Unknown)?;
+        e.state = state;
+        self.save()
+    }
+
     /// The account that carries `nick` (account_ref, entry).
     pub fn find_by_nick(&self, nick: &str) -> Option<(&str, &AccountEntry)> {
         self.file.accounts.iter().find(|(_, e)| e.nick.eq_ignore_ascii_case(nick.trim())).map(|(r, e)| (r.as_str(), e))
@@ -288,6 +305,24 @@ pub fn append_env_file(path: &Path, pairs: &[(&str, String)]) -> Result<(), Acco
         writeln!(f, "export {k}={v}").map_err(|e| AccountError::Io(e.to_string()))?;
     }
     Ok(())
+}
+
+/// After `m4a-agent enroll` succeeded with an account's own store root
+/// (`<base>/accounts/<account_ref>`), records the account as enrolled. Returns the ref, or `None`
+/// when that root is not a session account's.
+pub fn mark_enrolled(store_root: &Path) -> Result<Option<String>, AccountError> {
+    let Some(r) = store_root.file_name().and_then(|n| n.to_str()).map(str::to_string) else { return Ok(None) };
+    let Some(base) = store_root.parent().filter(|p| p.file_name().is_some_and(|n| n == "accounts")).and_then(Path::parent) else { return Ok(None) };
+    if !base.join(".m4a-accounts").join("registry.json").exists() {
+        return Ok(None);
+    }
+    let mut reg = AccountRegistry::open(base)?;
+    if reg.file.accounts.contains_key(&r) {
+        reg.set_state_ref(&r, ServerState::Enrolled)?;
+        Ok(Some(r))
+    } else {
+        Ok(None)
+    }
 }
 
 fn ct_eq(a: &str, b: &str) -> bool {
@@ -441,6 +476,22 @@ mod tests {
         assert_eq!(reg.gate(&a.entry.nick, Some(&ca), Some(1000), true), Ok(()));
         reg.set_state(&ida, ServerState::Retired).unwrap();
         assert_eq!(reg.gate(&a.entry.nick, Some(&ca), Some(1000), true), Err(AccountError::Refused));
+    }
+
+    #[test]
+    fn enroll_marks_only_that_account_and_daemon_lists_it_from_its_own_root() {
+        let dir = base("s3-enroll");
+        let a = provision_session(&dir, ProviderKind::KimiCode, "a", Some("kimi"), false).unwrap();
+        let b = provision_session(&dir, ProviderKind::KimiCode, "b", Some("kimi"), false).unwrap();
+        assert!(crate::account_sessions(&dir).is_empty(), "local accounts are not opened on the server");
+        assert_eq!(mark_enrolled(&a.store_root).unwrap(), Some(a.account_ref.clone()));
+        assert_eq!(mark_enrolled(&dir.join("elsewhere")).unwrap(), None);
+        let listed = crate::account_sessions(&dir);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].bot_name, a.entry.nick);
+        assert_eq!(listed[0].session_id, a.account_ref);
+        assert_eq!(listed[0].store_root.as_deref(), Some(a.store_root.as_path()));
+        assert_ne!(listed[0].store_root.as_deref(), Some(b.store_root.as_path()));
     }
 
     #[test]

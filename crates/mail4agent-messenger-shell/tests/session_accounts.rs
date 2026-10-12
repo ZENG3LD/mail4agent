@@ -79,3 +79,41 @@ fn two_sessions_of_one_provider_get_separate_accounts_and_cannot_use_each_others
     assert!(out.status.success());
     assert!(!again.exists());
 }
+
+#[test]
+fn launcher_gives_each_codex_or_kimi_process_its_own_account_env_and_no_invite() {
+    let root = tmp("launch");
+    let run = |provider: &str, session: &str| -> HashMap<String, String> {
+        let out = agent(&root)
+            .args(["launch", "--provider", provider, "--session", session, "--nick", provider, "--", "env"])
+            .env("M4A_SESSION_CAP", "inherited-should-not-leak")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.split_once('='))
+            .filter(|(k, _)| k.starts_with("M4A_"))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    };
+    let c1 = run("codex", "t1");
+    let c2 = run("codex", "t2");
+    let k1 = run("kimi", "k1");
+    for e in [&c1, &c2, &k1] {
+        assert!(!e.contains_key("M4A_PRODUCT_INVITE"));
+        assert_ne!(e["M4A_SESSION_CAP"], "inherited-should-not-leak");
+        assert!(e["M4A_STORE_ROOT"].contains("accounts"));
+    }
+    assert_ne!(c1["M4A_NICK"], c2["M4A_NICK"]);
+    assert_ne!(c1["M4A_STORE_ROOT"], c2["M4A_STORE_ROOT"]);
+    assert_ne!(c1["M4A_SESSION_ID"], k1["M4A_SESSION_ID"]);
+    let gate = mail4agent_messenger_shell::session_gate;
+    assert!(gate(Some(&root), &c1["M4A_NICK"], Some(&c1["M4A_SESSION_CAP"]), None).is_ok());
+    assert!(gate(Some(&root), &c1["M4A_NICK"], Some(&c2["M4A_SESSION_CAP"]), None).is_err());
+    // A relaunch of the same session rotates the cap: the old process's key stops working.
+    let c1b = run("codex", "t1");
+    assert_eq!(c1b["M4A_NICK"], c1["M4A_NICK"]);
+    assert!(gate(Some(&root), &c1["M4A_NICK"], Some(&c1["M4A_SESSION_CAP"]), None).is_err());
+    assert!(gate(Some(&root), &c1["M4A_NICK"], Some(&c1b["M4A_SESSION_CAP"]), None).is_ok());
+}

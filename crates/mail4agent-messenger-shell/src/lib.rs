@@ -111,7 +111,7 @@ pub use machine::{
     load_session_records, HostSession, MachineClient, RoutineReport, TickReport, WakeOptions,
     WakeStatus, AGENTS_DIR_ENV, AGENT_RESCAN_SECS_ENV, DEFAULT_AGENTS_DIR,
     LOCAL_BUS_ENV, PROFILE_NOTE_ENV, SESSIONS_DIR_ENV, SESSION_IDS_ENV, SKIP_NICKS_ENV, STORE_LOCK_FILE,
-    WAKE_KEYCHAIN_FILE, session_gate, REQUIRE_SESSION_CAP_ENV, ACCOUNTS_ROOT_ENV,
+    WAKE_KEYCHAIN_FILE, session_gate, account_sessions, REQUIRE_SESSION_CAP_ENV, ACCOUNTS_ROOT_ENV,
 };
 pub use mail4agent_messenger::{
     CreateRoomKind, DeviceId, MessageKind, MessengerCommand, OutgoingMessage, RoomId, RoomKind,

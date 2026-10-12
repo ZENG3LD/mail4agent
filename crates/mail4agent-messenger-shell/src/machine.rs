@@ -136,6 +136,9 @@ pub struct HostSession {
     pub routine_file: Option<PathBuf>,
     /// `server` tier (default) or `matrix`.
     pub tier: m4a_agent::BackendKind,
+    /// This session's own store root (a per-session account: own vault, own key, own login).
+    /// `None` uses the client's shared store root.
+    pub store_root: Option<PathBuf>,
 }
 
 impl HostSession {
@@ -150,6 +153,7 @@ impl HostSession {
             invite: None,
             routine_file: None,
             tier: m4a_agent::BackendKind::Server,
+            store_root: None,
         }
     }
 
@@ -214,6 +218,9 @@ struct SessionFile {
     /// `server` or `matrix`: the tier this session logs in on. Missing: `M4A_TIER`, else `server`.
     #[serde(default)]
     tier: Option<String>,
+    /// Own store root of a per-session account (no secret: a directory).
+    #[serde(default)]
+    store_root: Option<String>,
 }
 
 /// Reads `*.json` session records from `dir`. A file that carries anything
@@ -257,6 +264,7 @@ pub fn load_session_records(dir: &Path) -> Result<Vec<HostSession>, ShellError> 
             Some(other) => return Err(ShellError::SessionList(format!("tier {other:?} is not server or matrix"))),
         };
         session.routine_file = file.routine_file.map(|p| PathBuf::from(p.trim())).filter(|p| !p.as_os_str().is_empty());
+        session.store_root = file.store_root.map(|p| PathBuf::from(p.trim())).filter(|p| !p.as_os_str().is_empty());
         out.push(session);
     }
     Ok(out)
@@ -362,7 +370,16 @@ fn load_web_sessions(
     dir: &Path,
     mut get: impl FnMut(&str) -> Option<String>,
 ) -> Result<Vec<HostSession>, ShellError> {
-    let sessions = load_session_records(dir)?;
+    let mut sessions = load_session_records(dir)?;
+    // Enrolled per-session accounts join the daemon, each from its own store root.
+    let base = get(crate::ACCOUNTS_ROOT_ENV).or_else(|| get(STORE_ROOT_ENV)).map(PathBuf::from);
+    if let Some(base) = base {
+        for account in account_sessions(&base) {
+            if !sessions.iter().any(|s| s.session_id == account.session_id || s.bot_name.eq_ignore_ascii_case(&account.bot_name)) {
+                sessions.push(account);
+            }
+        }
+    }
     let mut sessions = drop_skipped(sessions, &skip_nicks(&mut get));
     attach_routines_from_env(&mut sessions, &mut get)?;
     Ok(sessions)
@@ -1456,7 +1473,9 @@ impl MachineClient {
         let mut seen_nicks = Vec::new();
         let mut locks = Vec::new();
         for session in sessions {
-            let config = session.config(homeserver_url, store_root)?;
+            // A per-session account opens from its own root: its own vault, key and login token.
+            let own_root = session.store_root.clone().unwrap_or_else(|| store_root.to_path_buf());
+            let config = session.config(homeserver_url, &own_root)?;
             if seen_ids.iter().any(|id: &String| id == config.session_id()) {
                 return Err(ShellError::SessionList("duplicate session id".to_string()));
             }
@@ -3240,4 +3259,22 @@ pub fn session_gate(store_root: Option<&Path>, nick: &str, cap: Option<&str>, pe
     }
     let reg = crate::session_account::AccountRegistry::open(base.as_deref().unwrap_or(Path::new("."))).map_err(|e| e.to_string())?;
     reg.gate(nick, cap, peer_uid, require).map_err(|e| format!("{nick}: {e}"))
+}
+
+/// One [`HostSession`] per enrolled per-session account under `base`: the account's nick, its
+/// account ref as the login session id, and its own store root (multi-account daemon; no shared
+/// provider-wide login). Local-only, pending and retired accounts are left out.
+pub fn account_sessions(base: &Path) -> Vec<HostSession> {
+    if !base.join(".m4a-accounts").join("registry.json").exists() {
+        return Vec::new();
+    }
+    let Ok(reg) = crate::session_account::AccountRegistry::open(base) else { return Vec::new() };
+    reg.accounts()
+        .filter(|(_, e)| e.state == crate::session_account::ServerState::Enrolled)
+        .map(|(r, e)| {
+            let mut s = HostSession::new(e.nick.clone(), r.to_string());
+            s.store_root = Some(reg.store_root_of(r));
+            s
+        })
+        .collect()
 }

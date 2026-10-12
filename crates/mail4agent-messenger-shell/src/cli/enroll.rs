@@ -16,6 +16,12 @@ pub fn run(args: Vec<String>) {
     match OpenedStore::connect_from_env() {
         Ok(store) => {
             println!("enrolled nick={}", store.nick().unwrap_or("(unknown)"));
+            // A per-session account (its own store root under the accounts base) is now enrolled.
+            if let Some(root) = std::env::var_os(crate::STORE_ROOT_ENV).map(std::path::PathBuf::from) {
+                if let Err(err) = crate::session_account::mark_enrolled(&root) {
+                    eprintln!("enroll: account state not updated: {err}");
+                }
+            }
         }
         Err(err) => {
             eprintln!("enroll failed: {err}");
