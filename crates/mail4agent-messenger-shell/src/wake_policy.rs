@@ -201,13 +201,13 @@ mod tests {
 
     #[test]
     fn addressing_means_the_nick_or_the_user_id_not_a_longer_name() {
-        let me = "@hatcheryweb:example.org";
-        assert!(addresses("hey @HatcheryWeb, look", Some("hatcheryweb"), me));
-        assert!(addresses("hatcheryweb: do it", Some("hatcheryweb"), me));
-        assert!(addresses("cc @hatcheryweb:example.org", Some("hatcheryweb"), me));
-        assert!(addresses("see @hatcheryweb.", Some("hatcheryweb"), me));
-        assert!(!addresses("@hatcherywebber hi", Some("hatcheryweb"), me));
-        assert!(!addresses("nothing here", Some("hatcheryweb"), me));
+        let me = "@operator:example.org";
+        assert!(addresses("hey @Operator, look", Some("operator"), me));
+        assert!(addresses("operator: do it", Some("operator"), me));
+        assert!(addresses("cc @operator:example.org", Some("operator"), me));
+        assert!(addresses("see @operator.", Some("operator"), me));
+        assert!(!addresses("@operatorber hi", Some("operator"), me));
+        assert!(!addresses("nothing here", Some("operator"), me));
         assert!(!addresses("", None, me));
     }
 

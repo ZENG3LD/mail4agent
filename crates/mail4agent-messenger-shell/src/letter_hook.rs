@@ -92,7 +92,7 @@ mod tests {
         ProviderSession { kind: SessionKind::local(ProviderKind::Codex), session_id: "s-1".into(), nick: "codex-1".into(), cwd: None, headless: false }
     }
     fn letter() -> WakeLetter<'static> {
-        WakeLetter { body: "hello", from_nick: "hatcheryweb", event_id: "$e", room: Some("!r") }
+        WakeLetter { body: "hello", from_nick: "operator", event_id: "$e", room: Some("!r") }
     }
 
     #[cfg(unix)]

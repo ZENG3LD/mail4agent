@@ -3539,8 +3539,8 @@ impl AutoJoinPolicy {
 mod auto_join_tests {
     use super::AutoJoinPolicy;
 
-    const HOME: &str = "message.sarl";
-    const ME: &str = "@kimi-web:message.sarl";
+    const HOME: &str = "example.org";
+    const ME: &str = "@agent-a:example.org";
 
     fn ok(p: &AutoJoinPolicy, direct: bool, inviter: Option<&str>, members: &[&str]) -> bool {
         p.accepts(HOME, ME, direct, inviter, members.iter().copied())
@@ -3549,32 +3549,32 @@ mod auto_join_tests {
     #[test]
     fn group_room_invite_from_our_server_is_joined() {
         let p = AutoJoinPolicy::default();
-        assert!(ok(&p, false, Some("@hatcheryweb:message.sarl"), &[ME, "@hatcheryweb:message.sarl", "@x:other.org"]));
+        assert!(ok(&p, false, Some("@operator:example.org"), &[ME, "@operator:example.org", "@x:other.org"]));
     }
 
     #[test]
     fn group_room_invite_from_another_server_or_unknown_inviter_is_left() {
         let p = AutoJoinPolicy::default();
         assert!(!ok(&p, false, Some("@evil:other.org"), &[ME, "@evil:other.org"]));
-        assert!(!ok(&p, false, None, &[ME, "@hatcheryweb:message.sarl"]));
+        assert!(!ok(&p, false, None, &[ME, "@operator:example.org"]));
     }
 
     #[test]
     fn dm_policy_is_unchanged() {
         let p = AutoJoinPolicy::default();
-        assert!(ok(&p, true, Some("@codex:message.sarl"), &[ME, "@codex:message.sarl"]));
-        assert!(ok(&p, true, None, &[ME, "@codex:message.sarl"]));
+        assert!(ok(&p, true, Some("@agent-b:example.org"), &[ME, "@agent-b:example.org"]));
+        assert!(ok(&p, true, None, &[ME, "@agent-b:example.org"]));
         assert!(!ok(&p, true, Some("@x:other.org"), &[ME, "@x:other.org"]));
     }
 
     #[test]
     fn switches_and_allow_list() {
         let off = AutoJoinPolicy { rooms: false, ..AutoJoinPolicy::default() };
-        assert!(!ok(&off, false, Some("@hatcheryweb:message.sarl"), &[ME]));
+        assert!(!ok(&off, false, Some("@operator:example.org"), &[ME]));
         let nodm = AutoJoinPolicy { dms: false, ..AutoJoinPolicy::default() };
-        assert!(!ok(&nodm, true, Some("@codex:message.sarl"), &[ME, "@codex:message.sarl"]));
-        let only_op = AutoJoinPolicy { room_inviters: vec!["hatcheryweb".into()], ..AutoJoinPolicy::default() };
-        assert!(ok(&only_op, false, Some("@hatcheryweb:message.sarl"), &[ME]));
-        assert!(!ok(&only_op, false, Some("@codex:message.sarl"), &[ME]));
+        assert!(!ok(&nodm, true, Some("@agent-b:example.org"), &[ME, "@agent-b:example.org"]));
+        let only_op = AutoJoinPolicy { room_inviters: vec!["operator".into()], ..AutoJoinPolicy::default() };
+        assert!(ok(&only_op, false, Some("@operator:example.org"), &[ME]));
+        assert!(!ok(&only_op, false, Some("@agent-b:example.org"), &[ME]));
     }
 }
