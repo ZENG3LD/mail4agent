@@ -9,6 +9,8 @@ use serde_json::{json, Value};
 use super::{WakeError, WakeOutcome};
 
 const MAX_FRAME: usize = 1024 * 1024;
+// Owner snapshots include history: the inspected live snapshot exceeded 1 MiB.
+const MAX_SNAPSHOT_FRAME: usize = 16 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(20);
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -29,8 +31,13 @@ pub fn wake(path: &Path, thread: &str, text: &str) -> Result<WakeOutcome, WakeEr
 
 fn wake_on<S: Read + Write>(stream: &mut S, thread: &str, text: &str) -> Result<WakeOutcome, WakeError> {
     let (client, owner) = discover(stream, thread)?;
+    // Observe the real owner's state, not our courier's process-level identity.
+    // Busy/unknown states are retryable; never insert another start placeholder.
+    // This is not an atomic owner gate: a human can submit after the snapshot.
+    // Full concurrency safety requires an owner-side prepared-message operation.
+    require_idle(stream, thread, &client, &owner)?;
     let params = json!({"conversationId": thread, "turnStart": {
-        "request": {"threadId": thread, "input": [{"type": "text", "text": text}]},
+        "request": {"threadId": thread, "input": [{"type": "text", "text": text, "text_elements": []}]},
         "context": {"inheritThreadSettings": true}
     }});
     let reply = call(stream, "thread-follower-start-turn", 2, params, Some(&client), Some(&owner))?;
@@ -39,6 +46,37 @@ fn wake_on<S: Read + Write>(stream: &mut S, thread: &str, text: &str) -> Result<
         return Err(WakeError::Transport("desktop did not return an accepted turn".into()));
     }
     Ok(WakeOutcome::Delivered)
+}
+
+fn require_idle<S: Read + Write>(stream: &mut S, thread: &str, client: &str, owner: &str) -> Result<(), WakeError> {
+    write_frame(stream, &json!({"type": "broadcast", "method": "thread-stream-following-changed",
+        "version": 1, "sourceClientId": client, "targetClientIds": [owner],
+        "params": {"conversationId": thread, "hostId": "local", "following": true}}))?;
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let update = read_frame(stream, deadline)?;
+        if update["type"] != "broadcast" || update["method"] != "thread-stream-state-changed"
+            || update["version"] != 11 || update["sourceClientId"] != owner
+            || update.pointer("/params/conversationId").and_then(Value::as_str) != Some(thread)
+            || update.pointer("/params/hostId").and_then(Value::as_str) != Some("local")
+            || update.pointer("/params/change/type").and_then(Value::as_str) != Some("snapshot") { continue; }
+        let state = &update["params"]["change"]["conversationState"];
+        // Fail closed for transient, unloaded and changed protocol states.
+        if state["id"] != thread || state["resumeState"] != "resumed"
+            || state.pointer("/threadRuntimeStatus/type").and_then(Value::as_str) != Some("idle")
+            || state["unconfirmedTurnSubmissions"].as_array().is_some_and(|items| !items.is_empty()) {
+            return Err(WakeError::Unavailable("desktop thread busy or idle state unconfirmed; retry later".into()));
+        }
+        let busy = match state["turnHistory"]["kind"].as_str() {
+            Some("canonical") => state["turnHistory"]["history"]["entitiesByKey"].as_object()
+                .map(|items| items.values().any(|turn| turn["status"] == "inProgress")),
+            _ => state["turns"].as_array().map(|items| items.iter().any(|turn| turn["status"] == "inProgress")),
+        };
+        if busy != Some(false) {
+            return Err(WakeError::Unavailable("desktop turn state busy or unavailable; retry later".into()));
+        }
+        return Ok(());
+    }
 }
 
 fn discover<S: Read + Write>(stream: &mut S, thread: &str) -> Result<(String, String), WakeError> {
@@ -92,7 +130,7 @@ fn read_frame<S: Read>(stream: &mut S, deadline: Instant) -> Result<Value, WakeE
     let mut header = [0; 4];
     read_exact_until(stream, &mut header, deadline)?;
     let size = u32::from_le_bytes(header) as usize;
-    if size == 0 || size > MAX_FRAME { return Err(transport()); }
+    if size == 0 || size > MAX_SNAPSHOT_FRAME { return Err(transport()); }
     let mut bytes = vec![0; size];
     read_exact_until(stream, &mut bytes, deadline)?;
     serde_json::from_slice(&bytes).map_err(|_| transport())
@@ -193,6 +231,15 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             for method in ["initialize", "thread-owner-discovery", "thread-follower-start-turn"] {
+                if method == "thread-follower-start-turn" {
+                    let following = read_frame(&mut stream, Instant::now()+TIMEOUT).unwrap();
+                    assert_eq!(following["method"], "thread-stream-following-changed");
+                    write_frame(&mut stream, &json!({"type": "broadcast", "method": "thread-stream-state-changed",
+                        "version": 11, "sourceClientId": "owner", "params": {"hostId": "local",
+                        "conversationId": "existing-thread", "change": {"type": "snapshot", "conversationState": {
+                            "id": "existing-thread", "resumeState": "resumed", "threadRuntimeStatus": {"type": "idle"}, "turns": []
+                        }}}})).unwrap();
+                }
                 let req = read_frame(&mut stream, Instant::now()+TIMEOUT).unwrap();
                 assert_eq!(req["method"], method);
                 let result = match method {
@@ -205,6 +252,7 @@ mod tests {
                         assert_eq!(req["targetClientId"], "owner");
                         assert_eq!(req["version"], 2);
                         assert_eq!(req["params"]["turnStart"]["request"]["threadId"], "existing-thread");
+                        assert_eq!(req["params"]["turnStart"]["request"]["input"][0]["text_elements"], json!([]));
                         json!({"result": {"turn": {"id": "accepted"}}})
                     }
                 };
@@ -216,5 +264,28 @@ mod tests {
         stream.set_read_timeout(Some(TIMEOUT)).unwrap();
         assert_eq!(wake_on(&mut stream, "existing-thread", "letter").unwrap(), WakeOutcome::Delivered);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn busy_or_unknown_owner_never_receives_start() {
+        for status in ["active", "notLoaded", "unknown"] {
+            let update = json!({"type": "broadcast", "method": "thread-stream-state-changed", "version": 11,
+                "sourceClientId": "owner", "params": {"hostId": "local", "conversationId": "thread",
+                "change": {"type": "snapshot", "conversationState": {"id": "thread", "resumeState": "resumed",
+                    "threadRuntimeStatus": {"type": status}, "turns": []}}}});
+            let mut input = std::io::Cursor::new(Vec::new());
+            write_frame(&mut input, &update).unwrap();
+            input.set_position(0);
+            struct Duplex { input: std::io::Cursor<Vec<u8>>, output: Vec<u8> }
+            impl Read for Duplex { fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> { self.input.read(bytes) } }
+            impl Write for Duplex {
+                fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> { self.output.write(bytes) }
+                fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+            }
+            let mut stream = Duplex { input, output: Vec::new() };
+            assert!(require_idle(&mut stream, "thread", "courier", "owner").is_err());
+            let sent = read_frame(&mut std::io::Cursor::new(stream.output), Instant::now()+TIMEOUT).unwrap();
+            assert_eq!(sent["method"], "thread-stream-following-changed");
+        }
     }
 }
