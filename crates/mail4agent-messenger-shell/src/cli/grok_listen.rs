@@ -65,14 +65,14 @@ pub fn run(args: Vec<String>) {
 
     let homeserver = env_required("M4A_HOMESERVER_URL");
     let store = PathBuf::from(env_required("M4A_STORE_ROOT"));
-    let grok_home = mail4agent_grok::grok_home().unwrap_or_else(|| {
+    let grok_home = grok_home().unwrap_or_else(|| {
         eprintln!("grok home is not set");
         std::process::exit(1);
     });
     let leader = std::env::var_os(LEADER_SOCK_ENV)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| mail4agent_grok::leader_socket(&grok_home, None));
+        .unwrap_or_else(|| grok_home.join("leader.sock"));
     let index = std::env::var_os("M4A_GROK_INDEX")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
@@ -156,4 +156,14 @@ fn env_required(key: &str) -> String {
             std::process::exit(1);
         }
     }
+}
+
+/// `$GROK_HOME`, else `<home>/.grok` (session discovery only).
+fn grok_home() -> Option<PathBuf> {
+    if let Some(env) = std::env::var_os("GROK_HOME").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(env));
+    }
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).filter(|v| !v.is_empty())?;
+    let home = PathBuf::from(home);
+    Some(std::fs::canonicalize(&home).unwrap_or(home).join(".grok"))
 }

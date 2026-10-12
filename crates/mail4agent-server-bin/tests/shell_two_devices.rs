@@ -109,7 +109,43 @@ impl Drop for RoutineCapture {
     }
 }
 
+/// Letter events m4a handed to `M4A_LETTER_HOOK` (one file per hook run), process-wide.
+fn hook_dir() -> &'static std::path::Path {
+    static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("m4a-letter-hook-{}", std::process::id()));
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).expect("hook dir");
+        let hook = dir.join("hook.sh");
+        std::fs::write(&hook, format!("#!/bin/sh\ncat > {}/$$.tmp && mv {}/$$.tmp {}/$$.json\n", out.display(), out.display(), out.display())).expect("hook");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        }
+        std::env::set_var("M4A_LETTER_HOOK", &hook);
+        out
+    })
+}
+
+/// Hook events whose body is `body`, as `(headers, json)` (headers empty: no HTTP involved).
+fn letter_hits(body: &str) -> Vec<(String, Vec<u8>)> {
+    let mut hits = Vec::new();
+    for entry in std::fs::read_dir(hook_dir()).expect("hook out").flatten() {
+        if entry.path().extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let bytes = std::fs::read(entry.path()).unwrap_or_default();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        if parsed["body"] == body {
+            hits.push((String::new(), bytes));
+        }
+    }
+    hits
+}
+
 fn start_routine() -> RoutineCapture {
+    hook_dir();
     let listener = TcpListener::bind("127.0.0.1:0").expect("routine bind");
     let addr = listener.local_addr().expect("routine addr");
     listener.set_nonblocking(true).expect("nonblocking");
@@ -431,11 +467,12 @@ fn two_shells_exchange_one_text_over_loopback() {
         "second device did not see the text; {}",
         describe(&bob)
     );
-    let hits = routine.hits.lock().expect("hits");
+    assert!(routine.hits.lock().expect("hits").is_empty(), "m4a posted to a routine");
+    let hits = letter_hits(TEXT);
     assert_eq!(
         hits.len(),
         1,
-        "decrypted room text did not hit the routine once; {}",
+        "decrypted room text did not reach the letter hook once; {}",
         describe(&bob)
     );
     assert!(
@@ -653,11 +690,13 @@ fn wait_text(shell: &mut OpenedStore, now: &mut i64, text: &str) {
 }
 
 fn wake_event_ids(routine: &RoutineCapture, body: &str, from: &str) -> Vec<String> {
-    let hits = routine.hits.lock().expect("hits");
+    assert!(routine.hits.lock().expect("hits").is_empty(), "m4a posted to a routine");
+    let hits = letter_hits(body);
     assert!(
         !hits.is_empty(),
-        "decrypted room text did not hit the routine"
+        "decrypted room text did not reach the letter hook"
     );
+    let from = from.trim_start_matches('@').split(':').next().unwrap_or(from);
     let mut ids = Vec::new();
     for (headers, bytes) in hits.iter() {
         assert!(

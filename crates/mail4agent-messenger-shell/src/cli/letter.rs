@@ -1,12 +1,11 @@
 //! `m4a-agent letter deliver`: hand one letter to a session the same way the client daemon
-//! does on an inbound room text -- letter hook first (`M4A_LETTER_HOOK`), then whatever legacy
-//! adapters this build has, then the durable inbox. For harness tests and for local senders
+//! does on an inbound room text -- letter hook first (`M4A_LETTER_HOOK`), then the durable inbox. For harness tests and for local senders
 //! that already hold the plaintext. Prints `<link> delivered|queued`.
 
 use std::io::Read;
 use std::path::PathBuf;
 
-use crate::provider::{self, AdapterConfig, HostEnv, ProviderSession, SessionKind, WakeLetter, WakeOutcome};
+use crate::provider::{self, ProviderSession, SessionKind, WakeLetter, WakeOutcome};
 use crate::{ProviderKind, STORE_ROOT_ENV};
 
 fn fail(msg: &str) -> ! {
@@ -47,8 +46,7 @@ pub fn run(args: Vec<String>) {
         cwd: std::env::current_dir().ok(),
         headless: false,
     };
-    let config = AdapterConfig::from_env(root.as_deref().map(|r| provider::registry::inbox_dir(r, &session_id)));
-    let mut chain = provider::plan_chain(&session, &HostEnv::detect(), &config);
+    let mut chain = provider::letter_chain(session.kind, root.as_deref().map(|r| provider::registry::inbox_dir(r, &session_id)));
     let letter = WakeLetter { body: body.trim_end(), from_nick: &from, event_id: &event, room: None };
     match chain.wake(&session, &letter) {
         Ok((id, WakeOutcome::Delivered)) => println!("{id} delivered"),

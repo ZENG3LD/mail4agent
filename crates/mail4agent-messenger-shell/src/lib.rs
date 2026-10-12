@@ -70,7 +70,6 @@ pub fn ipc_own_uid() -> Option<u32> {
     ipc::own_uid()
 }
 mod cmd;
-#[cfg(feature = "wake-grok")]
 mod grok_listen;
 mod ipc;
 mod machine;
@@ -82,8 +81,6 @@ mod local_bus;
 mod nick;
 mod webhook;
 pub mod wake_policy;
-#[cfg(feature = "wake-grok")]
-mod node;
 pub mod provider;
 mod bus_backend;
 pub mod resolve;
@@ -95,7 +92,6 @@ pub mod store_key;
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use mail4agent_messenger::store::sealed::SealedRecordCodec;
 use mail4agent_messenger::wire::Membership;
@@ -123,18 +119,11 @@ pub use mail4agent_messenger::{
 pub use cmd::{CmdReply, CmdRequest};
 // AutoJoinPolicy is defined in this file.
 pub use mail4agent_messenger::EventId;
-#[cfg(feature = "wake-grok")]
 pub use grok_listen::{hear, GrokListener, Heard, ListenReport};
 pub use nick::{nick_from_display_name, routine_folder_id};
-#[cfg(feature = "wake-grok")]
-pub use node::{NodeClient, NodeTickReport, NODE_DEFAULT_SOCK_NAME};
 pub use provider::{
-    plan_chain, HostEnv, HookFlavor, ResumeSpawnAdapter, SessionRecord, WakeChain, WebVendor,
-    adapter_for, wake_prompt, AdapterConfig, ClaudeChannelAdapter, ClaudeRoutineFireAdapter,
-    CodexAppServerAdapter, CodexCloudAdapter, CodexEndpoint, CursorAgentAdapter, GrokLeaderAdapter,
-    KimiServerAdapter, NoInboundAdapter, ProviderKind, ProviderSession, RoutineWebhookAdapter,
-    SessionKind, Surface, WakeAdapter, WakeError, WakeLetter, WakeOutcome, INBOX_DIR_ENV,
-    PROVIDER_ENV,
+    letter_chain, HostEnv, HookFlavor, ProviderKind, ProviderSession, SessionKind, SessionRecord, Surface,
+    WakeAdapter, WakeChain, WakeError, WakeLetter, WakeOutcome, INBOX_DIR_ENV, PROVIDER_ENV,
 };
 pub use m4a_agent::engine::PushedRoomEvent;
 pub use send::{
@@ -574,167 +563,6 @@ pub fn reply_hint(to: &str, from_nick: &str) -> String {
 pub fn mxid_localpart(mxid: &str) -> &str {
     let rest = mxid.strip_prefix('@').unwrap_or(mxid);
     rest.split_once(':').map(|(local, _)| local).unwrap_or(rest)
-}
-
-/// POSTs `wake` once, as a JSON object, to `url`. No mailbox path and no
-/// `Authorization` header. `url` is the bot's already-configured routine.
-/// `http` and `https` are both followed; anything else is refused before
-/// a socket is opened.
-pub fn post_decrypted(url: &str, wake: &DecryptedWake<'_>) -> Result<(), ShellError> {
-    post_decrypted_with_bearer(url, wake, None)
-}
-
-/// [`post_decrypted`] plus the routine key. When `bearer` is `Some` and
-/// non-empty, that same value is sent as `Authorization: Bearer` and as
-/// `X-Automation-Key`. `Content-Type` is `application/json`. One JSON body.
-/// One attempt, 8 seconds. A 200 means the routine woke. Anything else is
-/// a failure and is not retried here. The key and the URL are not included
-/// in the error. The value must come from memory, not from source.
-pub fn post_decrypted_with_bearer(
-    url: &str,
-    wake: &DecryptedWake<'_>,
-    bearer: Option<&str>,
-) -> Result<(), ShellError> {
-    let bytes = routine_json(wake)?;
-    post_routine_bytes(url, bytes, bearer)
-}
-
-/// [`post_decrypted_with_bearer`] with any JSON object as the body: the
-/// machine client's own events (`kind` = `peer_joined`) go to a bot's
-/// routine this way. Same headers, one attempt, 8 seconds, 200 or error.
-/// The key and the URL are not included in the error.
-pub fn post_routine_json(
-    url: &str,
-    body: &serde_json::Value,
-    bearer: Option<&str>,
-) -> Result<(), ShellError> {
-    let bytes = serde_json::to_vec(body)
-        .map_err(|err| ShellError::RoutineTransport(clip_public(err.to_string())))?;
-    post_routine_bytes(url, bytes, bearer)
-}
-
-fn post_routine_bytes(url: &str, bytes: Vec<u8>, bearer: Option<&str>) -> Result<(), ShellError> {
-    let target = parse_routine_url(url)?;
-    let client = routine_client()?;
-    let token = bearer.map(str::trim).filter(|token| !token.is_empty());
-    let mut builder = client
-        .post(target)
-        .header(reqwest::header::CONTENT_TYPE, "application/json");
-    if let Some(token) = token {
-        let authorization = bearer_header(token)?;
-        let mut automation_key =
-            reqwest::header::HeaderValue::from_str(token).map_err(|_| ShellError::RoutineBearer)?;
-        automation_key.set_sensitive(true);
-        builder = builder
-            .header(reqwest::header::AUTHORIZATION, authorization)
-            .header("x-automation-key", automation_key);
-    }
-    let response = builder.body(bytes).send().map_err(|err| {
-        ShellError::RoutineTransport(redact_wake(public_reqwest(&err), url, token))
-    })?;
-    let status = response.status().as_u16();
-    if !(200..300).contains(&status) {
-        return Err(ShellError::RoutineStatus(status));
-    }
-    Ok(())
-}
-
-fn redact_wake(mut text: String, url: &str, bearer: Option<&str>) -> String {
-    if !url.is_empty() {
-        text = text.replace(url, "[redacted]");
-    }
-    if let Some(token) = bearer.filter(|token| token.len() >= 4) {
-        text = text.replace(token, "[redacted]");
-    }
-    text
-}
-
-fn routine_json(wake: &DecryptedWake<'_>) -> Result<Vec<u8>, ShellError> {
-    let mut object = serde_json::Map::new();
-    object.insert(
-        "body".to_string(),
-        serde_json::Value::String(wake.body.to_string()),
-    );
-    object.insert(
-        "from".to_string(),
-        serde_json::Value::String(wake.from.to_string()),
-    );
-    object.insert(
-        "event_id".to_string(),
-        serde_json::Value::String(wake.event_id.to_string()),
-    );
-    if let Some(nick) = wake.nick.map(str::trim).filter(|nick| !nick.is_empty()) {
-        object.insert(
-            "nick".to_string(),
-            serde_json::Value::String(nick.to_string()),
-        );
-    }
-    for (key, value) in [
-        ("room", wake.room),
-        ("from_nick", wake.from_nick),
-        ("to", wake.to),
-        ("reply", wake.reply),
-    ] {
-        if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
-            object.insert(
-                key.to_string(),
-                serde_json::Value::String(value.to_string()),
-            );
-        }
-    }
-    serde_json::to_vec(&object)
-        .map_err(|err| ShellError::RoutineTransport(clip_public(err.to_string())))
-}
-
-fn bearer_header(token: &str) -> Result<reqwest::header::HeaderValue, ShellError> {
-    // One rule for both delivery paths (the Grok doorbell's and the routine POST): the Grok crate's.
-    let token = webhook::bearer_token(token).ok_or(ShellError::RoutineBearer)?;
-    let mut header = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
-        .map_err(|_| ShellError::RoutineBearer)?;
-    header.set_sensitive(true);
-    Ok(header)
-}
-
-fn routine_client() -> Result<reqwest::blocking::Client, ShellError> {
-    // Workspace feature unification also turns on native-tls. Without this,
-    // Windows uses schannel and a localized chain error instead of rustls.
-    reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(8))
-        .redirect(reqwest::redirect::Policy::none())
-        .http1_only()
-        .use_rustls_tls()
-        .build()
-        .map_err(|err| ShellError::RoutineTransport(public_reqwest(&err)))
-}
-
-fn public_reqwest(err: &reqwest::Error) -> String {
-    let mut text = err.to_string();
-    let mut source = std::error::Error::source(err);
-    while let Some(inner) = source {
-        text.push_str(": ");
-        text.push_str(&inner.to_string());
-        source = inner.source();
-        if text.len() > 400 {
-            break;
-        }
-    }
-    clip_public(text)
-}
-
-fn parse_routine_url(url: &str) -> Result<reqwest::Url, ShellError> {
-    // One rule for both delivery paths: the Grok crate's operator-URL check runs first.
-    if !webhook::url_ok(url) {
-        return Err(ShellError::RoutineUrl);
-    }
-    let parsed = reqwest::Url::parse(url).map_err(|_| ShellError::RoutineUrl)?;
-    match parsed.scheme() {
-        "http" | "https" => {}
-        _ => return Err(ShellError::RoutineUrl),
-    }
-    if parsed.host_str().is_none() || !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err(ShellError::RoutineUrl);
-    }
-    Ok(parsed)
 }
 
 /// A sealed messenger core opened for one session, plus the homeserver it
@@ -1344,14 +1172,6 @@ impl OpenedStore {
         self.routine_url.is_some()
     }
 
-    /// Routine URL and key, for the machine client's own events. Memory
-    /// only; never logged.
-    pub(crate) fn routine_target(&self) -> Option<(String, Option<String>)> {
-        let url = self.routine_url.clone()?;
-        let bearer = self.routine_bearer.as_ref().map(|token| token.as_str().to_string());
-        Some((url, bearer))
-    }
-
     /// Last wake failure that did not drop the room text. `None` if the
     /// last attempt worked or nothing has been attempted. The bearer and
     /// the plaintext are not included.
@@ -1859,33 +1679,46 @@ impl OpenedStore {
         state.name.is_none() && live <= 2
     }
 
-    #[cfg_attr(not(feature = "wake-grok"), allow(unused_variables))]
+    /// The letter chain for a store with no chain installed: the letter hook
+    /// (`M4A_LETTER_HOOK`) first, then the durable inbox. m4a never wakes a
+    /// session itself; the host behind the hook does (g4a deliver API).
+    fn default_letter_chain(&self) -> (provider::ProviderSession, provider::WakeChain) {
+        let kind = if self.routine_url.is_some() && self.leader_sock.is_none() {
+            provider::SessionKind::web(provider::ProviderKind::Grok)
+        } else {
+            provider::SessionKind::local(provider::ProviderKind::Grok)
+        };
+        let session = provider::ProviderSession {
+            kind,
+            session_id: self.session_id.clone(),
+            nick: self.nick.clone().unwrap_or_default(),
+            cwd: self.leader_cwd.clone().map(PathBuf::from),
+            headless: false,
+        };
+        let root = self.dir.parent().map(Path::to_path_buf);
+        let inbox = root.map(|r| provider::registry::inbox_dir(&r, &self.session_id));
+        (session.clone(), crate::provider::letter_chain(kind, inbox))
+    }
+
     fn wake_inbound(&mut self) {
         if self.routine_url.is_none() && self.leader_sock.is_none() && self.wake_chain.is_none() {
             return;
         }
         if self.routine_restart_catchup && self.routine_url.is_some() {
             // Existing ledger + tip/history catch-up: persist every inbound
-            // key without POSTing. Cleared when this drive finishes.
+            // key without handing it over again. Cleared when this drive finishes.
             for item in self.inbound_plaintexts() {
                 if !self.routine_sent.contains(&item.key) {
                     self.remember_routine_wake(&item.key);
+                    self.remember_leader_prompt(&item.key);
                 }
             }
         } else if self.routine_woken_seed_pending && self.routine_url.is_some() {
-            // Tip/history may have just filled an empty timeline. Mark older
-            // rows woken without POSTing; newest still fires once, then the
-            // ledger persists across restarts.
             if !self.inbound_plaintexts().is_empty() {
                 self.seed_routine_woken_from_timeline();
             }
         }
         self.arm_unprompted_newest();
-        let url = self.routine_url.clone();
-        let bearer = self.routine_bearer.clone();
-        let sock = self.leader_sock.clone();
-        let cwd = self.leader_cwd.clone();
-        let session_id = self.session_id.clone();
         let policy = crate::wake_policy::WakePolicy::load(self.store_dir());
         let me_id = self.driver.core.user_id().as_str().to_string();
         let mut items = self.inbound_plaintexts();
@@ -1902,114 +1735,43 @@ impl OpenedStore {
             false
         });
         for item in items {
-            if let Some(url) = url.as_deref() {
-                // Restart catch-up already remembered keys; skip POSTs.
-                if !self.routine_restart_catchup && !self.routine_sent.contains(&item.key) {
-                    let from_nick = mxid_localpart(&item.from).to_string();
-                    let to = self.nick.clone();
-                    let reply = to.as_deref().map(|to| reply_hint(to, &from_nick));
-                    let wake = DecryptedWake {
-                        body: &item.body,
-                        from: &item.from,
-                        nick: item.nick.as_deref(),
-                        event_id: &item.event_id,
-                        room: Some(&item.room_id),
-                        from_nick: Some(&from_nick),
-                        to: to.as_deref(),
-                        reply: reply.as_deref(),
+            if self.leader_sent.contains(&item.key) || self.routine_sent.contains(&item.key) {
+                continue;
+            }
+            let (session, mut chain) = match self.wake_chain.take() {
+                Some(installed) => installed,
+                None => self.default_letter_chain(),
+            };
+            let from_nick = mxid_localpart(&item.from).to_string();
+            let letter = provider::WakeLetter {
+                body: &item.body,
+                from_nick: &from_nick,
+                event_id: &item.event_id,
+                room: Some(&item.room_id),
+            };
+            match chain.wake(&session, &letter) {
+                Ok((id, outcome)) => {
+                    self.remember_leader_prompt(&item.key);
+                    self.remember_routine_wake(&item.key);
+                    let how = match outcome {
+                        provider::WakeOutcome::Delivered => "delivered",
+                        provider::WakeOutcome::Queued(_) => "queued",
                     };
-                    match post_decrypted_with_bearer(
-                        url,
-                        &wake,
-                        bearer.as_ref().map(|token| token.as_str()),
-                    ) {
-                        Ok(()) => {
-                            self.remember_routine_wake(&item.key);
-                            crate::wake_policy::note_attempt(self.store_dir(), Some(200));
-                            self.wake_log.push(WakeAttempt {
-                                event_id: item.event_id.clone(),
-                                status: Some(200),
-                            });
-                        }
-                        Err(err) => {
-                            let status = match &err {
-                                ShellError::RoutineStatus(code) => Some(*code),
-                                _ => None,
-                            };
-                            crate::wake_policy::note_attempt(self.store_dir(), status);
-                            self.wake_log.push(WakeAttempt {
-                                event_id: item.event_id.clone(),
-                                status,
-                            });
-                            self.wake_note = Some(clip_public(err.to_string()));
-                        }
-                    }
+                    let status = (how == "delivered").then_some(200);
+                    crate::wake_policy::note_attempt(self.store_dir(), status);
+                    self.wake_log.push(WakeAttempt { event_id: item.event_id.clone(), status });
+                    self.wake_route = Some(format!("{id} {how}"));
+                }
+                Err(err) => {
+                    self.wake_note = Some(clip_public(err.to_string()));
                 }
             }
-            if let Some(sock) = sock.as_deref() {
-                if !self.leader_sent.contains(&item.key) {
-                    let cwd = cwd.clone().or_else(|| {
-                        std::env::current_dir()
-                            .ok()
-                            .map(|path| path.display().to_string())
-                    });
-                    let Some(cwd) = cwd.filter(|cwd| !cwd.is_empty()) else {
-                        self.wake_note = Some("leader cwd is empty".to_string());
-                        continue;
-                    };
-                    #[cfg(feature = "wake-grok")]
-                    {
-                    match mail4agent_grok::wake_decrypted_room_blocking(
-                        sock,
-                        &session_id,
-                        &cwd,
-                        &item.body,
-                    ) {
-                        Ok(()) => {
-                            self.remember_leader_prompt(&item.key);
-                        }
-                        Err(err) => {
-                            self.wake_note = Some(clip_public(err.to_string()));
-                        }
-                    }
-                    #[cfg(not(feature = "wake-grok"))]
-                    {
-                        let _ = (sock, &session_id, &cwd);
-                        self.wake_note = Some("this build was made without feature wake-grok".to_string());
-                    }
-                    }
-                }
-            }
-            if sock.is_none() && !self.leader_sent.contains(&item.key) {
-                let Some((session, mut chain)) = self.wake_chain.take() else {
-                    continue;
-                };
-                let from_nick = mxid_localpart(&item.from).to_string();
-                let letter = provider::WakeLetter {
-                    body: &item.body,
-                    from_nick: &from_nick,
-                    event_id: &item.event_id,
-                    room: Some(&item.room_id),
-                };
-                match chain.wake(&session, &letter) {
-                    Ok((id, outcome)) => {
-                        self.remember_leader_prompt(&item.key);
-                        let how = match outcome {
-                            provider::WakeOutcome::Delivered => "delivered",
-                            provider::WakeOutcome::Queued(_) => "queued",
-                        };
-                        self.wake_route = Some(format!("{id} {how}"));
-                    }
-                    Err(err) => {
-                        self.wake_note = Some(clip_public(err.to_string()));
-                    }
-                }
-                self.wake_chain = Some((session, chain));
-            }
+            self.wake_chain = Some((session, chain));
         }
     }
 }
 
+#[allow(dead_code)]
 struct InboundPlaintext {
     room_id: String,
     key: String,
@@ -2319,6 +2081,8 @@ fn record_path(dir: &Path, key: &RecordKey) -> Result<PathBuf, ShellError> {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use std::time::Duration;
     use super::*;
 
     #[test]
@@ -2347,7 +2111,6 @@ mod tests {
     }
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -2481,169 +2244,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn post_decrypted_reaches_the_loopback_routine() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        let server = thread::spawn(move || {
-            let (mut sock, _) = listener.accept().expect("accept");
-            sock.set_read_timeout(Some(Duration::from_secs(2)))
-                .expect("timeout");
-            let mut buf = Vec::new();
-            let mut tmp = [0u8; 1024];
-            loop {
-                let n = sock.read(&mut tmp).unwrap_or(0);
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&tmp[..n]);
-                if let Some(header_end) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
-                    let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
-                    let length = headers
-                        .lines()
-                        .find_map(|line| {
-                            let (name, value) = line.split_once(':')?;
-                            if name.eq_ignore_ascii_case("content-length") {
-                                value.trim().parse::<usize>().ok()
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or(0);
-                    if buf.len() >= header_end + 4 + length {
-                        let body = buf[header_end + 4..header_end + 4 + length].to_vec();
-                        let _ = sock.write_all(
-                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                        );
-                        return (headers, body);
-                    }
-                }
-            }
-            (String::new(), buf)
-        });
 
-        let wake = RoutineWake {
-            url: format!("http://{addr}/routine"),
-        };
-        post_decrypted(
-            &wake.url,
-            &DecryptedWake {
-                body: "hello-from-room",
-                from: "@bob:localhost",
-                nick: None,
-                event_id: "$m1:localhost",
-                ..Default::default()
-            },
-        )
-        .expect("post");
-        let (headers, body) = server.join().expect("listener stopped");
-        assert!(headers.starts_with("POST /routine HTTP/1.1"), "{headers}");
-        assert!(
-            headers
-                .to_ascii_lowercase()
-                .contains("content-type: application/json"),
-            "{headers}"
-        );
-        assert!(
-            !headers.to_ascii_lowercase().contains("authorization"),
-            "routine post must not add a bearer"
-        );
-        assert!(
-            !headers.to_ascii_lowercase().contains("x-automation-key"),
-            "routine post must not add a key without a bearer"
-        );
-        assert!(!headers.contains("/mail/send"), "{headers}");
-        assert_wake_json(
-            &body,
-            "hello-from-room",
-            "@bob:localhost",
-            "$m1:localhost",
-            None,
-        );
-    }
-
-    #[test]
-    fn post_decrypted_attempts_https_against_a_local_self_signed_listener() {
-        let dir = temp_dir("https");
-        std::fs::create_dir_all(&dir.0).expect("dir");
-        let cert = dir.0.join("cert.pem");
-        let key = dir.0.join("key.pem");
-        let generated = Command::new("openssl")
-            .args([
-                "req",
-                "-x509",
-                "-newkey",
-                "rsa:2048",
-                "-keyout",
-                key.to_str().expect("utf-8"),
-                "-out",
-                cert.to_str().expect("utf-8"),
-                "-days",
-                "1",
-                "-nodes",
-                "-subj",
-                "/CN=127.0.0.1",
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .expect("openssl req");
-        assert!(generated.success(), "openssl did not write a local cert");
-
-        let probe = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = probe.local_addr().expect("addr").port();
-        drop(probe);
-        let mut server = Command::new("openssl")
-            .args([
-                "s_server",
-                "-accept",
-                &format!("127.0.0.1:{port}"),
-                "-cert",
-                cert.to_str().expect("utf-8"),
-                "-key",
-                key.to_str().expect("utf-8"),
-                "-www",
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("openssl s_server");
-        let started = std::time::Instant::now();
-        while started.elapsed() < Duration::from_secs(3) {
-            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-
-        let err = post_decrypted(
-            &format!("https://127.0.0.1:{port}/hook"),
-            &DecryptedWake {
-                body: "hello-https",
-                from: "@bob:localhost",
-                nick: None,
-                event_id: "$m1:localhost",
-                ..Default::default()
-            },
-        )
-        .expect_err("a self-signed cert must not verify");
-        let _ = server.kill();
-        let _ = server.wait();
-        assert!(
-            !matches!(err, ShellError::RoutineUrl),
-            "https was refused before the client tried it: {err}"
-        );
-        let text = err.to_string().to_ascii_lowercase();
-        assert!(
-            text.contains("cert")
-                || text.contains("tls")
-                || text.contains("handshake")
-                || text.contains("ssl")
-                || text.contains("unknownissuer")
-                || text.contains("invalidpeer"),
-            "https did not reach a tls failure: {err}"
-        );
-    }
 
     #[test]
     fn a_base_url_carries_no_fragment_credentials_or_query() {
@@ -2814,6 +2415,7 @@ mod tests {
         );
     }
 
+    #[allow(dead_code)]
     struct Hit {
         headers: String,
         body: Vec<u8>,
@@ -2858,20 +2460,6 @@ mod tests {
         );
         let _ = sock.write_all(head.as_bytes());
         let _ = sock.write_all(body);
-    }
-
-    fn assert_wake_json(bytes: &[u8], body: &str, from: &str, event_id: &str, nick: Option<&str>) {
-        let parsed: serde_json::Value = serde_json::from_slice(bytes).expect("json wake");
-        assert_eq!(parsed["body"], body);
-        assert_eq!(parsed["from"], from);
-        assert_eq!(parsed["event_id"], event_id);
-        match nick {
-            Some(nick) => assert_eq!(parsed["nick"], nick),
-            None => assert!(
-                parsed.get("nick").is_none() || parsed["nick"].is_null(),
-                "unknown nick must be omitted or null, not invented: {parsed}"
-            ),
-        }
     }
 
     fn sync_with_text_nick(body: &str, nick: Option<&str>) -> Vec<u8> {
@@ -3033,26 +2621,16 @@ mod tests {
             cwd: None,
             headless: false,
         };
-        let host = provider::HostEnv {
-            surface: provider::Surface::Local,
-            vendor: None,
-            os: "linux",
-        };
-        let config = provider::AdapterConfig {
-            inbox_dir: Some(inbox_dir.clone()),
-            spawn_program: Some("/bin/false".into()),
-            ..provider::AdapterConfig::default()
-        };
-        let chain = provider::plan_chain(&session, &host, &config);
+        let chain = provider::letter_chain(session.kind, Some(inbox_dir.clone()));
         store.set_wake_chain(session, chain);
-        assert_eq!(store.wake_chain_ids()[0], "codex-app-server-turn");
+        assert_eq!(store.wake_chain_ids(), vec!["inbox-queue"], "m4a links no session channel");
         store.drive(1_000, false).expect("drive");
         store.drive(3_000, false).expect("drive again");
         let route = store.take_wake_route();
         let note = store.wake_note().unwrap_or("").to_string();
         drop(store);
         stop(&home_done, home);
-        // No app-server and no hook armed: the durable queue took it, once.
+        // No hook armed: the durable queue took it, once.
         assert_eq!(route.as_deref(), Some("inbox-queue queued"), "note={note}");
         let letters = provider::inbox::drain(&inbox_dir);
         assert_eq!(letters.len(), 1);
@@ -3060,141 +2638,8 @@ mod tests {
         assert!(letters[0].letter.prompt.contains("m4a-send --as builder"));
     }
 
-    #[test]
-    fn inbound_room_text_hits_the_routine_once() {
-        let (base, home_done, home) = spawn_homeserver("wake-plain");
-        let (routine, hits, routine_done, routine_thread) = spawn_routine();
-        let dir = temp_dir("wake-once");
-        let mut store = open_against(&base, &dir.0, "session-a");
-        store.set_wake(SessionWake {
-            routine_url: Some(routine),
-            ..SessionWake::default()
-        });
-        store.drive(1_000, false).expect("drive");
-        store.drive(3_000, false).expect("drive again");
-        let note = store.wake_note().unwrap_or("").to_string();
-        let saw_text = store.texts().iter().any(|text| text.body == "wake-plain");
-        let trace = store.http_trace();
-        drop(store);
-        stop(&routine_done, routine_thread);
-        stop(&home_done, home);
-        assert!(
-            saw_text,
-            "engine did not surface the inbound text; http={trace:?} note={note}"
-        );
-        let hits = hits.lock().expect("hits");
-        assert_eq!(
-            hits.len(),
-            1,
-            "routine was not hit exactly once; note={note}"
-        );
-        let hit = &hits[0];
-        assert!(
-            hit.headers.starts_with("POST /routine HTTP/1.1"),
-            "{}",
-            hit.headers.lines().next().unwrap_or("")
-        );
-        assert!(
-            !hit.headers.to_ascii_lowercase().contains("authorization"),
-            "no bearer was passed, so the routine post must not send one"
-        );
-        assert!(
-            !hit.headers
-                .to_ascii_lowercase()
-                .contains("x-automation-key"),
-            "no bearer was passed, so the routine post must not send a key"
-        );
-        assert!(!hit.headers.contains("/mail/send"));
-        assert!(!hit.headers.contains("/admin/listener"));
-        assert!(
-            hit.headers
-                .to_ascii_lowercase()
-                .contains("content-type: application/json"),
-            "{}",
-            hit.headers
-        );
-        assert_wake_json(
-            &hit.body,
-            "wake-plain",
-            "@bob:localhost",
-            "$m1:localhost",
-            None,
-        );
-    }
 
-    #[test]
-    fn routine_wake_stays_once_across_store_reopen() {
-        let (base, home_done, home) = spawn_homeserver("wake-persist");
-        let (routine, hits, routine_done, routine_thread) = spawn_routine();
-        let dir = temp_dir("wake-persist");
-        let mut store = open_against(&base, &dir.0, "session-a");
-        store.set_wake(SessionWake {
-            routine_url: Some(routine.clone()),
-            ..SessionWake::default()
-        });
-        store.drive(1_000, false).expect("drive");
-        let ledger = dir.0.join("routine-woken");
-        assert!(
-            ledger.is_file(),
-            "successful wake must persist routine-woken"
-        );
-        drop(store);
-        let mut store = open_against(&base, &dir.0, "session-a");
-        store.set_wake(SessionWake {
-            routine_url: Some(routine),
-            ..SessionWake::default()
-        });
-        store.drive(1_000, false).expect("drive again");
-        store.drive(3_000, false).expect("drive third");
-        let note = store.wake_note().unwrap_or("").to_string();
-        drop(store);
-        stop(&routine_done, routine_thread);
-        stop(&home_done, home);
-        let hits = hits.lock().expect("hits");
-        assert_eq!(
-            hits.len(),
-            1,
-            "reopen must not re-POST the same event; note={note} hits={}",
-            hits.len()
-        );
-    }
 
-    #[test]
-    fn inbound_room_text_posts_the_sender_nick_the_shell_already_has() {
-        let (base, home_done, home) = spawn_homeserver_nick("wake-named", Some("Alice"));
-        let (routine, hits, routine_done, routine_thread) = spawn_routine();
-        let dir = temp_dir("wake-nick");
-        let mut store = open_against(&base, &dir.0, "session-a");
-        store.set_wake(SessionWake {
-            routine_url: Some(routine),
-            ..SessionWake::default()
-        });
-        store.drive(1_000, false).expect("drive");
-        let note = store.wake_note().unwrap_or("").to_string();
-        drop(store);
-        stop(&routine_done, routine_thread);
-        stop(&home_done, home);
-        let hits = hits.lock().expect("hits");
-        assert_eq!(
-            hits.len(),
-            1,
-            "routine was not hit exactly once; note={note}"
-        );
-        assert!(
-            !hits[0]
-                .headers
-                .to_ascii_lowercase()
-                .contains("authorization"),
-            "no bearer was passed"
-        );
-        assert_wake_json(
-            &hits[0].body,
-            "wake-named",
-            "@bob:localhost",
-            "$m1:localhost",
-            Some("Alice"),
-        );
-    }
 
     #[test]
     fn the_owners_policy_silences_a_wake_and_the_silenced_message_is_never_replayed() {
@@ -3219,6 +2664,27 @@ mod tests {
     }
 
     #[test]
+    fn a_routine_url_is_never_posted_by_m4a_and_the_letter_lands_in_the_inbox() {
+        let (base, home_done, home) = spawn_homeserver("wake-plain");
+        let (routine, hits, routine_done, routine_thread) = spawn_routine();
+        let dir = temp_dir("wake-pure");
+        let mut store = open_against(&base, &dir.0, "session-a");
+        store.set_wake(SessionWake { routine_url: Some(routine), routine_bearer: Some("k-test".into()), ..SessionWake::default() });
+        store.drive(1_000, false).expect("drive");
+        store.drive(3_000, false).expect("drive again");
+        let route = store.take_wake_route();
+        let note = store.wake_note().unwrap_or("").to_string();
+        drop(store);
+        stop(&routine_done, routine_thread);
+        stop(&home_done, home);
+        assert!(hits.lock().expect("hits").is_empty(), "m4a posted to a routine");
+        assert_eq!(route.as_deref(), Some("inbox-queue queued"), "note={note}");
+        let inbox = provider::registry::inbox_dir(dir.0.parent().expect("parent"), "session-a");
+        let letters = provider::inbox::drain(&inbox);
+        assert_eq!(letters.len(), 1, "the letter waits in the durable inbox once");
+    }
+
+    #[test]
     fn no_routine_url_posts_nothing() {
         let (base, home_done, home) = spawn_homeserver("wake-plain");
         let (_routine, hits, routine_done, routine_thread) = spawn_routine();
@@ -3239,247 +2705,8 @@ mod tests {
         assert!(hits.is_empty(), "a post happened with no routine url");
     }
 
-    #[test]
-    fn routine_bearer_header_is_sent_only_when_the_caller_passed_one() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        let server = thread::spawn(move || {
-            let (mut sock, _) = listener.accept().expect("accept");
-            let (headers, body) = read_http(&mut sock).expect("request");
-            let _ = sock
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-            (headers, body)
-        });
-        let bearer = "env-bearer";
-        post_decrypted_with_bearer(
-            &format!("http://{addr}/routine"),
-            &DecryptedWake {
-                body: "letter",
-                from: "@bob:localhost",
-                nick: Some("Bob"),
-                event_id: "$m1:localhost",
-                ..Default::default()
-            },
-            Some(bearer),
-        )
-        .expect("post");
-        let (headers, body) = server.join().expect("server");
-        let line = headers
-            .lines()
-            .find(|line| line.to_ascii_lowercase().starts_with("authorization:"))
-            .expect("authorization header");
-        let (name, value) = line.split_once(':').expect("header");
-        assert!(name.eq_ignore_ascii_case("authorization"));
-        assert_eq!(value.trim(), format!("Bearer {bearer}"));
-        let automation = headers
-            .lines()
-            .find(|line| line.to_ascii_lowercase().starts_with("x-automation-key:"))
-            .expect("automation key header");
-        let (name, value) = automation.split_once(':').expect("header");
-        assert!(name.eq_ignore_ascii_case("x-automation-key"));
-        assert_eq!(value.trim(), bearer);
-        assert_eq!(
-            headers
-                .lines()
-                .filter(|line| line.to_ascii_lowercase().starts_with("authorization:"))
-                .count(),
-            1
-        );
-        assert_eq!(
-            headers
-                .lines()
-                .filter(|line| line.to_ascii_lowercase().starts_with("x-automation-key:"))
-                .count(),
-            1
-        );
-        assert_wake_json(
-            &body,
-            "letter",
-            "@bob:localhost",
-            "$m1:localhost",
-            Some("Bob"),
-        );
-    }
 
-    #[test]
-    fn post_decrypted_omits_a_missing_or_blank_nick() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        let server = thread::spawn(move || {
-            let mut bodies = Vec::new();
-            for _ in 0..2 {
-                let (mut sock, _) = listener.accept().expect("accept");
-                let (headers, body) = read_http(&mut sock).expect("request");
-                assert!(
-                    !headers.to_ascii_lowercase().contains("authorization"),
-                    "no bearer was passed"
-                );
-                assert!(
-                    !headers.to_ascii_lowercase().contains("x-automation-key"),
-                    "no bearer was passed"
-                );
-                let _ = sock.write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                );
-                bodies.push(body);
-            }
-            bodies
-        });
-        let url = format!("http://{addr}/routine");
-        post_decrypted(
-            &url,
-            &DecryptedWake {
-                body: "plain",
-                from: "@bob:localhost",
-                nick: None,
-                event_id: "$m1:localhost",
-                ..Default::default()
-            },
-        )
-        .expect("missing nick");
-        post_decrypted(
-            &url,
-            &DecryptedWake {
-                body: "plain",
-                from: "@bob:localhost",
-                nick: Some("   "),
-                event_id: "$m1:localhost",
-                ..Default::default()
-            },
-        )
-        .expect("blank nick");
-        let bodies = server.join().expect("server");
-        for body in &bodies {
-            assert_wake_json(body, "plain", "@bob:localhost", "$m1:localhost", None);
-        }
-    }
 
-    #[cfg(all(unix, feature = "wake-grok"))]
-    #[test]
-    fn inbound_room_text_prompts_the_leader_socket_once() {
-        use std::os::unix::net::{UnixListener, UnixStream};
-
-        fn frame_read(sock: &mut UnixStream) -> Option<Vec<u8>> {
-            let _ = sock.set_read_timeout(Some(Duration::from_secs(3)));
-            let mut len_buf = [0u8; 4];
-            sock.read_exact(&mut len_buf).ok()?;
-            let len = u32::from_be_bytes(len_buf) as usize;
-            if len > 1_000_000 {
-                return None;
-            }
-            let mut buf = vec![0u8; len];
-            sock.read_exact(&mut buf).ok()?;
-            Some(buf)
-        }
-
-        fn frame_write(sock: &mut UnixStream, value: &serde_json::Value) {
-            let bytes = serde_json::to_vec(value).expect("json");
-            let mut out = (bytes.len() as u32).to_be_bytes().to_vec();
-            out.extend_from_slice(&bytes);
-            sock.write_all(&out).expect("write");
-            sock.flush().expect("flush");
-        }
-
-        fn serve_one(sock: &mut UnixStream, prompts: &Mutex<Vec<String>>) {
-            let Some(bytes) = frame_read(sock) else {
-                return;
-            };
-            let register: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
-            assert_eq!(register["type"], "register");
-            frame_write(
-                sock,
-                &serde_json::json!({"type": "registered", "ready": true}),
-            );
-            loop {
-                let Some(bytes) = frame_read(sock) else {
-                    break;
-                };
-                let value: serde_json::Value = match serde_json::from_slice(&bytes) {
-                    Ok(value) => value,
-                    Err(_) => break,
-                };
-                if value.get("type").and_then(|item| item.as_str()) == Some("disconnect") {
-                    break;
-                }
-                if value.get("type").and_then(|item| item.as_str()) != Some("acp") {
-                    continue;
-                }
-                let payload = value
-                    .get("payload")
-                    .and_then(|item| item.as_str())
-                    .unwrap_or("");
-                let inner: serde_json::Value = serde_json::from_str(payload).unwrap_or_default();
-                if inner.get("method").and_then(|item| item.as_str()) == Some("session/prompt") {
-                    let text = inner["params"]["prompt"][0]["text"]
-                        .as_str()
-                        .unwrap_or("")
-                        .to_string();
-                    let session = inner["params"]["sessionId"]
-                        .as_str()
-                        .unwrap_or("")
-                        .to_string();
-                    prompts
-                        .lock()
-                        .expect("prompts")
-                        .push(format!("{session} {text}"));
-                }
-                let id = inner.get("id").cloned().unwrap_or(serde_json::json!(null));
-                let body = serde_json::json!({"jsonrpc":"2.0","id": id, "result": {}}).to_string();
-                frame_write(sock, &serde_json::json!({"type":"acp","payload": body}));
-            }
-        }
-
-        let dir = temp_dir("leader");
-        let sock_dir = dir.0.join("sock");
-        std::fs::create_dir_all(&sock_dir).expect("dir");
-        let path = sock_dir.join("leader.sock");
-        let listener = UnixListener::bind(&path).expect("bind");
-        listener.set_nonblocking(true).expect("nonblocking");
-        let prompts = Arc::new(Mutex::new(Vec::<String>::new()));
-        let recorded = Arc::clone(&prompts);
-        let done = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&done);
-        let leader = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(8);
-            while !flag.load(Ordering::Relaxed) && Instant::now() < deadline {
-                match listener.accept() {
-                    Ok((mut sock, _)) => {
-                        let _ = sock.set_nonblocking(false);
-                        serve_one(&mut sock, &recorded);
-                    }
-                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(15));
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-
-        let (base, home_done, home) = spawn_homeserver("wake-leader");
-        let mut store = open_against(&base, &dir.0.join("store"), "session-a");
-        store.set_wake(SessionWake {
-            leader_sock: Some(path),
-            leader_cwd: Some("/tmp".to_string()),
-            ..SessionWake::default()
-        });
-        store.drive(1_000, false).expect("drive");
-        store.drive(3_000, false).expect("drive again");
-        let note = store.wake_note().unwrap_or("").to_string();
-        let saw_text = store.texts().iter().any(|text| text.body == "wake-leader");
-        drop(store);
-        stop(&done, leader);
-        stop(&home_done, home);
-        assert!(
-            saw_text,
-            "engine did not surface the inbound text; note={note}"
-        );
-        let prompts = prompts.lock().expect("prompts");
-        assert_eq!(
-            prompts.as_slice(),
-            ["session-a wake-leader"],
-            "leader prompt was not the decrypted text once; note={note}"
-        );
-    }
 }
 
 /// The server part of a Matrix user id (`@nick:server` -> `server`).

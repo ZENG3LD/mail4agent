@@ -76,7 +76,6 @@ members = [
     "crates/mail4agent-core",
     "crates/mail4agent-store-sqlite",
     "crates/mail4agent-client",
-    "crates/mail4agent-grok",
     "crates/mail4agent-vodozemac",
     "crates/mail4agent-messenger",
     "crates/mail4agent-messenger-shell",
@@ -100,7 +99,6 @@ mail4agent-attest = { path = "crates/mail4agent-attest", version = "=0.4.7" }
 mail4agent-core = { path = "crates/mail4agent-core", version = "=0.4.7" }
 mail4agent-store-sqlite = { path = "crates/mail4agent-store-sqlite", version = "=0.4.7" }
 mail4agent-client = { path = "crates/mail4agent-client", version = "=0.4.7" }
-mail4agent-grok = { path = "crates/mail4agent-grok", version = "=0.4.7" }
 mail4agent-vodozemac = { path = "crates/mail4agent-vodozemac", version = "=0.4.7" }
 mail4agent-messenger = { path = "crates/mail4agent-messenger", version = "=0.4.7" }
 mail4agent-messenger-shell = { path = "crates/mail4agent-messenger-shell", version = "=0.4.7" }

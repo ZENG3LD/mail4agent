@@ -6,9 +6,7 @@
 //! | `m4a-agent`            | old binary                 |
 //! | ---------------------- | -------------------------- |
 //! | `web-client`           | `m4a-web-client`           |
-//! | `node-client`          | `m4a-node-client`          |
 //! | `grok-listen`          | `m4a-grok-listen`          |
-//! | `claude-channel`       | `m4a-claude-channel`       |
 //! | `inbox`                | `m4a-inbox`                |
 //! | `send`                 | `m4a-send`                 |
 //! | `mail`                 | `m4a`                      |
@@ -19,8 +17,6 @@
 //! | `element-open`         | — (open Element, logged in)|
 //! | `door-listen`          | — (wake on hatchery node mail)|
 
-#[cfg(feature = "wake-claude")]
-pub mod claude_channel;
 pub mod enroll;
 pub mod session_arg;
 pub mod vault;
@@ -28,12 +24,9 @@ pub mod wake;
 #[cfg(feature = "element-open")]
 pub mod element_open;
 pub mod ensure_agent_webhooks;
-#[cfg(feature = "wake-grok")]
 pub mod grok_listen;
 pub mod inbox;
 pub mod mail;
-#[cfg(feature = "wake-grok")]
-pub mod node_client;
 pub mod send;
 pub mod web_client;
 pub mod door_listen;
@@ -42,20 +35,16 @@ pub mod account;
 mod letter;
 
 /// The subcommand names, in the order of the table above.
-pub const COMMANDS: &[&str] = &["web-client", "node-client", "grok-listen", "claude-channel", "inbox", "send", "mail", "ensure-agent-webhooks", "enroll", "wake", "vault", "element-open", "door-listen", "launch", "account", "letter"];
+pub const COMMANDS: &[&str] = &["web-client", "grok-listen", "inbox", "send", "mail", "ensure-agent-webhooks", "enroll", "wake", "vault", "element-open", "door-listen", "launch", "account", "letter"];
 
 /// Runs `command` with its arguments. `Err` names an unknown command (or one this build lacks).
 pub fn dispatch(command: &str, args: Vec<String>) -> Result<(), String> {
     match command {
         "web-client" => web_client::run(args),
-        #[cfg(feature = "wake-grok")]
-        "node-client" => node_client::run(args),
-        #[cfg(feature = "wake-grok")]
         "grok-listen" => grok_listen::run(args),
-        #[cfg(not(feature = "wake-grok"))]
-        "node-client" | "grok-listen" => return Err("this build was made without feature wake-grok".to_string()),
-        #[cfg(feature = "wake-claude")]
-        "claude-channel" => claude_channel::run(args),
+        "node-client" | "claude-channel" => {
+            return Err(format!("{command} moved out of m4a: session delivery is g4a's (hatchery node / gate4agent-wake)"))
+        }
         "inbox" => inbox::run(args),
         "send" => send::run(args),
         "mail" => mail::run(args),

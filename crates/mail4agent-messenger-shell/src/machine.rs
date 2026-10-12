@@ -1206,13 +1206,20 @@ fn gateway_client() -> Result<reqwest::blocking::Client, ShellError> {
         .map_err(|_| ShellError::Gateway("gateway client could not start".to_string()))
 }
 
+fn gateway_bearer_header(token: &str) -> Result<reqwest::header::HeaderValue, ()> {
+    let token = crate::webhook::bearer_token(token).ok_or(())?;
+    let mut header = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| ())?;
+    header.set_sensitive(true);
+    Ok(header)
+}
+
 fn gateway_post(
     gate: &GatewayConn,
     method: &str,
     body: &serde_json::Value,
 ) -> Result<(u16, Vec<u8>), ShellError> {
     let url = format!("{}/api/{method}", gate.base);
-    let authorization = crate::bearer_header(&gate.token).map_err(|_| {
+    let authorization = gateway_bearer_header(&gate.token).map_err(|_| {
         ShellError::Gateway("gateway token is not a single header value".to_string())
     })?;
     let bytes = serde_json::to_vec(body)
@@ -2063,37 +2070,11 @@ impl MachineClient {
         }
     }
 
-    /// POSTs `kind=peer_joined` once to every other ready bot's webhook.
-    /// Called when `joined_nick` first becomes ready. Failures are logged
-    /// without the URL or key.
-    fn announce_peer_joined(&self, joined_nick: &str, joined_user_id: &str) {
-        let body = serde_json::json!({
-            "kind": "peer_joined",
-            "nick": joined_nick,
-            "user_id": joined_user_id,
-        });
-        for store in &self.sessions {
-            let Some(nick) = store.nick() else {
-                continue;
-            };
-            if nick.eq_ignore_ascii_case(joined_nick) {
-                continue;
-            }
-            if !store.has_routine() {
-                continue;
-            }
-            let Some((url, bearer)) = store.routine_target() else {
-                continue;
-            };
-            match crate::post_routine_json(&url, &body, bearer.as_deref()) {
-                Ok(()) => {
-                    eprintln!("mail4agent: peer_joined {joined_nick} -> {nick} status=200")
-                }
-                Err(err) => {
-                    eprintln!("mail4agent: peer_joined {joined_nick} -> {nick}: {err}")
-                }
-            }
-        }
+    /// A peer became ready. m4a no longer POSTs to other bots' routines (no HTTP to routines in
+    /// the messenger); the event is logged, and hosts that want it subscribe through their own
+    /// pipeline.
+    fn announce_peer_joined(&self, joined_nick: &str, _joined_user_id: &str) {
+        eprintln!("mail4agent: peer_joined {joined_nick}");
     }
 
     /// Agent ids of open sessions that still have no wake.
@@ -2504,11 +2485,11 @@ fn server_name_of(mxid: &str) -> Result<&str, ShellError> {
 /// spawn only when headless). Nothing changes on the Grok Bot box or for
 /// a session that has a routine.
 fn attach_detected_chain(store: &mut OpenedStore, config: &SessionConfig, nick: &str) {
-    if let Some((session, chain)) = crate::provider::chain::detected_web_chain(
-        config.session_id(),
-        nick,
-        &config.store_root,
-    ) {
+    // m4a hands letters to the host (letter hook) and keeps them in the inbox; the vendor
+    // detection only names the session kind for the hook payload.
+    if let Some((session, _)) = crate::provider::chain::detected_web_chain(config.session_id(), nick, &config.store_root) {
+        let inbox = crate::provider::registry::inbox_dir(&config.store_root, config.session_id());
+        let chain = crate::provider::letter_chain(session.kind, Some(inbox));
         store.set_wake_chain(session, chain);
     }
 }

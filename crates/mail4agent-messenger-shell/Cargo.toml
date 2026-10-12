@@ -11,18 +11,9 @@ description = "Client shell that opens the sealed messenger store for one sessio
 
 [features]
 default = ["full"]
-full = ["tier-server", "tier-matrix", "vault-keychain", "vault-backup", "element-open", "local-bus", "legacy-wake"]
-# DEPRECATED: provider wake/spawn adapters now live in g4a (gate4agent-wake). `legacy-wake`
-# keeps them compiled in for standalone users (grok-listen, door-listen, codex-listen, web
-# client). A harness host turns it off and subscribes to M4A_LETTER_HOOK instead.
-legacy-wake = ["wake-grok", "wake-claude", "wake-codex", "wake-kimi", "wake-cursor", "wake-routine", "wake-spawn"]
-wake-grok = ["dep:mail4agent-grok", "gate4agent-wake/wake-grok"]
-wake-claude = ["gate4agent-wake/wake-claude"]
-wake-codex = ["gate4agent-wake/wake-codex"]
-wake-kimi = ["gate4agent-wake/wake-kimi"]
-wake-cursor = ["gate4agent-wake/wake-cursor"]
-wake-routine = ["gate4agent-wake/wake-routine"]
-wake-spawn = ["gate4agent-wake/wake-spawn"]
+full = ["tier-server", "tier-matrix", "vault-keychain", "vault-backup", "element-open", "local-bus"]
+# m4a is a pure messenger: no wake/deliver adapters. Letters go to M4A_LETTER_HOOK (the host,
+# e.g. the hatchery node, delivers through g4a) and the durable inbox.
 # The OS keychain for the vault master key (a headless machine falls back to an owner-only key file).
 vault-keychain = ["m4a-agent/vault-keychain"]
 # Encrypted vault backup and restore (`m4a-agent vault backup|restore`).
@@ -36,13 +27,12 @@ tier-matrix = ["m4a-agent/tier-matrix"]
 local-bus = ["dep:mail4agent-server"]
 
 [dependencies]
-# Branch-only until gate4agent-wake is published.
-gate4agent-wake = { git = "https://github.com/ZENG3LD/gate4agent.git", branch = "feat/wake", default-features = false }
+# Session vocabulary + durable inbox only (no deliver features). Branch-only until published.
+gate4agent-wake = { git = "https://github.com/ZENG3LD/gate4agent.git", branch = "feat/deliver-adapters", default-features = false }
 m4a-seam = { workspace = true }
 m4a-agent = { workspace = true, features = ["engine"] }
 mail4agent-messenger = { workspace = true  }
 mail4agent-server = { workspace = true, optional = true }
-mail4agent-grok = { workspace = true, optional = true }
 sha2 = "0.10"
 zeroize = "1"
 thiserror = "2"
@@ -71,32 +61,16 @@ name = "m4a-agent"
 path = "src/bin/m4a_agent.rs"
 
 [[bin]]
-name = "m4a-codex-listen"
-path = "src/bin/codex_listen.rs"
-required-features = ["wake-codex"]
-
-[[bin]]
 name = "m4a-ensure-agent-webhooks"
 path = "src/bin/ensure_agent_webhooks.rs"
 
 [[bin]]
-name = "m4a-web-client"
-path = "src/bin/web_client.rs"
-
-[[bin]]
-name = "m4a-node-client"
-path = "src/bin/node_client.rs"
-required-features = ["wake-grok"]
-
-[[bin]]
 name = "m4a-grok-listen"
 path = "src/bin/grok_listen.rs"
-required-features = ["wake-grok"]
 
 [[bin]]
-name = "m4a-claude-channel"
-path = "src/bin/claude_channel.rs"
-required-features = ["wake-claude"]
+name = "m4a-web-client"
+path = "src/bin/web_client.rs"
 
 [[bin]]
 name = "m4a-inbox"

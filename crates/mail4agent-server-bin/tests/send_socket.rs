@@ -1,7 +1,8 @@
 //! `m4a-send` path: a request on the client's local socket becomes an
-//! encrypted DM from the `as` session, and the recipient's wake JSON
-//! carries room, sender nick, recipient nick, event id, body, and the reply
-//! command. Loopback only. No bearer is printed.
+//! encrypted DM from the `as` session, and the recipient's letter event
+//! (`M4A_LETTER_HOOK`) carries room, sender nick, recipient nick, event id and
+//! body. m4a never POSTs to the recipient's routine (the host delivers).
+//! Loopback only. No bearer is printed.
 
 #[path = "support_product.rs"]
 mod support_product;
@@ -164,6 +165,15 @@ fn send_socket_dm_wakes_the_recipient_with_a_reply_hint() {
     wait_until_accepts(&addr);
 
     let (routine_url, routine_rx) = routine_mock();
+    let hook_out = temp.dir.join("letter.json");
+    let hook = temp.dir.join("hook.sh");
+    std::fs::write(&hook, format!("#!/bin/sh\ncat > {}.tmp && mv {}.tmp {}\n", hook_out.display(), hook_out.display(), hook_out.display())).expect("hook");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
+    std::env::set_var("M4A_LETTER_HOOK", &hook);
     let root = temp.dir.join("stores");
     let product = support_product::start_product(&base);
     let base = product.url.clone();
@@ -206,8 +216,8 @@ fn send_socket_dm_wakes_the_recipient_with_a_reply_hint() {
         if let Some(sent) = report.sent.into_iter().next() {
             served = Some(sent);
         }
-        if let Ok(body) = routine_rx.try_recv() {
-            wake = Some(body);
+        if wake.is_none() {
+            wake = std::fs::read(&hook_out).ok();
         }
         thread::sleep(Duration::from_millis(100));
     }
@@ -226,22 +236,15 @@ fn send_socket_dm_wakes_the_recipient_with_a_reply_hint() {
     assert!(event_id.starts_with('$'));
 
     let wake: serde_json::Value =
-        serde_json::from_slice(&wake.expect("recipient routine was woken")).expect("wake json");
+        serde_json::from_slice(&wake.expect("recipient letter reached the hook")).expect("letter json");
     assert_eq!(wake["body"], text);
     assert_eq!(wake["event_id"], event_id.as_str());
     assert_eq!(wake["room"], answer.room.clone().expect("room").as_str());
-    assert_eq!(wake["from_nick"], "alice");
-    assert_eq!(wake["to"], "privet-mir");
-    assert!(wake["from"]
-        .as_str()
-        .expect("from")
-        .starts_with("@alice:"));
-    assert_eq!(
-        wake["reply"],
-        "m4a-send --as privet-mir --to alice '<your reply>'"
-    );
+    assert_eq!(wake["from"], "alice");
+    assert_eq!(wake["nick"], "privet-mir");
     let raw = wake.to_string();
     assert!(!raw.contains("test-routine-key"));
+    assert!(routine_rx.try_recv().is_err(), "m4a posted to a routine");
 
     drop(client);
     assert!(!sock.exists(), "socket file removed on drop");

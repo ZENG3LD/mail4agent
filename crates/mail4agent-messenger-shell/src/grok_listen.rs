@@ -4,15 +4,15 @@
 //! Birth is a row in grok's `active_sessions.json`. Each new row is
 //! registered (nick, sealed Olm key, device bearer in the keychain, public
 //! key via the first drive). The push socket is the listener. After a
-//! pushed event is decrypted, [`OpenedStore::drive`] calls
-//! `mail4agent_grok::wake_decrypted_room_blocking` on the leader socket.
-//! This process does not start `grok` and does not create a webhook.
+//! pushed event is decrypted, [`OpenedStore::drive`] hands the letter to the
+//! letter hook (`M4A_LETTER_HOOK`; the host delivers it through g4a, e.g. grok
+//! ACP on the leader socket) and keeps it in the durable inbox. This process
+//! opens no grok channel, does not start `grok` and does not create a webhook.
 //!
 //! Other providers (Codex, Kimi Code, Claude Code, Cursor CLI) register
 //! from inside their session (`m4a-inbox register`, see
 //! [`crate::provider::registry`]); [`GrokListener::hear_providers`] adopts
-//! them on the same push socket and wakes each through its detected
-//! [`crate::provider::WakeChain`]. The Grok leader path is unchanged.
+//! them on the same push socket; their letters take the same hook + inbox path.
 
 use std::collections::HashSet;
 use std::fs::File;
@@ -52,7 +52,7 @@ pub fn hear(text: &str, sessions_root: &Path) -> Result<Vec<Heard>, ShellError> 
     if text.trim().is_empty() {
         return Ok(Vec::new());
     }
-    let rows = mail4agent_grok::parse_active_sessions(text)
+    let rows = parse_active_sessions(text)
         .map_err(|_| ShellError::SessionList("grok session index is unreadable".to_string()))?;
     let mut used = HashSet::new();
     let mut heard = Vec::with_capacity(rows.len());
@@ -70,6 +70,26 @@ pub fn hear(text: &str, sessions_root: &Path) -> Result<Vec<Heard>, ShellError> 
         });
     }
     Ok(heard)
+}
+
+struct ActiveRow {
+    session_id: String,
+    cwd: String,
+}
+
+/// Rows of grok's `active_sessions.json` (session discovery only; no grok channel is opened).
+fn parse_active_sessions(text: &str) -> Result<Vec<ActiveRow>, ()> {
+    #[derive(serde::Deserialize)]
+    struct Raw {
+        session_id: String,
+        cwd: String,
+    }
+    let rows: Vec<Raw> = serde_json::from_str(text).map_err(|_| ())?;
+    Ok(rows
+        .into_iter()
+        .filter(|r| !r.session_id.is_empty() && !r.cwd.is_empty())
+        .map(|r| ActiveRow { session_id: r.session_id, cwd: r.cwd })
+        .collect())
 }
 
 /// `generated_title`, else `session_summary`. Empty means the title has
@@ -142,8 +162,6 @@ pub struct GrokListener {
     send_listener: Option<SendListener>,
     /// Non-Grok sessions from the provider registry, as last heard.
     providers: Vec<crate::provider::ProviderSession>,
-    /// Where this client runs (decides each session's chain).
-    host: crate::provider::HostEnv,
 }
 
 /// What one [`GrokListener::tick`] did. Nicks only. No bearer, no session id.
@@ -175,7 +193,6 @@ impl GrokListener {
             last_full_drive: Instant::now(),
             send_listener: None,
             providers: Vec::new(),
-            host: crate::provider::HostEnv::detect(),
         }
     }
 
@@ -452,10 +469,10 @@ impl GrokListener {
         let lock = lock_store(&config.store_dir())?;
         let store_wake = SessionWake::default();
         let mut store = OpenedStore::connect_with_wake(&config, store_wake)?;
-        let adapters = crate::provider::AdapterConfig::from_env(Some(
-            crate::provider::registry::inbox_dir(&self.store_root, &session.session_id),
-        ));
-        let chain = crate::provider::plan_chain(session, &self.host, &adapters);
+        let chain = crate::provider::letter_chain(
+            session.kind,
+            Some(crate::provider::registry::inbox_dir(&self.store_root, &session.session_id)),
+        );
         store.set_wake_chain(session.clone(), chain);
         let user_id = store.user_id().to_string();
         let nick = store.nick().unwrap_or(&session.nick).to_string();

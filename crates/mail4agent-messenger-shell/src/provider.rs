@@ -1,48 +1,40 @@
-//! DEPRECATED here: provider wake/spawn adapters moved to g4a (`gate4agent-wake`).
+//! Session vocabulary and the letter chain. m4a is a pure messenger: it does not wake or spawn
+//! sessions and links no session channel (no ACP, no routine HTTP, no app-server). A letter is
+//! handed to the host through the letter hook ([`crate::letter_hook`], `M4A_LETTER_HOOK`); the
+//! host (the hatchery node) decides and delivers through g4a's deliver API (`gate4agent-wake`).
+//! Whatever the hook does not take stays in the durable inbox.
 //!
-//! Layer rule: m4a is the client of LIVE sessions only (deliver a letter, send). Waking and
-//! spawning belong to g4a. This module re-exports `gate4agent-wake` so existing users
-//! (`m4a-grok-listen`, `m4a-door-listen`, `m4a-codex-listen`, the web client) keep working
-//! unchanged; the adapters themselves are compiled only with feature `legacy-wake` (on in
-//! `full`). New hosts subscribe to the letter event instead: [`crate::letter_hook`]
-//! (`M4A_LETTER_HOOK`), which runs before any legacy adapter.
+//! The types and the inbox/registry come from `gate4agent-wake` built with no deliver features,
+//! so no adapter is compiled into m4a.
 
-pub use gate4agent_wake::*;
+pub use gate4agent_wake::{
+    chain, hook, inbox, registry, HookFlavor, HostEnv, ProviderKind, ProviderSession, SessionKind, SessionRecord,
+    Surface, WakeAdapter, WakeChain, WakeError, WakeLetter, WakeOutcome, INBOX_DIR_ENV, PROVIDER_ENV,
+};
 
-/// Registers m4a's transports into g4a once (grok leader ACP client, routine POST).
-pub fn install_transports() {
-    #[cfg(feature = "wake-grok")]
-    gate4agent_wake::set_grok_leader_transport(|sock, session_id, cwd, prompt| {
-        mail4agent_grok::wake_decrypted_room_blocking(sock, session_id, &cwd.to_string_lossy(), prompt).map_err(|e| e.to_string())
-    });
-    gate4agent_wake::set_routine_transport(|url, body, bearer| crate::post_routine_json(url, body, bearer).map_err(|e| e.to_string()));
-}
-
-/// [`gate4agent_wake::plan_chain`] with m4a's transports installed and the letter hook first.
-pub fn plan_chain(session: &ProviderSession, host: &HostEnv, config: &AdapterConfig) -> WakeChain {
-    install_transports();
-    let mut chain = gate4agent_wake::plan_chain(session, host, config);
+/// The chain m4a runs for a letter: the hook (when `M4A_LETTER_HOOK` is set), then the durable
+/// inbox for `kind`. Nothing else.
+pub fn letter_chain(kind: SessionKind, inbox_dir: Option<std::path::PathBuf>) -> WakeChain {
+    let mut chain = WakeChain::new();
+    chain.push("inbox-queue", Box::new(hook::InboxQueueAdapter::new(kind, inbox_dir)));
     crate::letter_hook::prepend_from_env(&mut chain);
     chain
 }
 
-/// [`gate4agent_wake::adapter_for`] with m4a's transports installed.
-pub fn adapter_for(kind: SessionKind, config: &AdapterConfig) -> Box<dyn WakeAdapter> {
-    install_transports();
-    gate4agent_wake::adapter_for(kind, config)
+pub mod claude_channel {
+    //! Moved to g4a (`gate4agent_wake::claude_channel`); the channel server is a deliver channel.
 }
 
-pub mod chain {
-    pub use gate4agent_wake::chain::*;
-    use std::path::Path;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    pub use super::plan_chain;
-
-    /// [`gate4agent_wake::chain::detected_web_chain`] with transports and the letter hook.
-    pub fn detected_web_chain(session_id: &str, nick: &str, store_root: &Path) -> Option<(super::ProviderSession, WakeChain)> {
-        super::install_transports();
-        let (session, mut chain) = gate4agent_wake::chain::detected_web_chain(session_id, nick, store_root)?;
-        crate::letter_hook::prepend_from_env(&mut chain);
-        Some((session, chain))
+    #[test]
+    fn letter_chain_is_inbox_only_without_a_hook() {
+        if std::env::var_os(crate::letter_hook::LETTER_HOOK_ENV).is_some() {
+            return;
+        }
+        let chain = letter_chain(SessionKind::local(ProviderKind::Codex), None);
+        assert_eq!(chain.ids(), vec!["inbox-queue"]);
     }
 }

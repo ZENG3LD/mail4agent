@@ -4,9 +4,9 @@
 //! `{"op": "mail.inbox" | "mail.ack" | "mail.send", "payload": {...}}`). Mail
 //! from the hatchery server lands in that inbox; nothing pushes it into a
 //! provider session. This source polls the inbox and hands each new letter to
-//! the same provider [`WakeChain`](crate::provider::WakeChain) the Matrix
-//! clients use (Codex app-server `turn/start`, Claude Code channel inbox,
-//! Kimi, Grok leader, Stop hook, durable inbox, headless resume), then acks it.
+//! the same letter chain the Matrix clients use (`M4A_LETTER_HOOK`, then the
+//! durable inbox), then acks it. m4a does not wake sessions; the host behind
+//! the hook delivers (the hatchery node does this itself as a host action).
 //!
 //! The door address, provider, session id and nick come from arguments or
 //! the environment. Nothing here embeds a host, key or name.
@@ -18,7 +18,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::provider::{
-    plan_chain, AdapterConfig, HostEnv, ProviderKind, ProviderSession, SessionKind, WakeLetter,
+    letter_chain, ProviderKind, ProviderSession, SessionKind, WakeLetter,
 };
 
 /// One letter from the door inbox.
@@ -152,9 +152,7 @@ pub fn run_loop(cfg: DoorListen) -> ! {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("http client");
-    let host = HostEnv::detect();
-    let adapters = AdapterConfig::from_env(cfg.inbox_dir.clone());
-    let mut chain = plan_chain(&cfg.session, &host, &adapters);
+    let mut chain = letter_chain(cfg.session.kind, cfg.inbox_dir.clone());
     let mut seen = Seen::load(&cfg.seen_file);
     loop {
         match door_call(&client, &cfg.door, "mail.inbox", json!({"limit": 256})) {
