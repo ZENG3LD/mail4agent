@@ -22,6 +22,9 @@ pub struct CmdRequest {
     /// Command arguments (command specific).
     #[serde(default)]
     pub args: Value,
+    /// The calling session's capability (see [`crate::SendRequest::cap`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap: Option<String>,
 }
 
 /// The answer to one [`CmdRequest`].

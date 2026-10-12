@@ -45,6 +45,15 @@ pub struct SendRequest {
     pub to: String,
     /// Plaintext; encrypted by the sending session.
     pub text: String,
+    /// The sending session's capability ([`crate::session_account::SESSION_CAP_ENV`]); the
+    /// daemon refuses a session account's nick without its own cap. Never logged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap: Option<String>,
+}
+
+/// The caller's session capability from its own environment, if the environment set one.
+pub fn session_cap_from_env() -> Option<String> {
+    std::env::var(crate::session_account::SESSION_CAP_ENV).ok().filter(|c| !c.trim().is_empty())
 }
 
 /// The answer to one [`SendRequest`].
@@ -339,6 +348,7 @@ mod tests {
             as_nick: "alice".to_string(),
             to: "privet-mir".to_string(),
             text: "hi".to_string(),
+            cap: None,
         };
         let json = serde_json::to_value(&request).expect("json");
         assert_eq!(json["as"], "alice");

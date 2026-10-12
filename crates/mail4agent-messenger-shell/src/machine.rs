@@ -2375,6 +2375,14 @@ impl MachineClient {
             loop {
                 match listener.accept() {
                     Ok(mut stream) => match crate::send::read_incoming(&mut stream) {
+                        Ok(crate::send::Incoming::Send(request)) if session_gate(self.store_root.as_deref(), &request.as_nick, request.cap.as_deref(), stream.peer_uid()).is_err() => {
+                            let why = session_gate(self.store_root.as_deref(), &request.as_nick, request.cap.as_deref(), stream.peer_uid()).unwrap_err();
+                            crate::send::write_reply(&mut stream, &crate::SendReply::failed(why))
+                        }
+                        Ok(crate::send::Incoming::Cmd(cmd)) if session_gate(self.store_root.as_deref(), &cmd.as_nick, cmd.cap.as_deref(), stream.peer_uid()).is_err() => {
+                            let why = session_gate(self.store_root.as_deref(), &cmd.as_nick, cmd.cap.as_deref(), stream.peer_uid()).unwrap_err();
+                            crate::send::write_cmd_reply(&mut stream, &crate::CmdReply::failed(why))
+                        }
                         Ok(crate::send::Incoming::Send(request)) => self.send_queue.push(PendingSend {
                             stream,
                             request,
@@ -3212,4 +3220,24 @@ mod tests {
         assert!(loaded.iter().all(|session| session.routine_url.is_none()));
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// Env switch: `1` makes the daemon refuse every nick that is not a session account with its cap.
+pub const REQUIRE_SESSION_CAP_ENV: &str = "M4A_REQUIRE_SESSION_CAP";
+/// Where the session-account registry lives (default: the client's store root).
+pub const ACCOUNTS_ROOT_ENV: &str = "M4A_ACCOUNTS_ROOT";
+
+/// The daemon's check before acting as `nick` for a socket caller (slice 2 of per-session
+/// accounts): a session account needs its own capability, and its OS owner when recorded. Nicks
+/// that are not session accounts pass unless [`REQUIRE_SESSION_CAP_ENV`] is `1`. The reason
+/// carries no secret.
+pub fn session_gate(store_root: Option<&Path>, nick: &str, cap: Option<&str>, peer_uid: Option<u32>) -> Result<(), String> {
+    let require = std::env::var(REQUIRE_SESSION_CAP_ENV).is_ok_and(|v| v.trim() == "1");
+    let base = std::env::var(ACCOUNTS_ROOT_ENV).ok().filter(|v| !v.is_empty()).map(PathBuf::from).or_else(|| store_root.map(Path::to_path_buf));
+    let exists = base.as_deref().is_some_and(|b| b.join(".m4a-accounts").join("registry.json").exists());
+    if !exists {
+        return if require { Err(format!("{nick}: no session account (capability required)")) } else { Ok(()) };
+    }
+    let reg = crate::session_account::AccountRegistry::open(base.as_deref().unwrap_or(Path::new("."))).map_err(|e| e.to_string())?;
+    reg.gate(nick, cap, peer_uid, require).map_err(|e| format!("{nick}: {e}"))
 }

@@ -109,7 +109,7 @@ pub fn run(args: Vec<String>) {
         fail(1, "M4A_STORE_ROOT is not set (environment or env file)");
     };
     let sock = send_sock_path(get, &store_root);
-    let request = CmdRequest { cmd: cmd.to_string(), as_nick, args: cargs };
+    let request = CmdRequest { cmd: cmd.to_string(), as_nick, args: cargs, cap: crate::send::session_cap_from_env() };
     let reply = send_cmd_via_socket(&sock, &request, Duration::from_secs(90))
         .unwrap_or_else(|_| fail(1, "no running m4a-web-client on the socket (run scripts/m4a-boot.sh)"));
     if !reply.ok {

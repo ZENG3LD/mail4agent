@@ -190,6 +190,7 @@ fn send_socket_dm_wakes_the_recipient_with_a_reply_hint() {
         as_nick: "alice".to_string(),
         to: "privet-mir".to_string(),
         text: text.to_string(),
+        cap: None,
     };
     let sock_for_thread = sock.clone();
     let sender =

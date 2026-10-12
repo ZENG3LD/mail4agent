@@ -73,6 +73,10 @@ pub struct AccountEntry {
     /// SHA-256 (hex) of the session capability; none until issued.
     #[serde(default)]
     pub cap_sha256: Option<String>,
+    /// OS user that owns the session (unix uid); when set, the daemon also requires the caller
+    /// on the send socket to be this uid (SO_PEERCRED / getpeereid).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os_uid: Option<u32>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -91,6 +95,10 @@ pub enum AccountError {
     Unknown,
     #[error("capability refused")]
     Refused,
+    #[error("session capability missing")]
+    Missing,
+    #[error("caller is not the session's OS user")]
+    WrongCaller,
     #[error("account registry io: {0}")]
     Io(String),
 }
@@ -130,7 +138,7 @@ impl AccountRegistry {
         } else {
             (1..).map(|i| format!("{stem}-{i}")).find(|n| !taken(n)).expect("free nick")
         };
-        let entry = AccountEntry { nick, provider: identity.provider.id().to_string(), state: ServerState::Local, cap_sha256: None };
+        let entry = AccountEntry { nick, provider: identity.provider.id().to_string(), state: ServerState::Local, cap_sha256: None, os_uid: None };
         self.file.accounts.insert(r, entry.clone());
         self.save()?;
         create_private_dir(&self.store_root(identity))?;
@@ -167,10 +175,44 @@ impl AccountRegistry {
         let e = self.get(identity).ok_or(AccountError::Unknown)?;
         let want = e.cap_sha256.as_deref().ok_or(AccountError::Refused)?;
         let got = hex(&Sha256::digest(cap.trim().as_bytes()));
-        if want.len() == got.len() && want.bytes().zip(got.bytes()).fold(0u8, |a, (x, y)| a | (x ^ y)) == 0 && e.state != ServerState::Retired {
+        if ct_eq(want, &got) && e.state != ServerState::Retired {
             Ok(e)
         } else {
             Err(AccountError::Refused)
+        }
+    }
+
+    /// The account that carries `nick` (account_ref, entry).
+    pub fn find_by_nick(&self, nick: &str) -> Option<(&str, &AccountEntry)> {
+        self.file.accounts.iter().find(|(_, e)| e.nick.eq_ignore_ascii_case(nick.trim())).map(|(r, e)| (r.as_str(), e))
+    }
+
+    /// Records the OS user that owns the account (unix uid).
+    pub fn set_os_uid(&mut self, identity: &SessionIdentity, uid: Option<u32>) -> Result<(), AccountError> {
+        let e = self.file.accounts.get_mut(&identity.account_ref()).ok_or(AccountError::Unknown)?;
+        e.os_uid = uid;
+        self.save()
+    }
+
+    /// The daemon's gate for one request acting as `nick`: Ok only when `cap` is that account's
+    /// current capability and (when the account has an OS owner and the caller's uid is known)
+    /// the caller is that OS user. A nick that is not a session account (operator/legacy bots
+    /// such as the web client's own) passes only when `require` is false.
+    pub fn gate(&self, nick: &str, cap: Option<&str>, peer_uid: Option<u32>, require: bool) -> Result<(), AccountError> {
+        let Some((_, e)) = self.find_by_nick(nick) else {
+            return if require { Err(AccountError::Unknown) } else { Ok(()) };
+        };
+        if e.state == ServerState::Retired {
+            return Err(AccountError::Refused);
+        }
+        let want = e.cap_sha256.as_deref().ok_or(AccountError::Refused)?;
+        let cap = cap.map(str::trim).filter(|c| !c.is_empty()).ok_or(AccountError::Missing)?;
+        if !ct_eq(want, &hex(&Sha256::digest(cap.as_bytes()))) {
+            return Err(AccountError::Refused);
+        }
+        match (e.os_uid, peer_uid) {
+            (Some(owner), Some(caller)) if owner != caller => Err(AccountError::WrongCaller),
+            _ => Ok(()),
         }
     }
 
@@ -181,6 +223,75 @@ impl AccountRegistry {
         write_private(&tmp, &bytes)?;
         std::fs::rename(&tmp, dir.join("registry.json")).map_err(|e| AccountError::Io(e.to_string()))
     }
+}
+
+/// What the environment hands one session at spawn/registration.
+pub struct Provisioned {
+    pub account_ref: String,
+    pub entry: AccountEntry,
+    /// This account's own store root (own vault, own key, own server token).
+    pub store_root: PathBuf,
+    /// Fresh capability, only when one was issued by this call (first time or rotation).
+    pub cap: Option<zeroize::Zeroizing<String>>,
+}
+
+impl Provisioned {
+    /// Env for THAT session's process only: its local login session id (the account ref, so no
+    /// two sessions share a login/token), its nick, its own store root and, when issued, its cap.
+    pub fn session_env(&self) -> Vec<(&'static str, String)> {
+        let mut v = vec![
+            ("M4A_SESSION_ID", self.account_ref.clone()),
+            ("M4A_NICK", self.entry.nick.clone()),
+            ("M4A_BOT_NAME", self.entry.nick.clone()),
+            ("M4A_STORE_ROOT", self.store_root.to_string_lossy().into_owned()),
+        ];
+        if let Some(cap) = &self.cap {
+            v.push((SESSION_CAP_ENV, cap.to_string()));
+        }
+        v
+    }
+}
+
+/// One call for launchers, `inbox register` and the hatchery node: the account of
+/// (provider, session) under `base`, created if missing; a capability is issued when the account
+/// has none yet or `rotate` is set. Nothing here prints the capability.
+pub fn provision_session(base: &Path, provider: ProviderKind, provider_session_id: &str, nick: Option<&str>, rotate: bool) -> Result<Provisioned, AccountError> {
+    let identity = SessionIdentity::new(provider, provider_session_id)?;
+    let mut reg = AccountRegistry::open(base)?;
+    let mut entry = reg.provision(&identity, nick)?;
+    let cap = if rotate || entry.cap_sha256.is_none() {
+        let c = reg.issue_capability(&identity)?;
+        entry = reg.get(&identity).cloned().ok_or(AccountError::Unknown)?;
+        Some(zeroize::Zeroizing::new(c))
+    } else {
+        None
+    };
+    Ok(Provisioned { account_ref: identity.account_ref(), store_root: reg.store_root(&identity), entry, cap })
+}
+
+/// Appends `KEY=VALUE` lines to an env file the provider reads into that session only
+/// (e.g. `CLAUDE_ENV_FILE` of a SessionStart hook). Owner-only on unix.
+pub fn append_env_file(path: &Path, pairs: &[(&str, String)]) -> Result<(), AccountError> {
+    use std::io::Write;
+    let mut o = std::fs::OpenOptions::new();
+    o.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    let mut f = o.open(path).map_err(|e| AccountError::Io(e.to_string()))?;
+    for (k, v) in pairs {
+        if v.contains('\n') {
+            return Err(AccountError::Io("newline in env value".into()));
+        }
+        writeln!(f, "export {k}={v}").map_err(|e| AccountError::Io(e.to_string()))?;
+    }
+    Ok(())
+}
+
+fn ct_eq(a: &str, b: &str) -> bool {
+    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 fn hex(b: &[u8]) -> String {
@@ -294,5 +405,56 @@ mod tests {
     fn identity_rejects_empty_and_control_chars() {
         assert!(SessionIdentity::new(ProviderKind::Codex, " ").is_err());
         assert!(SessionIdentity::new(ProviderKind::Codex, "a\nb").is_err());
+    }
+
+    #[test]
+    fn two_sessions_same_provider_get_distinct_accounts_roots_and_logins() {
+        let dir = base("s2-two");
+        let a = provision_session(&dir, ProviderKind::Codex, "thread-a", Some("codex"), false).unwrap();
+        let b = provision_session(&dir, ProviderKind::Codex, "thread-b", Some("codex"), false).unwrap();
+        assert_ne!(a.entry.nick, b.entry.nick);
+        assert_ne!(a.store_root, b.store_root);
+        assert_ne!(a.account_ref, b.account_ref);
+        let env_a: Vec<_> = a.session_env().into_iter().map(|(k, _)| k).collect();
+        assert!(env_a.contains(&SESSION_CAP_ENV));
+        // re-registration does not hand the cap out again
+        let a2 = provision_session(&dir, ProviderKind::Codex, "thread-a", Some("codex"), false).unwrap();
+        assert!(a2.cap.is_none());
+        assert_eq!(a2.entry.nick, a.entry.nick);
+    }
+
+    #[test]
+    fn gate_refuses_foreign_missing_and_wrong_caller() {
+        let dir = base("s2-gate");
+        let a = provision_session(&dir, ProviderKind::Codex, "thread-a", None, false).unwrap();
+        let b = provision_session(&dir, ProviderKind::Codex, "thread-b", None, false).unwrap();
+        let (ca, cb) = (a.cap.unwrap(), b.cap.unwrap());
+        let mut reg = AccountRegistry::open(&dir).unwrap();
+        assert_eq!(reg.gate(&a.entry.nick, Some(&ca), None, true), Ok(()));
+        assert_eq!(reg.gate(&a.entry.nick, Some(&cb), None, true), Err(AccountError::Refused));
+        assert_eq!(reg.gate(&a.entry.nick, None, None, false), Err(AccountError::Missing));
+        assert_eq!(reg.gate("operator-bot", None, None, false), Ok(()));
+        assert_eq!(reg.gate("operator-bot", None, None, true), Err(AccountError::Unknown));
+        let ida = SessionIdentity::new(ProviderKind::Codex, "thread-a").unwrap();
+        reg.set_os_uid(&ida, Some(1000)).unwrap();
+        assert_eq!(reg.gate(&a.entry.nick, Some(&ca), Some(1001), true), Err(AccountError::WrongCaller));
+        assert_eq!(reg.gate(&a.entry.nick, Some(&ca), Some(1000), true), Ok(()));
+        reg.set_state(&ida, ServerState::Retired).unwrap();
+        assert_eq!(reg.gate(&a.entry.nick, Some(&ca), Some(1000), true), Err(AccountError::Refused));
+    }
+
+    #[test]
+    fn env_file_is_private_and_rejects_newlines() {
+        let dir = base("s2-env");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("env");
+        append_env_file(&p, &[("M4A_NICK", "x".into())]).unwrap();
+        assert!(append_env_file(&p, &[("M4A_NICK", "x\ny".into())]).is_err());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "export M4A_NICK=x\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        }
     }
 }

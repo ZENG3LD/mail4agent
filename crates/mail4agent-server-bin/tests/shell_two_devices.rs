@@ -1002,6 +1002,7 @@ fn m5_rich_commands_roundtrip() {
         cmd: name.to_string(),
         as_nick: "x".to_string(),
         args,
+        cap: None,
     };
     let made = alice.run_command(&cmd("rooms.create", serde_json::json!({"name": "m5chan", "kind": "group", "invite": ["@bob:localhost"]})), alice_now);
     assert!(made.ok, "create: {:?}", made.error);

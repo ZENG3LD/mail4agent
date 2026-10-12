@@ -45,6 +45,9 @@ struct Args {
     hook_stdin: bool,
     format: Option<String>,
     timeout: Option<u64>,
+    env_file: Option<PathBuf>,
+    rotate_cap: bool,
+    no_account: bool,
 }
 
 fn parse(args_in: &[String]) -> Args {
@@ -63,6 +66,9 @@ fn parse(args_in: &[String]) -> Args {
             "--hook-stdin" => args.hook_stdin = true,
             "--format" => args.format = it.next(),
             "--timeout" => args.timeout = it.next().and_then(|v| v.parse().ok()),
+            "--env-file" => args.env_file = it.next().map(PathBuf::from),
+            "--rotate-cap" => args.rotate_cap = true,
+            "--no-account" => args.no_account = true,
             other => fail(&format!("unknown argument {other}")),
         }
     }
@@ -200,6 +206,33 @@ pub fn run(args: Vec<String>) {
                         .and_then(|name| nick_from_display_name(&name.to_string_lossy()).ok())
                 })
                 .unwrap_or_else(|| fail("no nick (use --nick or M4A_NICK)"));
+            // Per-session account: one account (nick, own store root, own login) per provider
+            // session, created here by the environment. The capability goes only into THIS
+            // session's env file, never to stdout.
+            let nick = if args.no_account {
+                nick
+            } else {
+                let base = accounts_base(&root);
+                let made = crate::session_account::provision_session(&base, provider, &ctx.session, Some(&nick), args.rotate_cap)
+                    .unwrap_or_else(|err| fail(&format!("session account: {err}")));
+                #[cfg(unix)]
+                {
+                    let id = crate::session_account::SessionIdentity::new(provider, &ctx.session).unwrap_or_else(|e| fail(&e.to_string()));
+                    if let Ok(mut reg) = crate::session_account::AccountRegistry::open(&base) {
+                        if reg.get(&id).is_some_and(|e| e.os_uid.is_none()) {
+                            let _ = reg.set_os_uid(&id, crate::ipc_own_uid());
+                        }
+                    }
+                }
+                let target = args.env_file.clone().or_else(|| env("CLAUDE_ENV_FILE").map(PathBuf::from));
+                match (&made.cap, target) {
+                    (Some(_), Some(path)) => crate::session_account::append_env_file(&path, &made.session_env())
+                        .unwrap_or_else(|err| fail(&format!("session env: {err}"))),
+                    (Some(_), None) => eprintln!("m4a-inbox: account {} has a new capability but no env file to hand it to (use --env-file); rotate with --rotate-cap", made.entry.nick),
+                    _ => {}
+                }
+                made.entry.nick
+            };
             let record = SessionRecord {
                 provider: provider.id().to_string(),
                 surface: if env("CLAUDE_CODE_REMOTE").is_some() {
@@ -236,6 +269,7 @@ pub fn run(args: Vec<String>) {
         }
         "drain" => {
             let ctx = context(&args);
+            guard_session(&ctx);
             let flavor = flavor(&args);
             if let Some(flavor) = flavor.filter(|f| !f.wakes_idle()) {
                 let _ = inbox::arm(&ctx.inbox, &flavor.consumer());
@@ -248,6 +282,7 @@ pub fn run(args: Vec<String>) {
         }
         "wait" => {
             let ctx = context(&args);
+            guard_session(&ctx);
             let flavor = flavor(&args).unwrap_or(HookFlavor::ClaudeRewake);
             let name = flavor.consumer();
             // One waiter per session: a second asyncRewake run leaves.
@@ -323,4 +358,35 @@ fn hook_config(provider: ProviderKind) -> String {
         }}),
     };
     serde_json::to_string_pretty(&value).unwrap_or_default()
+}
+
+fn accounts_base(store_root: &std::path::Path) -> PathBuf {
+    env(crate::ACCOUNTS_ROOT_ENV).map(PathBuf::from).unwrap_or_else(|| store_root.to_path_buf())
+}
+
+/// Reading a session's inbox needs that session's capability once it is a session account
+/// (another session on the machine cannot drain it by passing `--session`).
+fn guard_session(ctx: &Ctx) {
+    let (Some(provider), Some(root)) = (ctx.provider, ctx.store_root.as_deref()) else { return };
+    let base = accounts_base(root);
+    if !base.join(".m4a-accounts").join("registry.json").exists() {
+        return;
+    }
+    let Ok(id) = crate::session_account::SessionIdentity::new(provider, &ctx.session) else { return };
+    let Ok(reg) = crate::session_account::AccountRegistry::open(&base) else { return };
+    if reg.get(&id).is_none() {
+        return;
+    }
+    // A hook process may not see the session env yet: a missing cap is refused only in strict
+    // mode; a present but foreign/rotated cap is always refused.
+    let strict = env(crate::REQUIRE_SESSION_CAP_ENV).is_some_and(|v| v == "1");
+    let Some(cap) = env(crate::session_account::SESSION_CAP_ENV) else {
+        if strict {
+            fail("this session's capability is missing");
+        }
+        return;
+    };
+    if reg.authorize(&id, &cap).is_err() {
+        fail("this session's capability is missing or belongs to another session");
+    }
 }

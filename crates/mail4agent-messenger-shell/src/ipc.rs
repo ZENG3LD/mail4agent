@@ -88,6 +88,13 @@ impl SendListener {
 }
 
 impl SendStream {
+    /// The connecting process's OS user, where the OS tells it: SO_PEERCRED on Linux,
+    /// getpeereid on macOS/BSD. `None` elsewhere (Windows loopback TCP carries no caller identity;
+    /// there the session capability is the guard, and a per-user named pipe ACL is the next step).
+    pub(crate) fn peer_uid(&self) -> Option<u32> {
+        peer_uid_of(&self.inner)
+    }
+
     pub(crate) fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
         self.inner.set_nonblocking(nonblocking)
     }
@@ -199,5 +206,60 @@ mod tests {
         drop(client);
         let line = server.join().expect("server thread");
         assert_eq!(line, payload);
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn peer_uid_of(stream: &StreamInner) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: valid fd, out-pointer sized for ucred.
+    let rc = unsafe { libc::getsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, &mut cred as *mut _ as *mut libc::c_void, &mut len) };
+    (rc == 0).then_some(cred.uid)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn peer_uid_of(stream: &StreamInner) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    let (mut uid, mut gid) = (0, 0);
+    // SAFETY: valid fd and out-pointers.
+    let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
+    (rc == 0).then_some(uid)
+}
+
+#[cfg(windows)]
+fn peer_uid_of(_stream: &StreamInner) -> Option<u32> {
+    None
+}
+
+/// This process's OS user (unix), for comparing with [`SendStream::peer_uid`].
+pub(crate) fn own_uid() -> Option<u32> {
+    #[cfg(unix)]
+    {
+        // SAFETY: getuid never fails.
+        Some(unsafe { libc::getuid() })
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+#[cfg(all(test, unix))]
+mod peer_tests {
+    use super::*;
+
+    #[test]
+    fn peer_uid_is_the_connecting_os_user() {
+        let dir = std::env::temp_dir().join(format!("m4a-peer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.sock");
+        let listener = SendListener::bind(&path).unwrap();
+        let _client = SendStream::connect(&path).unwrap();
+        let server = listener.accept().unwrap();
+        assert_eq!(server.peer_uid(), own_uid());
+        assert!(server.peer_uid().is_some());
     }
 }

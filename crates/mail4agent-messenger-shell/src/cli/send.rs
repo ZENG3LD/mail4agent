@@ -71,6 +71,7 @@ pub fn run(args: Vec<String>) {
         as_nick: as_nick.clone(),
         to: to.clone(),
         text: text.clone(),
+        cap: crate::send::session_cap_from_env(),
     };
     let sock = send_sock_path(get, &store_root);
     let reply = match send_via_socket(&sock, &request, Duration::from_secs(180)) {
