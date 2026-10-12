@@ -469,10 +469,8 @@ impl GrokListener {
         let lock = lock_store(&config.store_dir())?;
         let store_wake = SessionWake::default();
         let mut store = OpenedStore::connect_with_wake(&config, store_wake)?;
-        let chain = crate::provider::letter_chain(
-            session.kind,
-            Some(crate::provider::registry::inbox_dir(&self.store_root, &session.session_id)),
-        );
+        let inbox = Some(crate::provider::registry::inbox_dir(&self.store_root, &session.session_id));
+        let chain = crate::provider::letter_chain(session.kind, inbox.clone(), &crate::provider::AdapterConfig::from_env(inbox));
         store.set_wake_chain(session.clone(), chain);
         let user_id = store.user_id().to_string();
         let nick = store.nick().unwrap_or(&session.nick).to_string();

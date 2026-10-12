@@ -152,7 +152,7 @@ pub fn run_loop(cfg: DoorListen) -> ! {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("http client");
-    let mut chain = letter_chain(cfg.session.kind, cfg.inbox_dir.clone());
+    let mut chain = letter_chain(cfg.session.kind, cfg.inbox_dir.clone(), &crate::provider::AdapterConfig::from_env(cfg.inbox_dir.clone()));
     let mut seen = Seen::load(&cfg.seen_file);
     loop {
         match door_call(&client, &cfg.door, "mail.inbox", json!({"limit": 256})) {

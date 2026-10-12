@@ -27,8 +27,8 @@ tier-matrix = ["m4a-agent/tier-matrix"]
 local-bus = ["dep:mail4agent-server"]
 
 [dependencies]
-# Session vocabulary + durable inbox only (no deliver features). Branch-only until published.
-gate4agent-wake = { git = "https://github.com/ZENG3LD/gate4agent.git", branch = "feat/deliver-adapters", default-features = false }
+# g4a deliver API (deliver features only; never spawn/terminal). Branch-only until published.
+gate4agent-wake = { git = "https://github.com/ZENG3LD/gate4agent.git", branch = "feat/deliver-adapters", default-features = false, features = ["wake-grok", "wake-claude", "wake-codex", "wake-kimi", "wake-cursor", "wake-routine"] }
 m4a-seam = { workspace = true }
 m4a-agent = { workspace = true, features = ["engine"] }
 mail4agent-messenger = { workspace = true  }

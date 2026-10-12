@@ -46,7 +46,8 @@ pub fn run(args: Vec<String>) {
         cwd: std::env::current_dir().ok(),
         headless: false,
     };
-    let mut chain = provider::letter_chain(session.kind, root.as_deref().map(|r| provider::registry::inbox_dir(r, &session_id)));
+    let inbox = root.as_deref().map(|r| provider::registry::inbox_dir(r, &session_id));
+    let mut chain = provider::letter_chain(session.kind, inbox.clone(), &provider::AdapterConfig::from_env(inbox));
     let letter = WakeLetter { body: body.trim_end(), from_nick: &from, event_id: &event, room: None };
     match chain.wake(&session, &letter) {
         Ok((id, WakeOutcome::Delivered)) => println!("{id} delivered"),

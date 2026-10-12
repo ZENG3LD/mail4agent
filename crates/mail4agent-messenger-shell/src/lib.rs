@@ -1680,8 +1680,8 @@ impl OpenedStore {
     }
 
     /// The letter chain for a store with no chain installed: the letter hook
-    /// (`M4A_LETTER_HOOK`) first, then the durable inbox. m4a never wakes a
-    /// session itself; the host behind the hook does (g4a deliver API).
+    /// (`M4A_LETTER_HOOK`) first, then g4a's deliver adapter (routine webhook for a web
+    /// client with a routine URL), then the durable inbox.
     fn default_letter_chain(&self) -> (provider::ProviderSession, provider::WakeChain) {
         let kind = if self.routine_url.is_some() && self.leader_sock.is_none() {
             provider::SessionKind::web(provider::ProviderKind::Grok)
@@ -1697,7 +1697,13 @@ impl OpenedStore {
         };
         let root = self.dir.parent().map(Path::to_path_buf);
         let inbox = root.map(|r| provider::registry::inbox_dir(&r, &self.session_id));
-        (session.clone(), crate::provider::letter_chain(kind, inbox))
+        let mut config = provider::AdapterConfig::from_env(inbox.clone());
+        config.routine_url = self.routine_url.clone();
+        config.routine_bearer = self.routine_bearer.as_ref().map(|b| b.as_str().to_owned());
+        if let Some(sock) = &self.leader_sock {
+            config.leader_sock = Some(PathBuf::from(sock));
+        }
+        (session.clone(), crate::provider::letter_chain(kind, inbox, &config))
     }
 
     fn wake_inbound(&mut self) {
@@ -2621,16 +2627,16 @@ mod tests {
             cwd: None,
             headless: false,
         };
-        let chain = provider::letter_chain(session.kind, Some(inbox_dir.clone()));
+        let chain = provider::letter_chain(session.kind, Some(inbox_dir.clone()), &provider::AdapterConfig::from_env(Some(inbox_dir.clone())));
         store.set_wake_chain(session, chain);
-        assert_eq!(store.wake_chain_ids(), vec!["inbox-queue"], "m4a links no session channel");
+        assert_eq!(store.wake_chain_ids(), vec!["deliver", "inbox-queue"], "g4a deliver, then the inbox");
         store.drive(1_000, false).expect("drive");
         store.drive(3_000, false).expect("drive again");
         let route = store.take_wake_route();
         let note = store.wake_note().unwrap_or("").to_string();
         drop(store);
         stop(&home_done, home);
-        // No hook armed: the durable queue took it, once.
+        // No hook armed and no codex app-server: deliver is unavailable, the durable queue took it, once.
         assert_eq!(route.as_deref(), Some("inbox-queue queued"), "note={note}");
         let letters = provider::inbox::drain(&inbox_dir);
         assert_eq!(letters.len(), 1);
@@ -2664,10 +2670,10 @@ mod tests {
     }
 
     #[test]
-    fn a_routine_url_is_never_posted_by_m4a_and_the_letter_lands_in_the_inbox() {
+    fn a_web_client_with_a_routine_url_wakes_it_exactly_once_through_g4a() {
         let (base, home_done, home) = spawn_homeserver("wake-plain");
         let (routine, hits, routine_done, routine_thread) = spawn_routine();
-        let dir = temp_dir("wake-pure");
+        let dir = temp_dir("wake-routine-once");
         let mut store = open_against(&base, &dir.0, "session-a");
         store.set_wake(SessionWake { routine_url: Some(routine), routine_bearer: Some("k-test".into()), ..SessionWake::default() });
         store.drive(1_000, false).expect("drive");
@@ -2677,11 +2683,10 @@ mod tests {
         drop(store);
         stop(&routine_done, routine_thread);
         stop(&home_done, home);
-        assert!(hits.lock().expect("hits").is_empty(), "m4a posted to a routine");
-        assert_eq!(route.as_deref(), Some("inbox-queue queued"), "note={note}");
+        assert_eq!(hits.lock().expect("hits").len(), 1, "one letter, one routine wake; note={note}");
+        assert_eq!(route.as_deref(), Some("deliver delivered"), "note={note}");
         let inbox = provider::registry::inbox_dir(dir.0.parent().expect("parent"), "session-a");
-        let letters = provider::inbox::drain(&inbox);
-        assert_eq!(letters.len(), 1, "the letter waits in the durable inbox once");
+        assert!(provider::inbox::drain(&inbox).is_empty(), "a delivered letter is not also queued");
     }
 
     #[test]

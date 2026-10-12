@@ -2489,7 +2489,8 @@ fn attach_detected_chain(store: &mut OpenedStore, config: &SessionConfig, nick: 
     // detection only names the session kind for the hook payload.
     if let Some((session, _)) = crate::provider::chain::detected_web_chain(config.session_id(), nick, &config.store_root) {
         let inbox = crate::provider::registry::inbox_dir(&config.store_root, config.session_id());
-        let chain = crate::provider::letter_chain(session.kind, Some(inbox));
+        let config = crate::provider::AdapterConfig::from_env(Some(inbox.clone()));
+        let chain = crate::provider::letter_chain(session.kind, Some(inbox), &config);
         store.set_wake_chain(session, chain);
     }
 }
