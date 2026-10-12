@@ -2,7 +2,6 @@
 //! the homeserver. Mail between the local pair does not call the homeserver.
 //! Mail to the third session does. Loopback only. No bearer is printed.
 
-use std::io::Read;
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -44,16 +43,14 @@ impl Drop for TempDb {
 }
 
 fn random_key_hex() -> String {
+    use rand::RngCore;
     let mut bytes = [0u8; 32];
-    std::fs::File::open("/dev/urandom")
-        .expect("urandom")
-        .read_exact(&mut bytes)
-        .expect("urandom read");
+    rand::thread_rng().fill_bytes(&mut bytes);
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn server_bin() -> PathBuf {
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_mail4agent_server_bin") {
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_mail4agent-server-bin") {
         if !path.is_empty() {
             return PathBuf::from(path);
         }
@@ -64,7 +61,11 @@ fn server_bin() -> PathBuf {
         .and_then(|dir| dir.parent())
         .expect("target profile dir")
         .to_path_buf();
-    path.push("mail4agent-server-bin");
+    path.push(if cfg!(windows) {
+        "mail4agent-server-bin.exe"
+    } else {
+        "mail4agent-server-bin"
+    });
     assert!(path.is_file(), "mail4agent-server-bin was not built");
     path
 }
@@ -338,8 +339,8 @@ fn uniq() -> u128 {
 #[test]
 fn one_client_local_dm_skips_homeserver_remote_session_uses_it() {
     let temp = TempDb {
-        dir: PathBuf::from(format!(
-            "/tmp/mail4agent-machine-{}-{}",
+        dir: std::env::temp_dir().join(format!(
+            "mail4agent-machine-{}-{}",
             std::process::id(),
             uniq()
         )),
@@ -363,6 +364,7 @@ fn one_client_local_dm_skips_homeserver_remote_session_uses_it() {
             "localhost",
         ])
         .env("M4A_DB_KEY_HEX", &key_hex)
+        .env("M4A_DB_ROOT", &temp.dir)
         .env("M4A_ASSERTION_SECRET", support_product::SEAM_SECRET)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -547,8 +549,8 @@ fn stable_hits(client: &MachineClient) -> u64 {
 #[test]
 fn one_socket_pushes_session_b_and_not_session_a() {
     let temp = TempDb {
-        dir: PathBuf::from(format!(
-            "/tmp/mail4agent-push-{}-{}",
+        dir: std::env::temp_dir().join(format!(
+            "mail4agent-push-{}-{}",
             std::process::id(),
             uniq()
         )),
@@ -572,6 +574,7 @@ fn one_socket_pushes_session_b_and_not_session_a() {
             "localhost",
         ])
         .env("M4A_DB_KEY_HEX", &key_hex)
+        .env("M4A_DB_ROOT", &temp.dir)
         .env("M4A_ASSERTION_SECRET", support_product::SEAM_SECRET)
         .stdout(Stdio::null())
         .stderr(Stdio::null())

@@ -26,6 +26,8 @@ pub struct EdgeLink {
     /// Barrier token for the link (`M4A_LINK_TOKEN`), sent in `x-m4a-link-token`.
     pub link_token: Option<String>,
     /// Set when `base` was `unix:/path`: the link runs over that unix socket.
+    /// Only the unix build reads it; such a base panics elsewhere.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) socket: Option<String>,
     client: reqwest::Client,
 }
@@ -35,9 +37,15 @@ impl EdgeLink {
     /// for a co-located edge.
     pub fn new(base: &str, secret: Vec<u8>, assertion_header: Option<String>) -> Self {
         let socket = base.strip_prefix("unix:").map(str::to_string);
-        let mut cb = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
-        if let Some(path) = &socket {
-            cb = cb.unix_socket(path.clone());
+        let cb = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+        #[cfg(unix)]
+        let cb = match &socket {
+            Some(path) => cb.unix_socket(path.clone()),
+            None => cb,
+        };
+        #[cfg(not(unix))]
+        if socket.is_some() {
+            panic!("unix: edge links are only supported on unix");
         }
         Self {
             socket: socket.clone(),
