@@ -17,8 +17,10 @@ fn fail(msg: &str) -> ! {
 
 pub fn run(args: Vec<String>) {
     let mut it = args.into_iter();
-    if it.next().as_deref() != Some("provision") {
-        fail("usage: m4a-agent account provision --provider P --session ID [--nick N] --cap-out FILE [--rotate]");
+    match it.next().as_deref() {
+        Some("provision") => {}
+        Some("check") => return check(it.collect()),
+        _ => fail("usage: m4a-agent account provision --provider P --session ID [--nick N] --cap-out FILE [--rotate] | account check --nick N"),
     }
     let (mut provider, mut session, mut nick, mut out, mut rotate) = (None, None, None, None, false);
     while let Some(a) = it.next() {
@@ -56,4 +58,27 @@ pub fn run(args: Vec<String>) {
         "{}",
         serde_json::json!({ "nick": made.entry.nick, "account_ref": made.account_ref, "store_root": made.store_root, "cap_issued": made.cap.is_some() })
     );
+}
+
+/// `account check --nick N`: exit 0 when the caller's `M4A_SESSION_CAP` (and OS user) may act as
+/// `N` -- the same gate the daemon applies to send/inbox/commands -- else exit 1 with the reason.
+fn check(args: Vec<String>) {
+    let mut it = args.into_iter();
+    let mut nick = None;
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--nick" => nick = it.next(),
+            other => fail(&format!("unknown argument {other}")),
+        }
+    }
+    let nick = nick.unwrap_or_else(|| fail("--nick is required"));
+    let root = std::env::var(STORE_ROOT_ENV).ok().filter(|v| !v.is_empty()).map(PathBuf::from);
+    let cap = crate::send::session_cap_from_env();
+    match crate::session_gate(root.as_deref(), &nick, cap.as_deref(), crate::ipc_own_uid()) {
+        Ok(()) => println!("ok {nick}"),
+        Err(why) => {
+            eprintln!("refused: {why}");
+            std::process::exit(1);
+        }
+    }
 }

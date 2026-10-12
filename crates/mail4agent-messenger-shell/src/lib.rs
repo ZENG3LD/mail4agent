@@ -87,6 +87,8 @@ pub mod provider;
 mod bus_backend;
 pub mod resolve;
 mod send;
+#[cfg(windows)]
+mod ipc_winpipe;
 pub mod store_key;
 
 use std::collections::HashSet;

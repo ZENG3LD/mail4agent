@@ -15,9 +15,9 @@ type ListenerInner = std::os::unix::net::UnixListener;
 type StreamInner = std::os::unix::net::UnixStream;
 
 #[cfg(windows)]
-type ListenerInner = std::net::TcpListener;
+type ListenerInner = crate::ipc_winpipe::PipeListener;
 #[cfg(windows)]
-type StreamInner = std::net::TcpStream;
+type StreamInner = crate::ipc_winpipe::PipeStream;
 
 /// Bound send socket. [`SendListener::accept`] returns the stream only.
 pub(crate) struct SendListener {
@@ -56,7 +56,10 @@ impl SendListener {
     }
 
     pub(crate) fn accept(&self) -> io::Result<SendStream> {
+        #[cfg(unix)]
         let (stream, _) = self.inner.accept()?;
+        #[cfg(windows)]
+        let stream = self.inner.accept()?;
         Ok(SendStream { inner: stream })
     }
 }
@@ -75,16 +78,25 @@ impl SendListener {
 
 #[cfg(windows)]
 impl SendListener {
+    /// A named pipe only this OS user can open (see [`crate::ipc_winpipe`]); `path` holds its
+    /// name. The pipe name is derived from the path, so each store root has its own.
     fn bind_fresh(path: &Path) -> io::Result<Self> {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-        let port = listener.local_addr()?.port();
-        let bytes = format!("127.0.0.1:{port}\n");
-        if let Err(err) = std::fs::write(path, bytes.as_bytes()) {
+        let name = windows_pipe_name(path);
+        let listener = crate::ipc_winpipe::PipeListener::bind(&name)?;
+        if let Err(err) = std::fs::write(path, format!("pipe:{name}\n").as_bytes()) {
             let _ = std::fs::remove_file(path);
             return Err(err);
         }
         Ok(Self { inner: listener })
     }
+}
+
+#[cfg(windows)]
+fn windows_pipe_name(path: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let abs = std::fs::canonicalize(path.parent().unwrap_or(Path::new("."))).unwrap_or_default().join(path.file_name().unwrap_or_default());
+    let h = Sha256::digest(abs.to_string_lossy().to_lowercase().as_bytes());
+    crate::ipc_winpipe::pipe_name(&h[..8].iter().map(|b| format!("{b:02x}")).collect::<String>())
 }
 
 impl SendStream {
@@ -95,16 +107,36 @@ impl SendStream {
         peer_uid_of(&self.inner)
     }
 
+    #[cfg(unix)]
     pub(crate) fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
         self.inner.set_nonblocking(nonblocking)
     }
 
+    #[cfg(unix)]
     pub(crate) fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         self.inner.set_read_timeout(timeout)
     }
 
+    #[cfg(unix)]
     pub(crate) fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         self.inner.set_write_timeout(timeout)
+    }
+
+    // A connected pipe instance is blocking with no per-call timeout; the daemon reads one line
+    // from a same-user client. (Overlapped I/O with timeouts is a later refinement.)
+    #[cfg(windows)]
+    pub(crate) fn set_nonblocking(&self, _nonblocking: bool) -> io::Result<()> {
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn set_read_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn set_write_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -119,32 +151,14 @@ impl SendStream {
 
 #[cfg(windows)]
 impl SendStream {
-    /// Reads the address file and connects only when the host is `127.0.0.1`.
+    /// Reads the name file and opens the pipe (`pipe:\\.\pipe\m4a-...`). Any other content is
+    /// refused (no TCP fallback: a loopback port is reachable by every local user).
     pub(crate) fn connect(path: &Path) -> io::Result<Self> {
         let text = std::fs::read_to_string(path)?;
-        let text = text.trim();
-        let (host, port) = text.rsplit_once(':').ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "send socket address is not host:port",
-            )
+        let name = text.trim().strip_prefix("pipe:").filter(|n| n.starts_with(r"\\.\pipe\m4a-")).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "send socket file does not name an m4a pipe")
         })?;
-        if host != "127.0.0.1" {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "send socket host is not 127.0.0.1",
-            ));
-        }
-        let port: u16 = port.parse().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "send socket port is not a number",
-            )
-        })?;
-        let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
-        Ok(Self {
-            inner: std::net::TcpStream::connect(addr)?,
-        })
+        Ok(Self { inner: crate::ipc_winpipe::PipeStream::connect(name)? })
     }
 }
 

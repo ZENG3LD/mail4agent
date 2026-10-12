@@ -813,3 +813,25 @@ pub(crate) mod tests {
         assert!(!shown.contains("secret") && !shown.contains("example"));
     }
 }
+
+#[cfg(test)]
+mod g4a_alignment_tests {
+    use super::ProviderKind;
+
+    /// hatchery-node maps g4a ids (claude, codex, grok, kimi) to these names before
+    /// `m4a-agent account provision --provider ...`; every one must parse, and g4a's own ids too.
+    #[test]
+    fn names_hatchery_node_sends_all_parse() {
+        for (sent, kind) in [
+            ("claude-code", ProviderKind::ClaudeCode),
+            ("codex", ProviderKind::Codex),
+            ("grok", ProviderKind::Grok),
+            ("kimi-code", ProviderKind::KimiCode),
+            ("claude", ProviderKind::ClaudeCode),
+            ("kimi", ProviderKind::KimiCode),
+        ] {
+            assert_eq!(ProviderKind::parse(sent), Some(kind), "{sent}");
+        }
+        assert_eq!(ProviderKind::parse("custom"), None);
+    }
+}
