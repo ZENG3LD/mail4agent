@@ -61,6 +61,11 @@ name = "m4a-agent"
 path = "src/bin/m4a_agent.rs"
 
 [[bin]]
+name = "m4a-codex-listen"
+path = "src/bin/codex_listen.rs"
+required-features = ["wake-codex"]
+
+[[bin]]
 name = "m4a-ensure-agent-webhooks"
 path = "src/bin/ensure_agent_webhooks.rs"
 

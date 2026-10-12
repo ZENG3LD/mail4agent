@@ -29,11 +29,15 @@ use super::{
 /// Env var naming the app-server endpoint (`unix:///path` or `ws://127.0.0.1:PORT`).
 pub const CODEX_APP_SERVER_ENV: &str = "M4A_CODEX_APP_SERVER";
 
+pub mod desktop;
+
 const RPC_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Where the shared app-server listens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CodexEndpoint {
+    /// The running Desktop owner's IPC router, never a new app-server.
+    Desktop(PathBuf),
     /// `unix:///abs/path.sock` (WebSocket over a Unix socket).
     Unix(PathBuf),
     /// `ws://127.0.0.1:PORT` (loopback only).
@@ -45,6 +49,12 @@ impl CodexEndpoint {
     /// `unix://` (Codex default socket) is not resolved here; pass the path.
     pub fn parse(value: &str) -> Option<Self> {
         let value = value.trim();
+        if value == "desktop" {
+            return desktop::default_endpoint().map(CodexEndpoint::Desktop);
+        }
+        if let Some(path) = value.strip_prefix("desktop://") {
+            return (!path.is_empty()).then(|| CodexEndpoint::Desktop(path.into()));
+        }
         if let Some(path) = value.strip_prefix("unix://") {
             return (!path.is_empty()).then(|| CodexEndpoint::Unix(PathBuf::from(path)));
         }
@@ -80,11 +90,12 @@ impl WakeAdapter for CodexAppServerAdapter {
         SessionKind::local(ProviderKind::Codex)
     }
 
-    fn probe(&self, _session: &ProviderSession) -> Result<(), WakeError> {
+    fn probe(&self, session: &ProviderSession) -> Result<(), WakeError> {
         match &self.endpoint {
             None => Err(WakeError::Unavailable(
                 "codex app-server endpoint unset".into(),
             )),
+            Some(CodexEndpoint::Desktop(path)) => desktop::probe(path, &session.session_id),
             Some(CodexEndpoint::Unix(path)) if !path.exists() => Err(WakeError::Unavailable(
                 "codex app-server socket missing".into(),
             )),
@@ -100,9 +111,16 @@ impl WakeAdapter for CodexAppServerAdapter {
         self.probe(session)?;
         let text = wake_prompt(session, letter);
         match self.endpoint.clone() {
+            Some(CodexEndpoint::Desktop(path)) => desktop::wake(&path, &session.session_id, &text),
             Some(CodexEndpoint::Ws(url)) => {
                 let (mut ws, _) = tungstenite::connect(url.as_str())
                     .map_err(|err| WakeError::Unavailable(format!("codex ws: {err}")))?;
+                if let tungstenite::stream::MaybeTlsStream::Plain(stream) = ws.get_mut() {
+                    stream.set_read_timeout(Some(RPC_TIMEOUT))
+                        .map_err(|_| WakeError::Transport("codex read timeout setup failed".into()))?;
+                    stream.set_write_timeout(Some(RPC_TIMEOUT))
+                        .map_err(|_| WakeError::Transport("codex write timeout setup failed".into()))?;
+                }
                 start_turn(&mut ws, &session.session_id, &text)
             }
             #[cfg(unix)]
@@ -210,15 +228,16 @@ fn call<S: Read + Write>(
     Err(WakeError::Transport("codex rpc timed out".into()))
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::provider::tests::{letter, session};
-    use std::os::unix::net::UnixListener;
+    use std::net::TcpListener;
 
-    fn fake_server(path: PathBuf, loaded: bool) -> std::thread::JoinHandle<Vec<String>> {
-        let listener = UnixListener::bind(&path).unwrap();
-        std::thread::spawn(move || {
+    fn fake_server(loaded: bool) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let mut ws = tungstenite::accept(stream).unwrap();
             let mut seen = Vec::new();
@@ -260,21 +279,14 @@ mod tests {
                 }
             }
             seen
-        })
-    }
-
-    fn sock(tag: &str) -> PathBuf {
-        let path =
-            std::env::temp_dir().join(format!("m4a-codex-{tag}-{}.sock", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        path
+        });
+        (endpoint, handle)
     }
 
     #[test]
     fn loaded_thread_gets_one_turn_start() {
-        let path = sock("loaded");
-        let server = fake_server(path.clone(), true);
-        let mut adapter = CodexAppServerAdapter::new(Some(CodexEndpoint::Unix(path.clone())));
+        let (endpoint, server) = fake_server(true);
+        let mut adapter = CodexAppServerAdapter::new(CodexEndpoint::parse(&endpoint));
         let s = session(SessionKind::local(ProviderKind::Codex));
         assert_eq!(
             adapter.wake(&s, &letter("hi")).unwrap(),
@@ -284,14 +296,12 @@ mod tests {
             server.join().unwrap(),
             ["initialize", "initialized", "turn/start"]
         );
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn unloaded_thread_is_resumed_then_started() {
-        let path = sock("resume");
-        let server = fake_server(path.clone(), false);
-        let mut adapter = CodexAppServerAdapter::new(Some(CodexEndpoint::Unix(path.clone())));
+        let (endpoint, server) = fake_server(false);
+        let mut adapter = CodexAppServerAdapter::new(CodexEndpoint::parse(&endpoint));
         let s = session(SessionKind::local(ProviderKind::Codex));
         assert_eq!(
             adapter.wake(&s, &letter("hi")).unwrap(),
@@ -307,7 +317,6 @@ mod tests {
                 "turn/start"
             ]
         );
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
