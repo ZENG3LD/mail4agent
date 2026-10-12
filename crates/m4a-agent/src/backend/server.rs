@@ -32,12 +32,20 @@ impl ServerBackend {
         })
     }
 
-    fn established(&self, token: &str) {
+    #[allow(unused_variables)]
+    fn established(&self, ids: &IdentityStore, id: &SessionIdentity, token: &str) {
         #[cfg(feature = "engine")]
         {
             self.live.set_token(token);
             // The product's own proxy serves the Matrix paths without the spec prefix.
             self.live.with_exec(|e| e.set_keep_prefix(false));
+            // A long-running client outlives its token (server restart, revocation, expiry): on
+            // M_UNKNOWN_TOKEN log in again by key signature instead of failing every request
+            // (and missing DM invites) until the process is restarted.
+            if id.enrolled {
+                let (ids, id, wire) = (ids.clone(), id.clone(), Arc::clone(&self.wire));
+                self.live.set_refresher(Arc::new(move || Ok(keyauth::login(&*wire, &ids, &id)?.1)));
+            }
         }
         let _ = token;
     }
@@ -62,7 +70,7 @@ impl Backend for ServerBackend {
             let (st, v) = self.wire.get("/product/v1/me", Some(&t))?;
             if st == 200 {
                 let nick = v.get("nick").and_then(|n| n.as_str()).unwrap_or_default().to_string();
-                self.established(&t);
+                self.established(ids, id, &t);
                 return Ok(Session { token: Zeroizing::new(t), nick, cred_ref: id.key_id.clone(), user_id: None, device_id: None });
             }
         }
@@ -71,7 +79,7 @@ impl Backend for ServerBackend {
         } else {
             keyauth::enroll(&*self.wire, ids, id, invite.ok_or(AgentError::NeedsInvite)?)?
         };
-        self.established(&token);
+        self.established(ids, id, &token);
         Ok(Session { token: Zeroizing::new(token), nick, cred_ref: id.key_id.clone(), user_id: None, device_id: None })
     }
 

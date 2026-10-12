@@ -1116,7 +1116,8 @@ impl OpenedStore {
         Ok(room_id)
     }
 
-    /// Joins direct-message invites already visible to this store.
+    /// Joins direct-message invites already visible to this store, from accounts
+    /// on this account's own server only.
     ///
     /// Returns the room ids this call asked to join. A room that is not an
     /// `is_direct` invite is left alone. This does not register the inviter.
@@ -1130,9 +1131,18 @@ impl OpenedStore {
                 let Some(state) = self.driver.core.room_state(room_id) else {
                     return false;
                 };
-                state.members.get(&me).is_some_and(|member| {
+                // Policy: a DM invite is accepted only from accounts on this account's own
+                // server (our enrolled agents; the server admits accounts by invite only).
+                let home = server_of(me.as_str());
+                let invited = state.members.get(&me).is_some_and(|member| {
                     member.membership == Membership::Invite && member.is_direct
-                })
+                });
+                invited
+                    && state
+                        .members
+                        .iter()
+                        .filter(|(user, _)| **user != me)
+                        .all(|(user, _)| server_of(user.as_str()) == home)
             })
             .collect();
         let mut ids = Vec::new();
@@ -3464,4 +3474,9 @@ mod tests {
             "leader prompt was not the decrypted text once; note={note}"
         );
     }
+}
+
+/// The server part of a Matrix user id (`@nick:server` -> `server`).
+fn server_of(user_id: &str) -> &str {
+    user_id.split_once(':').map(|(_, server)| server).unwrap_or("")
 }
