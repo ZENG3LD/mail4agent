@@ -978,6 +978,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "gate4agent-wake"
+version = "0.5.0"
+source = "git+https://github.com/ZENG3LD/gate4agent.git?branch=feat%2Fwake#b22d19ab69b09f00c3b20837f2bce71374bc0d1f"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tungstenite",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1791,6 +1802,7 @@ name = "mail4agent-messenger-shell"
 version = "0.4.7"
 dependencies = [
  "axum",
+ "gate4agent-wake",
  "libc",
  "m4a-agent",
  "m4a-seam",
@@ -1808,6 +1820,7 @@ dependencies = [
  "toml 0.8.23",
  "tower",
  "tungstenite",
+ "windows-sys 0.59.0",
  "zeroize",
 ]
 

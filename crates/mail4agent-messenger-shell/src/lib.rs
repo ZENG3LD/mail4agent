@@ -64,6 +64,7 @@
 pub mod cli;
 pub mod door_listen;
 pub mod session_account;
+pub mod letter_hook;
 #[doc(hidden)]
 pub fn ipc_own_uid() -> Option<u32> {
     ipc::own_uid()
