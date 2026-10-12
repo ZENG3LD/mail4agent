@@ -63,6 +63,7 @@
 
 pub mod cli;
 pub mod door_listen;
+pub mod session_account;
 mod cmd;
 #[cfg(feature = "wake-grok")]
 mod grok_listen;
