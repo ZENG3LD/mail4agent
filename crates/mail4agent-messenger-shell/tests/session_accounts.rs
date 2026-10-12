@@ -117,3 +117,28 @@ fn launcher_gives_each_codex_or_kimi_process_its_own_account_env_and_no_invite()
     assert!(gate(Some(&root), &c1["M4A_NICK"], Some(&c1["M4A_SESSION_CAP"]), None).is_err());
     assert!(gate(Some(&root), &c1["M4A_NICK"], Some(&c1b["M4A_SESSION_CAP"]), None).is_ok());
 }
+
+#[test]
+fn account_provision_writes_the_cap_only_to_a_new_private_file() {
+    let root = tmp("acct");
+    let cap = root.join("cap");
+    let out = agent(&root)
+        .args(["account", "provision", "--provider", "codex", "--session", "inst-1", "--cap-out"])
+        .arg(&cap)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let key = std::fs::read_to_string(&cap).unwrap();
+    assert!(!String::from_utf8_lossy(&out.stdout).contains(&key));
+    assert_eq!(v["cap_issued"], true);
+    let nick = v["nick"].as_str().unwrap();
+    assert!(mail4agent_messenger_shell::session_gate(Some(&root), nick, Some(&key), None).is_ok());
+    // An existing cap-out file is refused (no overwrite of something else).
+    let again = agent(&root)
+        .args(["account", "provision", "--provider", "codex", "--session", "inst-2", "--cap-out"])
+        .arg(&cap)
+        .output()
+        .unwrap();
+    assert!(!again.status.success());
+}
