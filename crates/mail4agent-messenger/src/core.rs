@@ -4570,6 +4570,7 @@ mod tests {
                     membership: Membership::Join,
                     displayname: Some("Erin Private".to_string()),
                     is_direct: false,
+                    invited_by: None,
                 },
             );
         }

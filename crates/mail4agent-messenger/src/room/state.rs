@@ -88,6 +88,10 @@ pub struct MemberState {
     /// room at invite time -- one of [`RoomState::derive_room_kind`]'s two
     /// DM signals.
     pub is_direct: bool,
+    /// Who sent this membership event when it is an invite (the inviter); `None` otherwise or
+    /// for state persisted before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invited_by: Option<UserId>,
 }
 
 /// One room's current state, folded from every state event
@@ -206,12 +210,14 @@ impl RoomState {
             EVENT_ROOM_MEMBER => {
                 let Ok(user_id) = UserId::parse(state_key) else { return Ok(()) };
                 let content: RoomMemberContent = serde_json::from_value(event.content.clone())?;
+                let invited_by = (content.membership == Membership::Invite).then(|| event.sender.clone());
                 self.members.insert(
                     user_id,
                     MemberState {
                         membership: content.membership,
                         displayname: content.displayname,
                         is_direct: content.is_direct.unwrap_or(false),
+                        invited_by,
                     },
                 );
             }

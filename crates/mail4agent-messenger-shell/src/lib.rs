@@ -118,6 +118,7 @@ pub use mail4agent_messenger::{
     UserId,
 };
 pub use cmd::{CmdReply, CmdRequest};
+// AutoJoinPolicy is defined in this file.
 pub use mail4agent_messenger::EventId;
 #[cfg(feature = "wake-grok")]
 pub use grok_listen::{hear, GrokListener, Heard, ListenReport};
@@ -1120,13 +1121,19 @@ impl OpenedStore {
         Ok(room_id)
     }
 
-    /// Joins direct-message invites already visible to this store, from accounts
-    /// on this account's own server only.
-    ///
-    /// Returns the room ids this call asked to join. A room that is not an
-    /// `is_direct` invite is left alone. This does not register the inviter.
-    pub fn accept_direct_invites(&mut self, mut now_ms: i64) -> Result<Vec<String>, ShellError> {
+    /// Joins invites already visible to this store, by the auto-join policy
+    /// ([`AutoJoinPolicy::from_env`]): a DM invite when every other member is on this account's
+    /// own server, a group-room invite when the inviter is on this account's own server (and,
+    /// when an allow-list is set, is on it). Anything else is left alone. Returns the room ids
+    /// this call asked to join. This does not register the inviter.
+    pub fn accept_direct_invites(&mut self, now_ms: i64) -> Result<Vec<String>, ShellError> {
+        self.accept_invites(now_ms, &AutoJoinPolicy::from_env())
+    }
+
+    /// [`Self::accept_direct_invites`] with an explicit policy.
+    pub fn accept_invites(&mut self, mut now_ms: i64, policy: &AutoJoinPolicy) -> Result<Vec<String>, ShellError> {
         let me = self.driver.core.user_id().clone();
+        let home = server_of(me.as_str()).to_string();
         let invited: Vec<RoomId> = self
             .driver.core
             .room_ids()
@@ -1135,18 +1142,10 @@ impl OpenedStore {
                 let Some(state) = self.driver.core.room_state(room_id) else {
                     return false;
                 };
-                // Policy: a DM invite is accepted only from accounts on this account's own
-                // server (our enrolled agents; the server admits accounts by invite only).
-                let home = server_of(me.as_str());
-                let invited = state.members.get(&me).is_some_and(|member| {
-                    member.membership == Membership::Invite && member.is_direct
-                });
-                invited
-                    && state
-                        .members
-                        .iter()
-                        .filter(|(user, _)| **user != me)
-                        .all(|(user, _)| server_of(user.as_str()) == home)
+                let Some(mine) = state.members.get(&me).filter(|m| m.membership == Membership::Invite) else {
+                    return false;
+                };
+                policy.accepts(&home, me.as_str(), mine.is_direct, mine.invited_by.as_ref().map(|u| u.as_str()), state.members.keys().map(|u| u.as_str()))
             })
             .collect();
         let mut ids = Vec::new();
@@ -3483,4 +3482,96 @@ mod tests {
 /// The server part of a Matrix user id (`@nick:server` -> `server`).
 fn server_of(user_id: &str) -> &str {
     user_id.split_once(':').map(|(_, server)| server).unwrap_or("")
+}
+
+/// Which invites a session joins on its own. Defaults: DMs and group rooms from members of this
+/// account's own server. Env: `M4A_AUTO_JOIN_DMS=0` / `M4A_AUTO_JOIN_ROOMS=0` turn either off;
+/// `M4A_AUTO_JOIN_FROM` (comma-separated nicks or user ids) limits room invites to those
+/// inviters (e.g. the operator).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoJoinPolicy {
+    pub dms: bool,
+    pub rooms: bool,
+    /// Allowed room inviters (nick or full user id); empty = any member of our server.
+    pub room_inviters: Vec<String>,
+}
+
+impl Default for AutoJoinPolicy {
+    fn default() -> Self {
+        Self { dms: true, rooms: true, room_inviters: Vec::new() }
+    }
+}
+
+impl AutoJoinPolicy {
+    pub fn from_env() -> Self {
+        let flag = |k: &str| std::env::var(k).map(|v| !matches!(v.trim(), "0" | "false" | "off" | "no")).unwrap_or(true);
+        let from = std::env::var("M4A_AUTO_JOIN_FROM").unwrap_or_default();
+        Self {
+            dms: flag("M4A_AUTO_JOIN_DMS"),
+            rooms: flag("M4A_AUTO_JOIN_ROOMS"),
+            room_inviters: from.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+        }
+    }
+
+    /// Whether to join one invite. `members` includes `me`.
+    pub fn accepts<'a>(&self, home: &str, me: &str, is_direct: bool, inviter: Option<&str>, members: impl Iterator<Item = &'a str>) -> bool {
+        if home.is_empty() {
+            return false;
+        }
+        if is_direct {
+            let others: Vec<&str> = members.filter(|u| *u != me).collect();
+            let peers_home = !others.is_empty() && others.iter().all(|u| server_of(u) == home);
+            return self.dms && peers_home && inviter.is_none_or(|i| server_of(i) == home);
+        }
+        let Some(inviter) = inviter else { return false };
+        if !self.rooms || server_of(inviter) != home || inviter == me {
+            return false;
+        }
+        self.room_inviters.is_empty()
+            || self.room_inviters.iter().any(|a| a.eq_ignore_ascii_case(inviter) || a.eq_ignore_ascii_case(inviter.trim_start_matches('@').split(':').next().unwrap_or("")))
+    }
+}
+
+#[cfg(test)]
+mod auto_join_tests {
+    use super::AutoJoinPolicy;
+
+    const HOME: &str = "message.sarl";
+    const ME: &str = "@kimi-web:message.sarl";
+
+    fn ok(p: &AutoJoinPolicy, direct: bool, inviter: Option<&str>, members: &[&str]) -> bool {
+        p.accepts(HOME, ME, direct, inviter, members.iter().copied())
+    }
+
+    #[test]
+    fn group_room_invite_from_our_server_is_joined() {
+        let p = AutoJoinPolicy::default();
+        assert!(ok(&p, false, Some("@hatcheryweb:message.sarl"), &[ME, "@hatcheryweb:message.sarl", "@x:other.org"]));
+    }
+
+    #[test]
+    fn group_room_invite_from_another_server_or_unknown_inviter_is_left() {
+        let p = AutoJoinPolicy::default();
+        assert!(!ok(&p, false, Some("@evil:other.org"), &[ME, "@evil:other.org"]));
+        assert!(!ok(&p, false, None, &[ME, "@hatcheryweb:message.sarl"]));
+    }
+
+    #[test]
+    fn dm_policy_is_unchanged() {
+        let p = AutoJoinPolicy::default();
+        assert!(ok(&p, true, Some("@codex:message.sarl"), &[ME, "@codex:message.sarl"]));
+        assert!(ok(&p, true, None, &[ME, "@codex:message.sarl"]));
+        assert!(!ok(&p, true, Some("@x:other.org"), &[ME, "@x:other.org"]));
+    }
+
+    #[test]
+    fn switches_and_allow_list() {
+        let off = AutoJoinPolicy { rooms: false, ..AutoJoinPolicy::default() };
+        assert!(!ok(&off, false, Some("@hatcheryweb:message.sarl"), &[ME]));
+        let nodm = AutoJoinPolicy { dms: false, ..AutoJoinPolicy::default() };
+        assert!(!ok(&nodm, true, Some("@codex:message.sarl"), &[ME, "@codex:message.sarl"]));
+        let only_op = AutoJoinPolicy { room_inviters: vec!["hatcheryweb".into()], ..AutoJoinPolicy::default() };
+        assert!(ok(&only_op, false, Some("@hatcheryweb:message.sarl"), &[ME]));
+        assert!(!ok(&only_op, false, Some("@codex:message.sarl"), &[ME]));
+    }
 }

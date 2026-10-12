@@ -1030,3 +1030,46 @@ fn m5_rich_commands_roundtrip() {
     drop(carol);
     stop_server(&mut boot.server);
 }
+
+#[test]
+fn m6_group_room_invite_from_own_server_is_auto_joined() {
+    use mail4agent_messenger_shell::{AutoJoinPolicy, CmdRequest};
+    let mut boot = start_three_shells();
+    let (mut alice, mut bob, mut carol) = open_trio(&boot);
+    let (mut alice_now, mut bob_now, mut carol_now) = (5_000_000_i64, 5_000_000_i64, 5_000_000_i64);
+    settle(&mut alice, &mut alice_now);
+    settle(&mut bob, &mut bob_now);
+    settle(&mut carol, &mut carol_now);
+    let cmd = |name: &str, args: serde_json::Value| CmdRequest { cmd: name.to_string(), as_nick: "x".to_string(), args, cap: None };
+    let made = alice.run_command(&cmd("rooms.create", serde_json::json!({"name": "m6room", "kind": "group", "invite": ["@bob:localhost", "@carol:localhost"]})), alice_now);
+    assert!(made.ok, "create: {:?}", made.error);
+    let room_id = made.data["room"].as_str().expect("room").to_string();
+    settle(&mut alice, &mut alice_now);
+    // Carol's policy has room auto-join off: she stays invited.
+    let off = AutoJoinPolicy { rooms: false, ..AutoJoinPolicy::default() };
+    let mut bob_joined = Vec::new();
+    for _ in 0..10 {
+        settle(&mut bob, &mut bob_now);
+        settle(&mut carol, &mut carol_now);
+        bob_joined.extend(bob.accept_invites(bob_now, &AutoJoinPolicy::default()).expect("bob accept"));
+        assert!(carol.accept_invites(carol_now, &off).expect("carol accept").is_empty());
+        if !bob_joined.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    assert_eq!(bob_joined, vec![room_id.clone()], "bob did not auto-join; {}", describe(&bob));
+    for _ in 0..20 {
+        settle(&mut bob, &mut bob_now);
+        if bob.rooms().iter().any(|r| r.room_id == room_id && r.membership == "join") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    assert!(bob.rooms().iter().any(|r| r.room_id == room_id && r.membership == "join"), "{}", describe(&bob));
+    assert!(carol.rooms().iter().any(|r| r.room_id == room_id && r.membership == "invite"), "{}", describe(&carol));
+    drop(alice);
+    drop(bob);
+    drop(carol);
+    stop_server(&mut boot.server);
+}
