@@ -973,8 +973,8 @@ dependencies = [
 
 [[package]]
 name = "gate4agent-wake"
-version = "0.5.0"
-source = "git+https://github.com/ZENG3LD/gate4agent.git?branch=master#531ba6b470fd292078220c2d3fc2e350221f6953"
+version = "0.5.1"
+source = "git+https://github.com/ZENG3LD/gate4agent.git?tag=v0.5.1#27673c395dc4d2fde125582d58965d10e25014f3"
 dependencies = [
  "dunce",
  "reqwest",
@@ -1580,7 +1580,7 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
 name = "m4a-agent"
-version = "0.4.7"
+version = "0.4.9"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -1601,7 +1601,7 @@ dependencies = [
 
 [[package]]
 name = "m4a-edge"
-version = "0.4.7"
+version = "0.4.9"
 dependencies = [
  "axum",
  "futures-util",
@@ -1616,7 +1616,7 @@ dependencies = [
 
 [[package]]
 name = "m4a-matrix-core"
-version = "0.4.7"
+version = "0.4.9"
 dependencies = [
  "ed25519-dalek 2.2.0",
  "js_int",
@@ -1631,7 +1631,7 @@ dependencies = [
 
 [[package]]
 name = "m4a-product-example"
-version = "0.4.7"
+version = "0.4.9"
 dependencies = [
  "argon2",
  "axum",
@@ -1656,7 +1656,7 @@ dependencies = [
 
 [[package]]
 name = "m4a-product-kit"
-version = "0.4.7"
+version = "0.4.9"
 dependencies = [
  "axum",
  "futures-util",
@@ -1675,7 +1675,7 @@ dependencies = [
 
 [[package]]
 name = "m4a-seam"
-version = "0.4.7"
+version = "0.4.9"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek 2.2.0",
@@ -1689,7 +1689,7 @@ dependencies = [
 
 [[package]]
 name = "mail4agent"
-version = "0.4.7"
+version = "0.4.9"
 dependencies = [
  "axum",
  "clap",
@@ -1716,7 +1716,7 @@ dependencies = [
 
 [[package]]
 name = "mail4agent-api"
-version = "0.4.7"
+version = "0.4.9"
 dependencies = [
  "serde",
  "serde_json",
@@ -1724,7 +1724,7 @@ dependencies = [
 
 [[package]]
 name = "mail4agent-attest"
-version = "0.4.7"
+version = "0.4.9"
 dependencies = [
  "libc",
  "sysinfo",
@@ -1734,7 +1734,7 @@ dependencies = [
 
 [[package]]
 name = "mail4agent-client"
-version = "0.4.7"
+version = "0.4.9"
 dependencies = [
  "mail4agent-api",
  "reqwest",
@@ -1747,7 +1747,7 @@ dependencies = [
 
 [[package]]
 name = "mail4agent-core"
-version = "0.4.7"
+version = "0.4.9"
 dependencies = [
  "getrandom 0.2.17",
  "hex",
@@ -1763,7 +1763,7 @@ dependencies = [
 
 [[package]]
 name = "mail4agent-messenger"
-version = "0.4.7"
+version = "0.4.9"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
@@ -1779,7 +1779,7 @@ dependencies = [
 
 [[package]]
 name = "mail4agent-messenger-shell"
-version = "0.4.7"
+version = "0.4.9"
 dependencies = [
  "axum",
  "gate4agent-wake",
@@ -1805,7 +1805,7 @@ dependencies = [
 
 [[package]]
 name = "mail4agent-server"
-version = "0.4.7"
+version = "0.4.9"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1831,7 +1831,7 @@ dependencies = [
 
 [[package]]
 name = "mail4agent-server-bin"
-version = "0.4.7"
+version = "0.4.9"
 dependencies = [
  "axum",
  "chrono",
@@ -1852,7 +1852,7 @@ dependencies = [
 
 [[package]]
 name = "mail4agent-store-sqlite"
-version = "0.4.7"
+version = "0.4.9"
 dependencies = [
  "mail4agent-api",
  "mail4agent-core",
@@ -1866,7 +1866,7 @@ dependencies = [
 
 [[package]]
 name = "mail4agent-vodozemac"
-version = "0.4.7"
+version = "0.4.9"
 dependencies = [
  "aes",
  "anyhow",
