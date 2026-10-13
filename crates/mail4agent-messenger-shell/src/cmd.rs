@@ -248,10 +248,14 @@ impl OpenedStore {
                     .and_then(Value::as_array)
                     .map(|v| v.iter().filter_map(Value::as_str).filter_map(|u| UserId::parse(u).ok()).collect())
                     .unwrap_or_default();
-                let kind = match arg_str(a, "kind").unwrap_or("group") {
-                    "channel" => CreateRoomKind::Channel { name: name.to_string(), topic: arg_str(a, "topic").map(str::to_string) },
+                let wanted = arg_str(a, "kind").unwrap_or("group");
+                // `open` is an open room: the server's public plaintext shape (a channel) with the
+                // write level lowered to 0 once the room exists, so everyone who joins can write.
+                let open_for_all = wanted == "open";
+                let kind = match wanted {
+                    "channel" | "open" => CreateRoomKind::Channel { name: name.to_string(), topic: arg_str(a, "topic").map(str::to_string) },
                     "group" => CreateRoomKind::Group { name: name.to_string(), invite, members_can_invite: true },
-                    other => return CmdReply::failed(format!("kind must be channel or group, not {other}")),
+                    other => return CmdReply::failed(format!("kind must be group, channel or open, not {other}")),
                 };
                 match self.dispatch(MessengerCommand::CreateRoom { kind }, now_ms) {
                     Ok(()) => {
@@ -266,6 +270,15 @@ impl OpenedStore {
                             if found.is_some() {
                                 break;
                             }
+                        }
+                        if open_for_all {
+                            let Some(room) = found.as_ref().and_then(|r| RoomId::parse(&r.room_id).ok()) else {
+                                return CmdReply::failed("the room was created but did not show up; its write level is still moderator-only");
+                            };
+                            if let Err(e) = self.dispatch(MessengerCommand::SetEventsDefault { room_id: room, level: 0 }, now_ms) {
+                                return CmdReply::failed(format!("the room was created but its write level was not lowered: {e}"));
+                            }
+                            self.settle_cmd(now_ms);
                         }
                         CmdReply::ok(json!({ "room": found.map(|r| r.room_id) }))
                     }

@@ -7,7 +7,7 @@
 //!   m4a mentions [-n 20]
 //!   m4a thread <room> <event_id>
 //!   m4a join|leave <room>
-//!   m4a create <name> [--channel] [--invite @u:server,...]
+//!   m4a create <name> [--channel | --open] [--invite @u:server,...]
 //!   m4a invite <room> <user>
 //!   m4a react <room> <event_id> <emoji>
 //!   m4a members <room>   (--json: user, membership, power level)
@@ -69,6 +69,7 @@ pub fn run(args: Vec<String>) {
     let mut as_json = false;
     let mut n: Option<u64> = None;
     let mut channel = false;
+    let mut open = false;
     let mut invite: Vec<String> = Vec::new();
     let mut pos: Vec<String> = Vec::new();
     let mut args = args.clone().into_iter();
@@ -78,9 +79,10 @@ pub fn run(args: Vec<String>) {
             "--json" => as_json = true,
             "-n" => n = args.next().and_then(|v| v.parse().ok()),
             "--channel" => channel = true,
+            "--open" => open = true,
             "--invite" => invite = args.next().unwrap_or_default().split(',').map(str::to_string).collect(),
             "-h" | "--help" => {
-                println!("usage: m4a [--as NICK] [--json] rooms | read <room> [-n N] | send <room> <text> | reply <room> <event> <text> | mentions | thread <room> <event> | join|leave <room> | create <name> [--channel] [--invite ids] | invite <room> <user>");
+                println!("usage: m4a [--as NICK] [--json] rooms | read <room> [-n N] | send <room> <text> | reply <room> <event> <text> | mentions | thread <room> <event> | join|leave <room> | create <name> [--channel | --open] [--invite ids] | invite <room> <user>");
                 return;
             }
             _ => pos.push(arg),
@@ -103,7 +105,7 @@ pub fn run(args: Vec<String>) {
         "thread" => ("threads.read", json!({ "room": need(0, "room"), "event": need(1, "event id") })),
         "join" => ("rooms.join", json!({ "room": need(0, "room") })),
         "leave" => ("rooms.leave", json!({ "room": need(0, "room") })),
-        "create" => ("rooms.create", json!({ "name": need(0, "name"), "kind": if channel { "channel" } else { "group" }, "invite": invite })),
+        "create" => ("rooms.create", json!({ "name": need(0, "name"), "kind": if open { "open" } else if channel { "channel" } else { "group" }, "invite": invite })),
         "react" => ("rooms.react", json!({ "room": need(0, "room"), "event": need(1, "event id"), "key": need(2, "emoji") })),
         "members" => ("rooms.members", json!({ "room": need(0, "room") })),
         "redact" => ("rooms.redact", json!({ "room": need(0, "room"), "event": need(1, "event id") })),
