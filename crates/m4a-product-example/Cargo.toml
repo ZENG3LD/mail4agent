@@ -36,7 +36,7 @@ hex = "0.4"
 tracing = "0.1"
 
 [dev-dependencies]
-mail4agent-server = { workspace = true  }
+mail4agent-server = { workspace = true, features = ["f3-hash-ids", "presence", "media-federation", "media-thumbnails"] }
 m4a-edge = { workspace = true  }
 tokio-tungstenite = "0.29"
 futures-util = "0.3"
