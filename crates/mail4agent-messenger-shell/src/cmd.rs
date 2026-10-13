@@ -125,6 +125,7 @@ impl OpenedStore {
                     "body": body,
                     "reply_to": item.relations.reply_to.as_ref().map(|e| e.as_str()),
                     "thread": item.relations.thread_root.as_ref().map(|e| e.as_str()),
+                    "reactions": item.relations.reactions.iter().map(|(k, who)| json!({ "key": k, "count": who.len(), "by": who.iter().map(|u| mxid_localpart(u.as_str())).collect::<Vec<_>>() })).collect::<Vec<_>>(),
                     "state": crate::outcome_name(&item.send_state),
                 }))
             })
@@ -289,6 +290,26 @@ impl OpenedStore {
                 };
                 let Ok(user_id) = UserId::parse(&user) else { return CmdReply::failed("bad user id") };
                 match self.dispatch(MessengerCommand::Invite { room_id: id.clone(), user_id }, now_ms) {
+                    Ok(()) => {
+                        self.settle_cmd(now_ms);
+                        CmdReply::ok(json!({ "room": id.as_str() }))
+                    }
+                    Err(e) => CmdReply::failed(e.to_string()),
+                }
+            }
+            "rooms.react" => {
+                let (Some(spec), Some(ev), Some(key)) = (arg_str(a, "room"), arg_str(a, "event"), arg_str(a, "key")) else {
+                    return CmdReply::failed("room, event and key are required");
+                };
+                if key.is_empty() || key.len() > 64 {
+                    return CmdReply::failed("bad key");
+                }
+                let id = match self.resolve_room(spec, now_ms) {
+                    Ok(id) => id,
+                    Err(e) => return CmdReply::failed(e),
+                };
+                let Ok(target) = crate::EventId::parse(ev) else { return CmdReply::failed("bad event id") };
+                match self.dispatch(MessengerCommand::React { room_id: id.clone(), target, key: key.to_string() }, now_ms) {
                     Ok(()) => {
                         self.settle_cmd(now_ms);
                         CmdReply::ok(json!({ "room": id.as_str() }))
