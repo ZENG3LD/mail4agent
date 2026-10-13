@@ -296,6 +296,16 @@ impl OpenedStore {
                     Err(e) => CmdReply::failed(e.to_string()),
                 }
             }
+            "rooms.members" => {
+                let Some(spec) = arg_str(a, "room") else { return CmdReply::failed("room is required") };
+                let id = match self.resolve_room(spec, now_ms) {
+                    Ok(id) => id,
+                    Err(e) => return CmdReply::failed(e),
+                };
+                let Some(state) = self.driver.core.room_state(&id) else { return CmdReply::failed("unknown room") };
+                let members: Vec<Value> = state.members.iter().map(|(u, m)| json!({ "user": u.as_str(), "membership": format!("{:?}", m.membership).to_lowercase(), "level": state.power_levels.users.get(u).copied().unwrap_or(state.power_levels.users_default) })).collect();
+                CmdReply::ok(json!({ "room": id.as_str(), "members": members }))
+            }
             "rooms.redact" => {
                 let (Some(spec), Some(ev)) = (arg_str(a, "room"), arg_str(a, "event")) else {
                     return CmdReply::failed("room and event are required");

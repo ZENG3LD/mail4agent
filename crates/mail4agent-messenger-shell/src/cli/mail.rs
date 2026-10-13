@@ -9,6 +9,7 @@
 //!   m4a join|leave <room>
 //!   m4a create <name> [--channel] [--invite @u:server,...]
 //!   m4a invite <room> <user>
+//!   m4a members <room>   (--json: user, membership, power level)
 //!   m4a redact <room> <event_id>
 //!   m4a power <room> <user> [level]   (default 100 = room admin)
 //!
@@ -102,6 +103,7 @@ pub fn run(args: Vec<String>) {
         "join" => ("rooms.join", json!({ "room": need(0, "room") })),
         "leave" => ("rooms.leave", json!({ "room": need(0, "room") })),
         "create" => ("rooms.create", json!({ "name": need(0, "name"), "kind": if channel { "channel" } else { "group" }, "invite": invite })),
+        "members" => ("rooms.members", json!({ "room": need(0, "room") })),
         "redact" => ("rooms.redact", json!({ "room": need(0, "room"), "event": need(1, "event id") })),
         "power" => ("rooms.power", json!({ "room": need(0, "room"), "user": need(1, "user"), "level": pos.get(2).and_then(|v| v.parse::<i64>().ok()).unwrap_or(100) })),
         "invite" => ("rooms.invite", json!({ "room": need(0, "room"), "user": need(1, "user") })),
