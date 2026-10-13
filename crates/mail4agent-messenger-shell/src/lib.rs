@@ -1248,7 +1248,17 @@ impl OpenedStore {
     pub fn drive(&mut self, now_ms: i64, wait_for_sync: bool) -> Result<(), ShellError> {
         self.driver.core.decrypt_loaded_timeline();
         if self.reaction_floor.is_none() {
-            self.reaction_floor = Some(self.reaction_items(i64::MIN).iter().map(|r| r.ts).max().unwrap_or(i64::MIN));
+            // Reactions older than the first time this store ran with reaction wakes never wake, so a
+            // deploy does not replay history; later ones (also while offline) are deduped by the ledger.
+            let path = self.store_dir().join("reaction-wake-floor");
+            // Wall clock, not `now_ms`: callers pass synthetic times on open (`drive(1_000)`).
+            let _ = now_ms;
+            let floor = std::fs::read_to_string(&path).ok().and_then(|t| t.trim().parse::<i64>().ok()).unwrap_or_else(|| {
+                let wall = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+                let _ = std::fs::write(&path, wall.to_string());
+                wall
+            });
+            self.reaction_floor = Some(floor);
         }
         let trace_at = self.driver.http_trace.len();
         let history = self.request_missing_history(now_ms)?;
@@ -2804,6 +2814,10 @@ mod tests {
     fn redaction_ev(id: &str, sender: &str, ts: i64, target: &str) -> serde_json::Value {
         serde_json::json!({ "event_id": id, "type": "m.room.redaction", "sender": sender, "origin_server_ts": ts, "redacts": target, "content": { "redacts": target } })
     }
+    /// A server timestamp after this process started (reactions older than the first run never wake).
+    fn later(ms: i64) -> i64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0) + 3_600_000 + ms
+    }
     fn reaction_ev(id: &str, sender: &str, ts: i64, target: &str, key: &str) -> serde_json::Value {
         serde_json::json!({ "event_id": id, "type": "m.reaction", "sender": sender, "origin_server_ts": ts, "content": { "m.relates_to": { "rel_type": "m.annotation", "event_id": target, "key": key } } })
     }
@@ -2856,8 +2870,8 @@ mod tests {
     fn a_reaction_to_my_message_wakes_once_low_priority_and_mine_never() {
         let w = wakes_for("reaction-wake", serde_json::json!([
             text_ev("$a1:localhost", "@alice:localhost", 10, "deploy finished"),
-            reaction_ev("$r1:localhost", "@bob:localhost", 11, "$a1:localhost", "👍"),
-            reaction_ev("$r2:localhost", "@alice:localhost", 12, "$a1:localhost", "🎉"),
+            reaction_ev("$r1:localhost", "@bob:localhost", later(0), "$a1:localhost", "👍"),
+            reaction_ev("$r2:localhost", "@alice:localhost", later(1), "$a1:localhost", "🎉"),
         ]), true);
         assert_eq!(w.len(), 1, "exactly one wake (bob's reaction), none for my own, no replay after restart: {w:?}");
         assert_eq!(w[0]["kind"], "reaction");
@@ -2871,11 +2885,20 @@ mod tests {
     }
 
     #[test]
+    fn reactions_from_before_the_first_run_never_wake() {
+        let w = wakes_for("reaction-history", serde_json::json!([
+            text_ev("$a1:localhost", "@alice:localhost", 10, "old"),
+            reaction_ev("$r1:localhost", "@bob:localhost", 11, "$a1:localhost", "👍"),
+        ]), false);
+        assert!(w.is_empty(), "history replayed: {w:?}");
+    }
+
+    #[test]
     fn a_reaction_added_and_removed_before_the_wake_produces_nothing() {
         let w = wakes_for("reaction-undo", serde_json::json!([
             text_ev("$a1:localhost", "@alice:localhost", 10, "hello"),
-            reaction_ev("$r1:localhost", "@bob:localhost", 11, "$a1:localhost", "👍"),
-            redaction_ev("$x1:localhost", "@bob:localhost", 12, "$r1:localhost"),
+            reaction_ev("$r1:localhost", "@bob:localhost", later(0), "$a1:localhost", "👍"),
+            redaction_ev("$x1:localhost", "@bob:localhost", later(1), "$r1:localhost"),
         ]), false);
         assert!(w.is_empty(), "{w:?}");
     }
