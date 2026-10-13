@@ -444,6 +444,16 @@ pub enum MessengerCommand {
         /// Why, if given.
         reason: Option<String>,
     },
+    /// Sets one user's power level in a room (`m.room.power_levels`, the
+    /// rest of the current content kept). The server enforces who may.
+    SetPowerLevel {
+        /// The room.
+        room_id: RoomId,
+        /// The user whose level changes.
+        user_id: UserId,
+        /// The new level (100 = room admin).
+        level: i64,
+    },
     /// Adds (or updates) an `m.tag` room-account-data tag.
     SetTag {
         /// The room being tagged.
@@ -2226,6 +2236,14 @@ impl<C: RecordCodec> MessengerCore<C> {
             MessengerCommand::Kick { room_id, user_id, reason } => {
                 let request_id = self.next_request_id()?;
                 let request = OutgoingRequest::kick(request_id, &room_id, &user_id, reason.as_deref());
+                self.enqueue_request(request, Lane::Other)?;
+            }
+            MessengerCommand::SetPowerLevel { room_id, user_id, level } => {
+                let mut content = self.room_state(&room_id).map(|st| st.power_levels.clone()).ok_or_else(|| MessengerError::IntentRefused(format!("unknown room {}", room_id.as_str())))?;
+                content.users.insert(user_id, level);
+                let body = serde_json::to_value(&content)?;
+                let request_id = self.next_request_id()?;
+                let request = OutgoingRequest::set_state(request_id, &room_id, "m.room.power_levels", "", body);
                 self.enqueue_request(request, Lane::Other)?;
             }
             MessengerCommand::SetTag { room_id, tag, order } => {

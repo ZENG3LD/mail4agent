@@ -296,6 +296,49 @@ impl OpenedStore {
                     Err(e) => CmdReply::failed(e.to_string()),
                 }
             }
+            "rooms.redact" => {
+                let (Some(spec), Some(ev)) = (arg_str(a, "room"), arg_str(a, "event")) else {
+                    return CmdReply::failed("room and event are required");
+                };
+                let id = match self.resolve_room(spec, now_ms) {
+                    Ok(id) => id,
+                    Err(e) => return CmdReply::failed(e),
+                };
+                let Ok(target) = crate::EventId::parse(ev) else { return CmdReply::failed("bad event id") };
+                match self.dispatch(MessengerCommand::Redact { room_id: id.clone(), target, reason: None }, now_ms) {
+                    Ok(()) => {
+                        self.settle_cmd(now_ms);
+                        CmdReply::ok(json!({ "room": id.as_str() }))
+                    }
+                    Err(e) => CmdReply::failed(e.to_string()),
+                }
+            }
+            "rooms.power" => {
+                let (Some(spec), Some(who)) = (arg_str(a, "room"), arg_str(a, "user")) else {
+                    return CmdReply::failed("room and user are required");
+                };
+                let level = a.get("level").and_then(Value::as_i64).unwrap_or(100);
+                let id = match self.resolve_room(spec, now_ms) {
+                    Ok(id) => id,
+                    Err(e) => return CmdReply::failed(e),
+                };
+                let user = if who.starts_with('@') && who.contains(':') {
+                    who.to_string()
+                } else {
+                    match self.find_nick(who, now_ms) {
+                        Ok(found) => found.user_id,
+                        Err(e) => return CmdReply::failed(format!("{who}: {e}")),
+                    }
+                };
+                let Ok(user_id) = UserId::parse(&user) else { return CmdReply::failed("bad user id") };
+                match self.dispatch(MessengerCommand::SetPowerLevel { room_id: id.clone(), user_id, level }, now_ms) {
+                    Ok(()) => {
+                        self.settle_cmd(now_ms);
+                        CmdReply::ok(json!({ "room": id.as_str(), "level": level }))
+                    }
+                    Err(e) => CmdReply::failed(e.to_string()),
+                }
+            }
             "mentions" => {
                 let limit = a.get("limit").and_then(Value::as_u64).unwrap_or(20).min(200) as usize;
                 let me = self.nick().unwrap_or("").to_ascii_lowercase();

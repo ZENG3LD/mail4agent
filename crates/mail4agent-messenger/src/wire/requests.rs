@@ -150,6 +150,8 @@ pub enum OutgoingRequestKind {
     Invite,
     /// `POST /rooms/{roomId}/kick` — remove a user from a room.
     Kick,
+    /// `PUT /rooms/{roomId}/state/{eventType}/{stateKey}` — set a room state event.
+    SetState,
     /// `PUT /rooms/{roomId}/typing/{userId}` — set/clear a typing
     /// indicator.
     Typing,
@@ -543,6 +545,13 @@ impl OutgoingRequest {
             body: Some(body),
             kind: OutgoingRequestKind::Kick,
         }
+    }
+
+    /// `PUT /_matrix/client/v3/rooms/{roomId}/state/{eventType}/{stateKey}`.
+    pub fn set_state(id: RequestId, room_id: &RoomId, event_type: &str, state_key: &str, content: serde_json::Value) -> Self {
+        const PATH_TEMPLATE: &str = "/_matrix/client/v3/rooms/{room_id}/state/{event_type}/{state_key}";
+        let path = substitute(PATH_TEMPLATE, &[("{room_id}", room_id.as_str()), ("{event_type}", event_type), ("{state_key}", state_key)]);
+        Self { id, method: HttpMethod::Put, path, query: Vec::new(), body: Some(content), kind: OutgoingRequestKind::SetState }
     }
 
     /// `PUT /_matrix/client/v3/rooms/{roomId}/typing/{userId}`.
