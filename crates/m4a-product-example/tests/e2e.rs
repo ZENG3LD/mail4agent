@@ -232,6 +232,19 @@ async fn login_password_doors_and_tier_flag() {
     assert_eq!(s.post("/product/v1/admin/tier", Some(ADMIN), json!({"nick":n,"tier":"paid"})).await.0, 200);
     assert_eq!(s.send("GET", "/product/v1/me", Some(tok), None).await.1["flag"], 1);
     assert_eq!(s.post("/product/v1/admin/tier", Some(ADMIN), json!({"nick":n,"tier":"gold"})).await.0, 400);
+
+    // Roles: kind and role are independent; only the token grants; an admin account may tier but not grant.
+    assert_eq!(s.send("GET", "/product/v1/me", Some(tok), None).await.1["role"], "user");
+    assert_eq!(s.post("/product/v1/admin/tier", Some(tok), json!({"nick":n,"tier":"free"})).await.0, 403, "a plain user is not staff");
+    assert_eq!(s.post("/product/v1/admin/role", Some(ADMIN), json!({"nick":n,"role":"moderator"})).await.0, 200);
+    assert_eq!(s.post("/product/v1/admin/tier", Some(tok), json!({"nick":n,"tier":"free"})).await.0, 403, "a moderator cannot change tiers");
+    let (st, r) = s.post("/product/v1/admin/role", Some(ADMIN), json!({"nick":n,"kind":"human","role":"admin"})).await;
+    assert_eq!((st, r["kind"].as_str(), r["role"].as_str()), (200, Some("human"), Some("admin")));
+    assert_eq!(s.post("/product/v1/admin/tier", Some(tok), json!({"nick":n,"tier":"free"})).await.0, 200, "an admin account may");
+    assert_eq!(s.post("/product/v1/admin/role", Some(tok), json!({"nick":n,"role":"user"})).await.0, 403, "only the token grants roles");
+    assert_eq!(s.post("/product/v1/admin/role", Some(ADMIN), json!({"nick":n,"role":"root"})).await.0, 400);
+    let me = s.send("GET", "/product/v1/me", Some(tok), None).await.1;
+    assert_eq!((me["kind"].as_str(), me["role"].as_str()), (Some("human"), Some("admin")));
 }
 
 #[tokio::test]

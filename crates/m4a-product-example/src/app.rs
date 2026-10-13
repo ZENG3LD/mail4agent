@@ -12,6 +12,7 @@ use axum::routing::{any, get, post, put};
 use axum::{Json, Router};
 use m4a_product_kit::door::{DoorError, LoginDoor};
 use m4a_product_kit::model::UserStore;
+use crate::store::Role;
 use m4a_product_kit::service::{AuthUser, ServiceError, UserService};
 use m4a_product_kit::{EdgeLink, EventPublisher};
 use serde_json::{json, Value};
@@ -168,6 +169,7 @@ pub fn router(app: App) -> Router {
         .route("/product/v1/admin/revoke", post(admin_revoke))
         .route("/product/v1/admin/delete", post(admin_delete))
         .route("/product/v1/admin/tier", post(admin_tier))
+        .route("/product/v1/admin/role", post(admin_role))
         .fallback(any(proxy))
         .layer(axum::middleware::from_fn(cors))
         .with_state(app)
@@ -488,7 +490,13 @@ async fn logout(State(app): State<App>, headers: HeaderMap) -> Result<Json<Value
 
 async fn me(State(app): State<App>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
     let who = need(&app, &headers).await?;
-    Ok(Json(json!({ "nick": who.nick, "flag": who.flag })))
+    let nick = who.nick.clone();
+    let (kind, role) = blk(&app, move |a| -> Result<(String, Role), ServiceError> {
+        let u = a.users.store.user_by_nick(&nick)?.ok_or(ServiceError::Unauthorized)?;
+        Ok(a.users.store.roles(u.id)?)
+    })
+    .await??;
+    Ok(Json(json!({ "nick": who.nick, "flag": who.flag, "kind": kind, "role": role.as_str() })))
 }
 
 async fn set_nick(State(app): State<App>, headers: HeaderMap, Json(body): Json<Value>) -> Result<Json<Value>, ApiError> {
@@ -504,6 +512,51 @@ async fn set_nick(State(app): State<App>, headers: HeaderMap, Json(body): Json<V
     Ok(Json(json!({ "nick": u.nick })))
 }
 
+fn is_admin_token(app: &App, h: &HeaderMap) -> bool {
+    !app.admin_token.is_empty() && bearer(h).map(|t| Sha256::digest(t.as_bytes()) == Sha256::digest(app.admin_token.as_bytes())).unwrap_or(false)
+}
+
+/// The admin token, or a signed-in account whose server role is at least `min`. Returns the acting
+/// account's role (`Admin` for the token).
+async fn staff(app: &App, h: &HeaderMap, min: Role) -> Result<Role, ApiError> {
+    if is_admin_token(app, h) {
+        return Ok(Role::Admin);
+    }
+    let who = need(app, h).await.map_err(|_| err(StatusCode::FORBIDDEN, "M_FORBIDDEN", "admin token required"))?;
+    let nick = who.nick.clone();
+    let role = blk(app, move |a| -> Result<Role, ServiceError> {
+        let u = a.users.store.user_by_nick(&nick)?.ok_or(ServiceError::Unauthorized)?;
+        Ok(a.users.store.roles(u.id)?.1)
+    })
+    .await??;
+    if role >= min {
+        Ok(role)
+    } else {
+        Err(err(StatusCode::FORBIDDEN, "M_FORBIDDEN", "not allowed for this account"))
+    }
+}
+
+/// `POST /product/v1/admin/role {nick, kind?: human|agent, role?: admin|moderator|user}`. Admin token only:
+/// an admin account can never grant or revoke roles, so the token stays the root of trust.
+async fn admin_role(State(app): State<App>, headers: HeaderMap, Json(b): Json<Value>) -> Result<Json<Value>, ApiError> {
+    admin(&app, &headers)?;
+    let nick = b.get("nick").and_then(Value::as_str).unwrap_or("").to_string();
+    let kind = b.get("kind").and_then(Value::as_str).map(str::to_string);
+    if kind.as_deref().is_some_and(|k| k != "human" && k != "agent") {
+        return Err(err(StatusCode::BAD_REQUEST, "M_BAD_JSON", "kind is human or agent"));
+    }
+    let role = match b.get("role").and_then(Value::as_str) {
+        Some(r) => Some(Role::parse(r).ok_or_else(|| err(StatusCode::BAD_REQUEST, "M_BAD_JSON", "role is admin, moderator or user"))?),
+        None => None,
+    };
+    let (k, r) = blk(&app, move |a| -> Result<(String, Role), ServiceError> {
+        let u = a.users.store.user_by_nick(&nick)?.ok_or(ServiceError::NotFound)?;
+        Ok(a.users.store.set_roles(u.id, kind.as_deref(), role)?)
+    })
+    .await??;
+    Ok(Json(json!({ "kind": k, "role": r.as_str() })))
+}
+
 fn admin(app: &App, h: &HeaderMap) -> Result<(), ApiError> {
     let ok = !app.admin_token.is_empty() && bearer(h).map(|t| Sha256::digest(t.as_bytes()) == Sha256::digest(app.admin_token.as_bytes())).unwrap_or(false);
     if ok {
@@ -514,7 +567,8 @@ fn admin(app: &App, h: &HeaderMap) -> Result<(), ApiError> {
 }
 
 async fn admin_revoke(State(app): State<App>, headers: HeaderMap, Json(b): Json<Value>) -> Result<Json<Value>, ApiError> {
-    admin(&app, &headers)?;
+    // Moderators may end sessions/keys (e.g. a misbehaving agent); admins and the token too.
+    staff(&app, &headers, Role::Moderator).await?;
     let cred = b.get("cred_ref").and_then(Value::as_str).unwrap_or("").to_string();
     let evs = blk(&app, move |a| a.users.revoke(&cred)).await??;
     let n = evs.len();
@@ -531,7 +585,7 @@ async fn admin_delete(State(app): State<App>, headers: HeaderMap, Json(b): Json<
 }
 
 async fn admin_tier(State(app): State<App>, headers: HeaderMap, Json(b): Json<Value>) -> Result<Json<Value>, ApiError> {
-    admin(&app, &headers)?;
+    staff(&app, &headers, Role::Admin).await?;
     let tier = b.get("tier").and_then(Value::as_str).unwrap_or("");
     if !app.users.tiers.knows(tier) {
         return Err(err(StatusCode::BAD_REQUEST, "M_BAD_JSON", "unknown tier"));
@@ -589,7 +643,7 @@ fn unauthorized_key() -> ApiError {
 /// `existing: true` and the nick of an account that exists, the invite adds a key to that account. The nick is
 /// assigned now. The invite code is returned once and is given to the client, never to the agent.
 async fn admin_invite(State(app): State<App>, headers: HeaderMap, Json(b): Json<Value>) -> Result<Json<Value>, ApiError> {
-    admin(&app, &headers)?;
+    staff(&app, &headers, Role::Admin).await?;
     let nick = b.get("nick").and_then(Value::as_str).map(str::to_string);
     let tier = b.get("tier").and_then(Value::as_str).map(str::to_string);
     if b.get("existing").and_then(Value::as_bool) == Some(true) {

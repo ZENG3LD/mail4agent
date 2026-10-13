@@ -13,6 +13,56 @@ pub struct SqliteStore {
     db: Db,
 }
 
+/// Server role, ordered: `User < Moderator < Admin`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Role {
+    User,
+    Moderator,
+    Admin,
+}
+
+impl Role {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "user" => Some(Self::User),
+            "moderator" => Some(Self::Moderator),
+            "admin" => Some(Self::Admin),
+            _ => None,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Moderator => "moderator",
+            Self::Admin => "admin",
+        }
+    }
+}
+
+impl SqliteStore {
+    /// `(kind, role)` of a user; defaults `("agent", User)`.
+    pub fn roles(&self, user_id: i64) -> StoreResult<(String, Role)> {
+        self.with(|c| {
+            let row: Option<(String, String)> = c
+                .query_row("SELECT kind, role FROM user_roles WHERE user_id = ?1", params![user_id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map(Some)
+                .or_else(|e| if matches!(e, rusqlite::Error::QueryReturnedNoRows) { Ok(None) } else { Err(e) })
+                .map_err(be)?;
+            Ok(row.map(|(k, r)| (k, Role::parse(&r).unwrap_or(Role::User))).unwrap_or_else(|| ("agent".into(), Role::User)))
+        })
+    }
+    /// Sets either axis (or both); the other keeps its value.
+    pub fn set_roles(&self, user_id: i64, kind: Option<&str>, role: Option<Role>) -> StoreResult<(String, Role)> {
+        let (k0, r0) = self.roles(user_id)?;
+        let (k, r) = (kind.map(str::to_owned).unwrap_or(k0), role.unwrap_or(r0));
+        self.with(|c| {
+            c.execute("INSERT INTO user_roles (user_id, kind, role) VALUES (?1, ?2, ?3) ON CONFLICT(user_id) DO UPDATE SET kind = ?2, role = ?3", params![user_id, k, r.as_str()]).map_err(be)?;
+            Ok(())
+        })?;
+        Ok((k, r))
+    }
+}
+
 fn be(e: rusqlite::Error) -> StoreError {
     match &e {
         rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::ConstraintViolation => StoreError::NickTaken,
@@ -21,6 +71,13 @@ fn be(e: rusqlite::Error) -> StoreError {
 }
 
 const SCHEMA: &str = r#"
+-- Account kind (human|agent) and server role (admin|moderator|user); independent axes. A missing
+-- row means kind=agent, role=user. Granted only with the admin token.
+CREATE TABLE IF NOT EXISTS user_roles (
+    user_id INTEGER PRIMARY KEY,
+    kind TEXT NOT NULL DEFAULT 'agent' CHECK (kind IN ('human','agent')),
+    role TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('admin','moderator','user'))
+);
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     nick TEXT NOT NULL,
@@ -145,6 +202,7 @@ impl UserStore for SqliteStore {
     }
     fn delete_user(&self, user_id: i64) -> StoreResult<()> {
         self.with(|c| {
+        c.execute("DELETE FROM user_roles WHERE user_id = ?1", params![user_id]).map_err(be)?;
         c.execute("DELETE FROM users WHERE id = ?1", params![user_id]).map_err(be).map(|_| ())
         })
     }
