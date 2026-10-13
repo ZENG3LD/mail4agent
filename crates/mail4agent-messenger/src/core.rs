@@ -2776,7 +2776,10 @@ impl<C: RecordCodec> MessengerCore<C> {
     ) -> Result<Option<(UserId, mail4agent_vodozemac::Curve25519PublicKey, mail4agent_vodozemac::Ed25519PublicKey)>, MessengerError>
     {
         let members = self.encrypted_room_member_ids(&content.room_id);
-        let forwarder_is_us = decrypted.sender == self.config.user_id;
+        // A room admin (power >= 100) may forward any member's session when history is shared: that is
+        // how a new member gets the history its senders can no longer send (offline, gone).
+        let forwarder_is_us = decrypted.sender == self.config.user_id
+            || (self.history_forwarding_allowed(&content.room_id) && self.room_admins(&content.room_id).contains(&decrypted.sender));
         if !forwarder_is_us && !members.contains(&decrypted.sender) {
             return Ok(None);
         }
@@ -2915,6 +2918,15 @@ impl<C: RecordCodec> MessengerCore<C> {
         };
         let mut targets = DeviceTracker::devices_for_user(&self.store, sender)?;
         targets.extend(DeviceTracker::devices_for_user(&self.store, &self.config.user_id)?);
+        // History for a new member: the original sender may be offline for good, so also ask the
+        // room's admins (power >= 100), whose forwards this client accepts when history is shared.
+        if self.history_forwarding_allowed(room_id) {
+            for admin in self.room_admins(room_id) {
+                if &admin != sender && admin != self.config.user_id {
+                    targets.extend(DeviceTracker::devices_for_user(&self.store, &admin)?);
+                }
+            }
+        }
         if targets.is_empty() {
             return Ok(());
         }
@@ -3065,6 +3077,15 @@ impl<C: RecordCodec> MessengerCore<C> {
     /// M4 policy: forward old room keys only when the room's history is
     /// shared (our rooms default to `shared`); a `joined`/`invited` room keeps
     /// pre-join history away from later members.
+    /// Joined members whose power level in the room is at least 100.
+    fn room_admins(&self, room_id: &RoomId) -> BTreeSet<UserId> {
+        let Some(state) = self.room_state(room_id) else { return BTreeSet::new() };
+        self.encrypted_room_member_ids(room_id)
+            .into_iter()
+            .filter(|u| state.power_levels.users.get(u).copied().unwrap_or(state.power_levels.users_default) >= 100)
+            .collect()
+    }
+
     fn history_forwarding_allowed(&self, room_id: &RoomId) -> bool {
         !matches!(
             self.rooms.get(room_id).and_then(|room| room.history_visibility.clone()),
