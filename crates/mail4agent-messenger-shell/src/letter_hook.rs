@@ -27,6 +27,10 @@ pub fn letter_event(session: &ProviderSession, letter: &WakeLetter<'_>) -> serde
         "event_id": letter.event_id,
         "room": letter.room,
         "body": letter.body,
+        "kind": if letter.reaction.is_some() { "reaction" } else { "message" },
+        "reaction": letter.reaction.map(|r| r.key),
+        "target_event_id": letter.reaction.map(|r| r.target),
+        "reply_needed": letter.reaction.is_none(),
     })
 }
 
@@ -92,7 +96,7 @@ mod tests {
         ProviderSession { kind: SessionKind::local(ProviderKind::Codex), session_id: "s-1".into(), nick: "codex-1".into(), cwd: None, headless: false }
     }
     fn letter() -> WakeLetter<'static> {
-        WakeLetter { body: "hello", from_nick: "operator", event_id: "$e", room: Some("!r") }
+        WakeLetter { body: "hello", from_nick: "operator", event_id: "$e", room: Some("!r"), reaction: None }
     }
 
     #[cfg(unix)]

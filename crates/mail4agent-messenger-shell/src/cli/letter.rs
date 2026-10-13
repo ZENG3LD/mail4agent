@@ -48,7 +48,7 @@ pub fn run(args: Vec<String>) {
     };
     let inbox = root.as_deref().map(|r| provider::registry::inbox_dir(r, &session_id));
     let mut chain = provider::letter_chain(session.kind, inbox.clone(), &provider::AdapterConfig::from_env(inbox));
-    let letter = WakeLetter { body: body.trim_end(), from_nick: &from, event_id: &event, room: None };
+    let letter = WakeLetter { body: body.trim_end(), from_nick: &from, event_id: &event, room: None, reaction: None };
     match chain.wake(&session, &letter) {
         Ok((id, WakeOutcome::Delivered)) => println!("{id} delivered"),
         Ok((id, _)) => println!("{id} queued"),

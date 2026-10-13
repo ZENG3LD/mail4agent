@@ -2,14 +2,16 @@
 //!
 //!   m4a [--as NICK] [--json] rooms
 //!   m4a read <room> [-n 20]          room = !id | #name | nick (DM)
-//!   m4a send <room> <text...>        (text '-' reads stdin)
+//!   m4a send <room> [--reply-to <event_id>] <text...>   (text '-' reads stdin)
 //!   m4a reply <room> <event_id> <text...>
 //!   m4a mentions [-n 20]
 //!   m4a thread <room> <event_id>
 //!   m4a join|leave <room>
 //!   m4a create <name> [--channel | --open] [--invite @u:server,...]
 //!   m4a invite <room> <user>
-//!   m4a react <room> <event_id> <emoji>
+//!   m4a react <room> <event_id> <emoji>          (undo with unreact)
+//!   m4a unreact <room> <event_id> <emoji>        (takes back this account's own reaction)
+//!   m4a unreact <room> <reaction_event_id>       (same, by the reaction's own id)
 //!   m4a members <room>   (--json: user, membership, power level)
 //!   m4a redact <room> <event_id>
 //!   m4a power <room> <user> [level]   (default 100 = room admin)
@@ -71,6 +73,7 @@ pub fn run(args: Vec<String>) {
     let mut channel = false;
     let mut open = false;
     let mut invite: Vec<String> = Vec::new();
+    let mut reply_to: Option<String> = None;
     let mut pos: Vec<String> = Vec::new();
     let mut args = args.clone().into_iter();
     while let Some(arg) = args.next() {
@@ -80,9 +83,10 @@ pub fn run(args: Vec<String>) {
             "-n" => n = args.next().and_then(|v| v.parse().ok()),
             "--channel" => channel = true,
             "--open" => open = true,
+            "--reply-to" => reply_to = args.next(),
             "--invite" => invite = args.next().unwrap_or_default().split(',').map(str::to_string).collect(),
             "-h" | "--help" => {
-                println!("usage: m4a [--as NICK] [--json] rooms | read <room> [-n N] | send <room> <text> | reply <room> <event> <text> | mentions | thread <room> <event> | join|leave <room> | create <name> [--channel | --open] [--invite ids] | invite <room> <user>");
+                println!("usage: m4a [--as NICK] [--json] rooms | read <room> [-n N] | send <room> [--reply-to <event>] <text> | reply <room> <event> <text> | react <room> <event> <emoji> | unreact <room> <event> <emoji> | unreact <room> <reaction_event> | mentions | thread <room> <event> | join|leave <room> | create <name> [--channel | --open] [--invite ids] | invite <room> <user> | members <room> | redact <room> <event>");
                 return;
             }
             _ => pos.push(arg),
@@ -99,7 +103,10 @@ pub fn run(args: Vec<String>) {
     let (cmd, cargs) = match sub.as_str() {
         "rooms" | "ls" => ("rooms.list", json!({})),
         "read" => ("rooms.read", json!({ "room": need(0, "room"), "limit": n.unwrap_or(20) })),
-        "send" => ("rooms.send", json!({ "room": need(0, "room"), "text": text_arg(&pos[1.min(pos.len())..]) })),
+        "send" => match &reply_to {
+            Some(ev) => ("rooms.reply", json!({ "room": need(0, "room"), "event": ev, "text": text_arg(&pos[1.min(pos.len())..]) })),
+            None => ("rooms.send", json!({ "room": need(0, "room"), "text": text_arg(&pos[1.min(pos.len())..]) })),
+        },
         "reply" => ("rooms.reply", json!({ "room": need(0, "room"), "event": need(1, "event id"), "text": text_arg(&pos[2.min(pos.len())..]) })),
         "mentions" => ("mentions", json!({ "limit": n.unwrap_or(20) })),
         "thread" => ("threads.read", json!({ "room": need(0, "room"), "event": need(1, "event id") })),
@@ -108,6 +115,8 @@ pub fn run(args: Vec<String>) {
         "create" => ("rooms.create", json!({ "name": need(0, "name"), "kind": if open { "open" } else if channel { "channel" } else { "group" }, "invite": invite })),
         "react" => ("rooms.react", json!({ "room": need(0, "room"), "event": need(1, "event id"), "key": need(2, "emoji") })),
         "members" => ("rooms.members", json!({ "room": need(0, "room") })),
+        "unreact" if pos.len() >= 3 => ("unreact", json!({ "room": need(0, "room"), "event": need(1, "event id"), "key": need(2, "emoji") })),
+        "unreact" => ("rooms.redact", json!({ "room": need(0, "room"), "event": need(1, "reaction event id") })),
         "redact" => ("rooms.redact", json!({ "room": need(0, "room"), "event": need(1, "event id") })),
         "power" => ("rooms.power", json!({ "room": need(0, "room"), "user": need(1, "user"), "level": pos.get(2).and_then(|v| v.parse::<i64>().ok()).unwrap_or(100) })),
         "invite" => ("rooms.invite", json!({ "room": need(0, "room"), "user": need(1, "user") })),
@@ -119,6 +128,23 @@ pub fn run(args: Vec<String>) {
         fail(1, "M4A_STORE_ROOT is not set (environment or env file)");
     };
     let sock = send_sock_path(get, &store_root);
+    let (cmd, cargs) = if cmd == "unreact" {
+        // Find this account's own reaction event for (event, emoji), then redact it.
+        let read = CmdRequest { cmd: "rooms.read".into(), as_nick: as_nick.clone(), args: json!({ "room": cargs["room"], "limit": 200 }), cap: crate::send::session_cap_from_env() };
+        let r = send_cmd_via_socket(&sock, &read, Duration::from_secs(90)).unwrap_or_else(|_| fail(1, "no running m4a-web-client on the socket"));
+        if !r.ok {
+            fail(1, r.error.as_deref().unwrap_or("read failed"));
+        }
+        let mine = r.data["messages"].as_array().into_iter().flatten()
+            .filter(|m| m["event_id"] == cargs["event"])
+            .flat_map(|m| m["reactions"].as_array().cloned().unwrap_or_default())
+            .find(|x| x["key"] == cargs["key"])
+            .and_then(|x| x["mine"].as_str().map(str::to_string))
+            .unwrap_or_else(|| fail(1, "no own reaction with that emoji on that event"));
+        ("rooms.redact", json!({ "room": cargs["room"], "event": mine }))
+    } else {
+        (cmd, cargs)
+    };
     let request = CmdRequest { cmd: cmd.to_string(), as_nick, args: cargs, cap: crate::send::session_cap_from_env() };
     let reply = send_cmd_via_socket(&sock, &request, Duration::from_secs(90))
         .unwrap_or_else(|_| fail(1, "no running m4a-web-client on the socket (run scripts/m4a-boot.sh)"));
@@ -156,6 +182,7 @@ pub fn run(args: Vec<String>) {
             d["room"].as_str().unwrap_or(""),
             d["event_id"].as_str().unwrap_or("")
         ),
+        "rooms.react" => println!("reacted room={}", d["room"].as_str().unwrap_or("")),
         _ => println!("ok {}", d["room"].as_str().unwrap_or("")),
     }
 }
