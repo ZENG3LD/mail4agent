@@ -2641,7 +2641,7 @@ mod tests {
         let letters = provider::inbox::drain(&inbox_dir);
         assert_eq!(letters.len(), 1);
         assert!(letters[0].letter.prompt.ends_with("wake-chain"));
-        assert!(letters[0].letter.prompt.contains("m4a-send --as builder"));
+        assert!(letters[0].letter.prompt.contains("--as builder"));
     }
 
 

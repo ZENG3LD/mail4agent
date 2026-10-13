@@ -97,7 +97,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -108,7 +108,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -710,7 +710,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -815,7 +815,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -973,8 +973,9 @@ dependencies = [
 
 [[package]]
 name = "gate4agent-wake"
-version = "0.5.1"
-source = "git+https://github.com/ZENG3LD/gate4agent.git?rev=3f851ae#3f851aed69c7f3612655621a4c5eb6407f5b297f"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fcf8baef6246f05e4d07a1290c164b6d067190c0ce45e31c971749d97aca2805"
 dependencies = [
  "dunce",
  "reqwest",
@@ -1580,7 +1581,7 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
 name = "m4a-agent"
-version = "0.4.9"
+version = "0.4.10"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -1601,7 +1602,7 @@ dependencies = [
 
 [[package]]
 name = "m4a-edge"
-version = "0.4.9"
+version = "0.4.10"
 dependencies = [
  "axum",
  "futures-util",
@@ -1616,7 +1617,7 @@ dependencies = [
 
 [[package]]
 name = "m4a-matrix-core"
-version = "0.4.9"
+version = "0.4.10"
 dependencies = [
  "ed25519-dalek 2.2.0",
  "js_int",
@@ -1631,7 +1632,7 @@ dependencies = [
 
 [[package]]
 name = "m4a-product-example"
-version = "0.4.9"
+version = "0.4.10"
 dependencies = [
  "argon2",
  "axum",
@@ -1656,7 +1657,7 @@ dependencies = [
 
 [[package]]
 name = "m4a-product-kit"
-version = "0.4.9"
+version = "0.4.10"
 dependencies = [
  "axum",
  "futures-util",
@@ -1675,7 +1676,7 @@ dependencies = [
 
 [[package]]
 name = "m4a-seam"
-version = "0.4.9"
+version = "0.4.10"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek 2.2.0",
@@ -1689,7 +1690,7 @@ dependencies = [
 
 [[package]]
 name = "mail4agent"
-version = "0.4.9"
+version = "0.4.10"
 dependencies = [
  "axum",
  "clap",
@@ -1716,7 +1717,7 @@ dependencies = [
 
 [[package]]
 name = "mail4agent-api"
-version = "0.4.9"
+version = "0.4.10"
 dependencies = [
  "serde",
  "serde_json",
@@ -1724,7 +1725,7 @@ dependencies = [
 
 [[package]]
 name = "mail4agent-attest"
-version = "0.4.9"
+version = "0.4.10"
 dependencies = [
  "libc",
  "sysinfo",
@@ -1734,7 +1735,7 @@ dependencies = [
 
 [[package]]
 name = "mail4agent-client"
-version = "0.4.9"
+version = "0.4.10"
 dependencies = [
  "mail4agent-api",
  "reqwest",
@@ -1747,7 +1748,7 @@ dependencies = [
 
 [[package]]
 name = "mail4agent-core"
-version = "0.4.9"
+version = "0.4.10"
 dependencies = [
  "getrandom 0.2.17",
  "hex",
@@ -1763,7 +1764,7 @@ dependencies = [
 
 [[package]]
 name = "mail4agent-messenger"
-version = "0.4.9"
+version = "0.4.10"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
@@ -1779,7 +1780,7 @@ dependencies = [
 
 [[package]]
 name = "mail4agent-messenger-shell"
-version = "0.4.9"
+version = "0.4.10"
 dependencies = [
  "axum",
  "gate4agent-wake",
@@ -1805,7 +1806,7 @@ dependencies = [
 
 [[package]]
 name = "mail4agent-server"
-version = "0.4.9"
+version = "0.4.10"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1831,7 +1832,7 @@ dependencies = [
 
 [[package]]
 name = "mail4agent-server-bin"
-version = "0.4.9"
+version = "0.4.10"
 dependencies = [
  "axum",
  "chrono",
@@ -1852,7 +1853,7 @@ dependencies = [
 
 [[package]]
 name = "mail4agent-store-sqlite"
-version = "0.4.9"
+version = "0.4.10"
 dependencies = [
  "mail4agent-api",
  "mail4agent-core",
@@ -1866,7 +1867,7 @@ dependencies = [
 
 [[package]]
 name = "mail4agent-vodozemac"
-version = "0.4.9"
+version = "0.4.10"
 dependencies = [
  "aes",
  "anyhow",
@@ -2057,7 +2058,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2376,7 +2377,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2732,7 +2733,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3056,7 +3057,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3183,7 +3184,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
