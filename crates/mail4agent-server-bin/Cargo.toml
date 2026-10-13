@@ -22,6 +22,7 @@ media-federation = ["mail4agent-server/media-federation"]
 f3-hash-ids = ["mail4agent-server/f3-hash-ids"]
 
 [dependencies]
+# Its own [features] forward to the server; `--no-default-features` builds the light server.
 mail4agent-server = { workspace = true  }
 # Names the connection type init_messenger_db returns. Features stay on
 # mail4agent-server's sqlcipher flag; this dependency does not add its own.

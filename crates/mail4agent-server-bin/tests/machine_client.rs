@@ -795,3 +795,134 @@ fn one_socket_pushes_session_b_and_not_session_a() {
     }
     server.0 = None;
 }
+
+fn spawn_server(addr: &str, db: &std::path::Path, key_hex: &str) -> Child {
+    Command::new(server_bin())
+        .args(["--bind", addr, "--db", db.to_str().expect("utf-8"), "--server-name", "localhost"])
+        .env("M4A_DB_KEY_HEX", key_hex)
+        .env("M4A_ASSERTION_SECRET", support_product::SEAM_SECRET)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn server")
+}
+
+/// The homeserver restarts under a running machine client: the dead push
+/// socket is reopened by `tick` and a post after the restart is pushed again.
+#[test]
+fn push_socket_heals_after_a_homeserver_restart() {
+    let temp = TempDb {
+        dir: PathBuf::from(format!("/tmp/mail4agent-heal-{}-{}", std::process::id(), uniq())),
+    };
+    std::fs::create_dir_all(&temp.dir).expect("tmpdir");
+    let db = temp.dir.join("messenger.db");
+    let key_hex = random_key_hex();
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+    let port = probe.local_addr().expect("addr").port();
+    drop(probe);
+    let addr = format!("127.0.0.1:{port}");
+    let base = format!("http://{addr}");
+    let mut server = StopServer(Some(spawn_server(&addr, &db, &key_hex)));
+    wait_until_accepts(&addr);
+
+    let root = temp.dir.join("stores");
+    std::fs::create_dir_all(&root).expect("store root");
+    let product = support_product::start_product(&base);
+    let base = product.url.clone();
+    let sessions = vec![mail4agent_messenger_shell::HostSession::new("Bob", "web-bob")
+        .with_invite(support_product::product_invite(&product, "bob"))];
+    let courier_invite = support_product::product_invite(&product, "courier");
+    let mut client = MachineClient::open(&base, &root, sessions).expect("client");
+    let mut courier = OpenedStore::connect(
+        &SessionConfig::new_identity(&base, m4a_agent::BackendKind::Server, "web-courier", &root, Some(courier_invite)).expect("courier config"),
+    )
+    .expect("courier");
+    let mut courier_now = 10_000_i64;
+    for _ in 0..6 {
+        drive_quiet(&mut courier, &mut courier_now);
+    }
+    courier
+        .dispatch(MessengerCommand::CreateRoom { kind: CreateRoomKind::Channel { name: "heal-channel".to_string(), topic: None } }, courier_now)
+        .expect("create channel");
+    let mut room_id = None;
+    for _ in 0..8 {
+        drive_quiet(&mut courier, &mut courier_now);
+        let _ = courier.drive(courier_now, true);
+        room_id = courier.rooms().into_iter().find(|room| room.membership == "join").map(|room| room.room_id);
+        if room_id.is_some() {
+            break;
+        }
+    }
+    let room_id = room_id.unwrap_or_else(|| panic!("channel missing; {}", describe(&courier)));
+    let room = RoomId::parse(&room_id).expect("room id");
+    let mut now = 20_000_i64;
+    client.session_mut("bob").expect("bob").dispatch(MessengerCommand::JoinRoom { room_id: room.clone() }, now).expect("join");
+    let mut joined = false;
+    for _ in 0..8 {
+        now += 2_000;
+        let _ = client.session_mut("bob").expect("bob").drive(now, true);
+        joined = client.session_mut("bob").expect("bob").rooms().iter().any(|r| r.room_id == room_id && r.membership == "join");
+        if joined {
+            break;
+        }
+    }
+    assert!(joined, "bob did not join");
+
+    // Restart the homeserver on the same address and database.
+    if let Some(mut child) = server.0.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    thread::sleep(Duration::from_millis(300));
+    server.0 = Some(spawn_server(&addr, &db, &key_hex));
+    wait_until_accepts(&addr);
+
+    let start = Instant::now();
+    let mut healed = false;
+    while start.elapsed() < Duration::from_secs(20) {
+        now += 1_000;
+        let report = client.tick(now, 3600);
+        if report.alerts.iter().any(|(_, text)| text.contains("push socket was down and is open again")) {
+            healed = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    assert!(healed, "push socket was not reopened after the restart");
+
+    let body = "after-restart";
+    courier
+        .dispatch(
+            MessengerCommand::SendMessage {
+                room_id: room.clone(),
+                message: OutgoingMessage { kind: MessageKind::Text, body: body.to_string(), reply_to: None, edit_of: None },
+                txn_id: None,
+            },
+            courier_now,
+        )
+        .expect("send");
+    let mut sent = false;
+    for _ in 0..15 {
+        courier_now += 2_000;
+        let _ = courier.drive(courier_now, false);
+        if courier.texts().iter().any(|row| row.body == body && row.outcome == "sent") {
+            sent = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    assert!(sent, "send after restart not accepted; {}", describe(&courier));
+
+    let start = Instant::now();
+    let mut pushed = false;
+    while start.elapsed() < Duration::from_secs(10) {
+        now += 1_000;
+        let report = client.tick(now, 3600);
+        if report.pushed.iter().any(|(nick, _)| nick == "bob") {
+            pushed = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(pushed, "no push reached bob after the restart");
+}

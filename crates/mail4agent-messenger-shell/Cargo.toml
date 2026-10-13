@@ -32,7 +32,7 @@ gate4agent-wake = { git = "https://github.com/ZENG3LD/gate4agent.git", rev = "3f
 m4a-seam = { workspace = true }
 m4a-agent = { workspace = true, features = ["engine"] }
 mail4agent-messenger = { workspace = true  }
-mail4agent-server = { workspace = true, optional = true }
+mail4agent-server = { workspace = true, optional = true, features = ["f3-hash-ids", "presence", "media-federation", "media-thumbnails"] }
 sha2 = "0.10"
 zeroize = "1"
 thiserror = "2"

@@ -95,6 +95,12 @@ impl PushLink {
         }
     }
 
+    /// `false` once a socket worker has ended (the server closed it, the network dropped, the
+    /// server restarted). A dead link never revives by itself: the owner opens a new one.
+    pub fn is_alive(&self) -> bool {
+        self.workers.iter().all(|worker| !worker.is_finished())
+    }
+
     pub fn drain(&self) -> Vec<(String, PushedRoomEvent)> {
         self.inbox
             .lock()
@@ -259,6 +265,17 @@ fn parse_event(value: &serde_json::Value) -> Option<Incoming> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_link_whose_worker_ended_is_not_alive() {
+        let alive = PushLink { inbox: Arc::default(), stop: Arc::default(), workers: vec![thread::spawn(|| thread::sleep(Duration::from_millis(400)))] };
+        assert!(alive.is_alive());
+        let dead = PushLink { inbox: Arc::default(), stop: Arc::default(), workers: vec![thread::spawn(|| {})] };
+        thread::sleep(Duration::from_millis(100));
+        assert!(!dead.is_alive());
+        thread::sleep(Duration::from_millis(500));
+        assert!(!alive.is_alive());
+    }
 
     #[test]
     fn https_homeserver_opens_the_push_socket_as_wss() {

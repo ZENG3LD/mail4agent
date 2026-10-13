@@ -312,8 +312,9 @@ pub enum CreateRoomKind {
         /// server plan's §5 `group` column.
         members_can_invite: bool,
     },
-    /// A public, announcement-style room. Still E2E-encrypted; "public"
-    /// means join_rule public (anyone can join), not plaintext.
+    /// A public, announcement-style room: join_rule public (anyone can
+    /// join) and plaintext (the server keeps channel posts unencrypted).
+    /// Only moderators write until `events_default` is lowered (an open room).
     Channel {
         /// The room's display name.
         name: String,
@@ -452,6 +453,15 @@ pub enum MessengerCommand {
         /// The user whose level changes.
         user_id: UserId,
         /// The new level (100 = room admin).
+        level: i64,
+    },
+    /// Sets the level needed to send an ordinary event in a room
+    /// (`events_default` of `m.room.power_levels`, the rest kept). `0` lets
+    /// every member write; a channel starts at `50` (announcement-only).
+    SetEventsDefault {
+        /// The room.
+        room_id: RoomId,
+        /// The new `events_default`.
         level: i64,
     },
     /// Adds (or updates) an `m.tag` room-account-data tag.
@@ -2241,6 +2251,14 @@ impl<C: RecordCodec> MessengerCore<C> {
             MessengerCommand::SetPowerLevel { room_id, user_id, level } => {
                 let mut content = self.room_state(&room_id).map(|st| st.power_levels.clone()).ok_or_else(|| MessengerError::IntentRefused(format!("unknown room {}", room_id.as_str())))?;
                 content.users.insert(user_id, level);
+                let body = serde_json::to_value(&content)?;
+                let request_id = self.next_request_id()?;
+                let request = OutgoingRequest::set_state(request_id, &room_id, "m.room.power_levels", "", body);
+                self.enqueue_request(request, Lane::Other)?;
+            }
+            MessengerCommand::SetEventsDefault { room_id, level } => {
+                let mut content = self.room_state(&room_id).map(|st| st.power_levels.clone()).ok_or_else(|| MessengerError::IntentRefused(format!("unknown room {}", room_id.as_str())))?;
+                content.events_default = level;
                 let body = serde_json::to_value(&content)?;
                 let request_id = self.next_request_id()?;
                 let request = OutgoingRequest::set_state(request_id, &room_id, "m.room.power_levels", "", body);
@@ -4419,6 +4437,30 @@ mod tests {
 
     /// Marks `room_id` as a public channel for [`RoomState::derive_room_kind`]
     /// (join_rule public + raised `events_default`).
+    #[test]
+    fn set_events_default_opens_a_channel_for_every_member() {
+        let mut core = open_fresh_core();
+        let chan = room("!chan:example.org");
+        add_room(&mut core, &chan, false, Some("Talk"));
+        mark_as_channel(&mut core, &chan);
+        core.dispatch(MessengerCommand::SetEventsDefault { room_id: chan.clone(), level: 0 }, 1_000).expect("dispatch");
+        core.releasable_requests(1_000);
+        flush_and_ack(&mut core);
+        let sent = core.releasable_requests(1_000);
+        let put = sent.iter().find(|r| r.kind == OutgoingRequestKind::SetState).expect("a state PUT");
+        assert!(put.path.ends_with("/state/m.room.power_levels/"), "{}", put.path);
+        let body = put.body.clone().expect("body");
+        assert_eq!(body["events_default"], 0);
+        assert_eq!(body["users_default"], 0);
+    }
+
+    #[test]
+    fn set_events_default_refuses_an_unknown_room() {
+        let mut core = open_fresh_core();
+        let err = core.dispatch(MessengerCommand::SetEventsDefault { room_id: room("!nope:example.org"), level: 0 }, 1_000);
+        assert!(err.is_err());
+    }
+
     fn mark_as_channel(core: &mut TestCore, room_id: &RoomId) {
         let Some(state) = core.rooms.get_mut(room_id) else { return };
         state

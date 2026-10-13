@@ -56,7 +56,13 @@ pub(crate) fn parse_origin(raw: &str) -> Result<Url> {
 
 impl HttpExec {
     pub fn new(base: &str) -> Result<Self> {
-        let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(60)).http1_only().build().map_err(|e| AgentError::Transport(clip_public(e.to_string())))?;
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(60))
+            // A pooled connection that outlives a server restart answers every request with a
+            // transport failure; short idle life and keepalive make the pool drop it on its own.
+            .pool_idle_timeout(Duration::from_secs(15))
+            .tcp_keepalive(Duration::from_secs(30))
+            .http1_only().build().map_err(|e| AgentError::Transport(clip_public(e.to_string())))?;
         Ok(Self { client, base: parse_origin(base)?, keep_prefix: false })
     }
 
