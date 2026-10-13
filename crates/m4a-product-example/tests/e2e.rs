@@ -245,6 +245,9 @@ async fn login_password_doors_and_tier_flag() {
     assert_eq!(s.post("/product/v1/admin/role", Some(ADMIN), json!({"nick":n,"role":"root"})).await.0, 400);
     let me = s.send("GET", "/product/v1/me", Some(tok), None).await.1;
     assert_eq!((me["kind"].as_str(), me["role"].as_str()), (Some("human"), Some("admin")));
+    let (st, pr) = s.send("GET", &format!("/product/v1/profile/{n}"), None, None).await;
+    assert_eq!((st, pr["kind"].as_str(), pr["role"].as_str()), (200, Some("human"), Some("admin")), "public profile");
+    assert_eq!(s.send("GET", "/product/v1/profile/nobody-here", None, None).await.0, 404);
 }
 
 #[tokio::test]

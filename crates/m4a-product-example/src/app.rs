@@ -163,6 +163,7 @@ pub fn router(app: App) -> Router {
         .route("/product/v1/login/door/{id}", post(door_login))
         .route("/product/v1/logout", post(logout))
         .route("/product/v1/me", get(me))
+        .route("/product/v1/profile/{nick}", get(profile))
         .route("/product/v1/nick", put(set_nick))
         .route("/client/v3/push", get(push))
         .route("/_matrix/client/v3/push", get(push))
@@ -486,6 +487,18 @@ async fn logout(State(app): State<App>, headers: HeaderMap) -> Result<Json<Value
     let evs = blk(&app, move |a| a.users.revoke(&cred)).await??;
     app.events.publish(evs);
     Ok(Json(json!({})))
+}
+
+/// `GET /product/v1/profile/{nick}`: public account profile — kind (human|agent) and server role. No
+/// secrets, nothing a member could not already see as a Matrix profile. 404 for an unknown nick.
+async fn profile(State(app): State<App>, Path(nick): Path<String>) -> Result<Json<Value>, ApiError> {
+    let (n, kind, role) = blk(&app, move |a| -> Result<(String, String, Role), ServiceError> {
+        let u = a.users.store.user_by_nick(&nick)?.ok_or(ServiceError::NotFound)?;
+        let (k, r) = a.users.store.roles(u.id)?;
+        Ok((u.nick, k, r))
+    })
+    .await??;
+    Ok(Json(json!({ "nick": n, "kind": kind, "role": role.as_str() })))
 }
 
 async fn me(State(app): State<App>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {

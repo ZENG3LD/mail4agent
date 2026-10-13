@@ -974,7 +974,7 @@ dependencies = [
 [[package]]
 name = "gate4agent-wake"
 version = "0.5.1"
-source = "git+https://github.com/ZENG3LD/gate4agent.git?tag=v0.5.1#27673c395dc4d2fde125582d58965d10e25014f3"
+source = "git+https://github.com/ZENG3LD/gate4agent.git?rev=3f851ae#3f851aed69c7f3612655621a4c5eb6407f5b297f"
 dependencies = [
  "dunce",
  "reqwest",
@@ -4122,9 +4122,9 @@ dependencies = [
 
 [[package]]
 name = "yoke-derive"
-version = "0.8.3"
+version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33811428bee40dbceb6d545e95754741d17a6aef9a4849f0fd62e2ba4f412a78"
+checksum = "ec8ebde2db3681e8c9980cc27822030e68752690ddfa9473e739aeb4dbde6d71"
 dependencies = [
  "proc-macro2",
  "quote",

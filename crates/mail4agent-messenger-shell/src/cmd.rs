@@ -114,6 +114,17 @@ impl OpenedStore {
                     ItemContent::Notice(t) => ("notice", t.body.clone()),
                     ItemContent::Emote(t) => ("emote", t.body.clone()),
                     ItemContent::Undecryptable { .. } => ("undecryptable", String::new()),
+                    // Membership: body is "<user> <joined|left|invited|...>"; the subject is in "subject".
+                    ItemContent::StateChange(mail4agent_messenger::room::timeline::StateChangeSummary::Member { user_id, membership, .. }) => {
+                        let verb = match format!("{membership:?}").to_lowercase().as_str() {
+                            "join" => "joined",
+                            "leave" => if user_id.as_str() == item.sender.as_str() { "left" } else { "was removed" },
+                            "invite" => "was invited",
+                            "ban" => "was banned",
+                            other => return Some(json!({ "event_id": item.event_id.as_ref().map(|e| e.as_str()), "from": mxid_localpart(item.sender.as_str()), "ts": item.origin_server_ts, "kind": "member", "subject": mxid_localpart(user_id), "body": format!("{} {other}", mxid_localpart(user_id)) })),
+                        };
+                        return Some(json!({ "event_id": item.event_id.as_ref().map(|e| e.as_str()), "from": mxid_localpart(item.sender.as_str()), "ts": item.origin_server_ts, "kind": "member", "subject": mxid_localpart(user_id), "body": format!("{} {verb}", mxid_localpart(user_id)) }));
+                    }
                     _ => return None,
                 };
                 Some(json!({
@@ -125,7 +136,13 @@ impl OpenedStore {
                     "body": body,
                     "reply_to": item.relations.reply_to.as_ref().map(|e| e.as_str()),
                     "thread": item.relations.thread_root.as_ref().map(|e| e.as_str()),
-                    "reactions": item.relations.reactions.iter().map(|(k, who)| json!({ "key": k, "count": who.len(), "by": who.iter().map(|u| mxid_localpart(u.as_str())).collect::<Vec<_>>() })).collect::<Vec<_>>(),
+                    "reactions": item.relations.reactions.iter().map(|(k, who)| {
+                        // This account's own reaction event for `k`, so a client can take it back (redact).
+                        let mine = item.event_id.as_ref().and_then(|t| {
+                            timeline.relating_events_for(t).iter().find(|r| &r.sender == self.driver.core.user_id() && matches!(&r.relation, mail4agent_messenger::wire::events::RelatesTo::Annotation { key, .. } if key == k)).map(|r| r.event_id.as_str().to_string())
+                        });
+                        json!({ "key": k, "count": who.len(), "by": who.iter().map(|u| mxid_localpart(u.as_str())).collect::<Vec<_>>(), "mine": mine })
+                    }).collect::<Vec<_>>(),
                     "state": crate::outcome_name(&item.send_state),
                 }))
             })
