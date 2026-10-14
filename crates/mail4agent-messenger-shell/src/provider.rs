@@ -6,7 +6,7 @@
 
 pub use gate4agent_wake::{
     chain, hook, inbox, registry, HookFlavor, HostEnv, ProviderKind, ProviderSession, SessionKind, SessionRecord,
-    Surface, WakeAdapter, adapter_for, AdapterConfig, WakeChain, WakeError, WakeLetter, WakeOutcome, INBOX_DIR_ENV, PROVIDER_ENV,
+    Surface, WakeAdapter, adapter_for, AdapterConfig, ReactionNote, WakeChain, WakeError, WakeLetter, WakeOutcome, INBOX_DIR_ENV, PROVIDER_ENV,
 };
 
 /// The chain m4a runs for a letter: the hook (when `M4A_LETTER_HOOK` is set), then the g4a
@@ -69,7 +69,7 @@ mod tests {
             chain.push("deliver", Box::new(Count(delivers.clone(), true)));
             chain.prepend("letter-hook", Box::new(Count(hooks.clone(), hook_ok)));
             let session = ProviderSession { kind: SessionKind::web(ProviderKind::Grok), session_id: "s".into(), nick: "n".into(), cwd: None, headless: false };
-            let letter = WakeLetter { body: "b", from_nick: "f", event_id: "$e", room: None };
+            let letter = WakeLetter { body: "b", from_nick: "f", event_id: "$e", room: None, reaction: None };
             let (id, _) = chain.wake(&session, &letter).expect("wake");
             assert_eq!(hooks.load(Ordering::SeqCst), 1);
             assert_eq!(delivers.load(Ordering::SeqCst), want_deliver);

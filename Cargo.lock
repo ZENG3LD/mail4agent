@@ -974,8 +974,7 @@ dependencies = [
 [[package]]
 name = "gate4agent-wake"
 version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fcf8baef6246f05e4d07a1290c164b6d067190c0ce45e31c971749d97aca2805"
+source = "git+https://github.com/ZENG3LD/gate4agent.git?rev=251fca9#251fca9097dcda319a54380040f21d055d443f52"
 dependencies = [
  "dunce",
  "reqwest",

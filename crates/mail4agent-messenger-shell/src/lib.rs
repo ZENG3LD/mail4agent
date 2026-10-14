@@ -594,6 +594,9 @@ pub struct OpenedStore {
     /// more rows than the ledger. While true, remember every inbound key
     /// without POSTing. Cleared at the end of the first [`Self::drive`].
     routine_restart_catchup: bool,
+    /// Reactions at or before this `origin_server_ts` were already in the store when this
+    /// process started; they never wake (no replay on restart). Set on the first drive.
+    reaction_floor: Option<i64>,
     /// Inbound event keys whose leader prompt already succeeded.
     leader_sent: HashSet<String>,
     /// Last wake failure, clipped. No bearer and no message body.
@@ -718,6 +721,7 @@ impl OpenedStore {
             routine_sent: HashSet::new(),
             routine_woken_seed_pending: false,
             routine_restart_catchup: false,
+            reaction_floor: None,
             leader_sent: HashSet::new(),
             wake_chain: None,
             wake_route: None,
@@ -1243,6 +1247,19 @@ impl OpenedStore {
     /// event without the shell polling twice.
     pub fn drive(&mut self, now_ms: i64, wait_for_sync: bool) -> Result<(), ShellError> {
         self.driver.core.decrypt_loaded_timeline();
+        if self.reaction_floor.is_none() {
+            // Reactions older than the first time this store ran with reaction wakes never wake, so a
+            // deploy does not replay history; later ones (also while offline) are deduped by the ledger.
+            let path = self.store_dir().join("reaction-wake-floor");
+            // Wall clock, not `now_ms`: callers pass synthetic times on open (`drive(1_000)`).
+            let _ = now_ms;
+            let floor = std::fs::read_to_string(&path).ok().and_then(|t| t.trim().parse::<i64>().ok()).unwrap_or_else(|| {
+                let wall = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+                let _ = std::fs::write(&path, wall.to_string());
+                wall
+            });
+            self.reaction_floor = Some(floor);
+        }
         let trace_at = self.driver.http_trace.len();
         let history = self.request_missing_history(now_ms)?;
         self.pull_room_tips()?;
@@ -1463,12 +1480,21 @@ impl OpenedStore {
                 if item.redacted || &item.sender == me || item.send_state != SendState::Sent {
                     continue;
                 }
-                let body = match &item.content {
+                let mut body = match &item.content {
                     ItemContent::Text(text)
                     | ItemContent::Notice(text)
                     | ItemContent::Emote(text) => text.body.clone(),
                     _ => continue,
                 };
+                // An edit that landed before the wake: deliver only the final version.
+                if let Some(edit) = &item.relations.latest_edit {
+                    if let mail4agent_messenger::wire::events::RoomMessageContent::Text(t)
+                    | mail4agent_messenger::wire::events::RoomMessageContent::Notice(t)
+                    | mail4agent_messenger::wire::events::RoomMessageContent::Emote(t) = &edit.content
+                    {
+                        body = t.body.clone();
+                    }
+                }
                 let Some(event_id) = item.event_id.as_ref() else {
                     continue;
                 };
@@ -1480,7 +1506,53 @@ impl OpenedStore {
                     from: item.sender.as_str().to_string(),
                     nick: self.sender_nick(room_id, &item.sender),
                     event_id: event_id.as_str().to_string(),
+                    reaction: None,
+                    ts: item.origin_server_ts,
                 });
+            }
+        }
+        out
+    }
+
+    /// Reactions by others on this account's own messages, or on anything in a DM, newer than
+    /// `floor`. A reaction that was taken back (redacted) is no longer a relating event, so one
+    /// added and removed before the wake produces nothing; one on a redacted message neither.
+    fn reaction_items(&self, floor: i64) -> Vec<InboundPlaintext> {
+        let me = self.driver.core.user_id();
+        let mut out = Vec::new();
+        for room_id in self.driver.core.room_ids() {
+            let Some(timeline) = self.driver.core.timeline(room_id) else { continue };
+            let direct = self.room_is_direct(room_id.as_str());
+            for item in timeline.items() {
+                let Some(target) = item.event_id.as_ref() else { continue };
+                if item.redacted || !(direct || &item.sender == me) {
+                    continue;
+                }
+                let snippet = match &item.content {
+                    ItemContent::Text(t) | ItemContent::Notice(t) | ItemContent::Emote(t) => {
+                        let one: String = t.body.split_whitespace().collect::<Vec<_>>().join(" ");
+                        if one.chars().count() > 80 { format!("{}…", one.chars().take(80).collect::<String>()) } else { one }
+                    }
+                    _ => String::new(),
+                };
+                for r in timeline.relating_events_for(target) {
+                    let mail4agent_messenger::wire::events::RelatesTo::Annotation { key, .. } = &r.relation else { continue };
+                    if &r.sender == me || r.origin_server_ts <= floor {
+                        continue;
+                    }
+                    let who = mxid_localpart(r.sender.as_str()).to_string();
+                    let whose = if &item.sender == me { "your message".to_string() } else { format!("{}'s message", mxid_localpart(item.sender.as_str())) };
+                    out.push(InboundPlaintext {
+                        room_id: room_id.as_str().to_string(),
+                        key: format!("{}\n{}", room_id.as_str(), r.event_id.as_str()),
+                        body: format!("{who} reacted {key} to {whose}: \"{snippet}\""),
+                        from: r.sender.as_str().to_string(),
+                        nick: None,
+                        event_id: r.event_id.as_str().to_string(),
+                        reaction: Some((key.clone(), target.as_str().to_string())),
+                        ts: r.origin_server_ts,
+                    });
+                }
             }
         }
         out
@@ -1740,6 +1812,10 @@ impl OpenedStore {
             self.remember_leader_prompt(&item.key);
             false
         });
+        // Reactions to this agent (its own messages, or in its DMs): a low-priority letter each.
+        let floor = self.reaction_floor.unwrap_or(i64::MAX);
+        let reactions = self.reaction_items(floor);
+        items.extend(reactions.into_iter().filter(|r| policy.allows(self.room_is_direct(&r.room_id), true)));
         for item in items {
             if self.leader_sent.contains(&item.key) || self.routine_sent.contains(&item.key) {
                 continue;
@@ -1754,6 +1830,7 @@ impl OpenedStore {
                 from_nick: &from_nick,
                 event_id: &item.event_id,
                 room: Some(&item.room_id),
+                reaction: item.reaction.as_ref().map(|(key, target)| provider::ReactionNote { key, target }),
             };
             match chain.wake(&session, &letter) {
                 Ok((id, outcome)) => {
@@ -1785,6 +1862,9 @@ struct InboundPlaintext {
     from: String,
     nick: Option<String>,
     event_id: String,
+    /// `(emoji, target event)` for a reaction letter.
+    reaction: Option<(String, String)>,
+    ts: i64,
 }
 
 fn membership_name(membership: &Membership) -> &'static str {
@@ -2687,6 +2767,140 @@ mod tests {
         assert_eq!(route.as_deref(), Some("deliver delivered"), "note={note}");
         let inbox = provider::registry::inbox_dir(dir.0.parent().expect("parent"), "session-a");
         assert!(provider::inbox::drain(&inbox).is_empty(), "a delivered letter is not also queued");
+    }
+
+    fn spawn_homeserver_events(events: serde_json::Value) -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        let first = serde_json::json!({
+            "next_batch": "s1",
+            "rooms": { "join": { "!r:localhost": { "state": { "events": [] }, "timeline": { "events": events } } } },
+            "device_one_time_keys_count": { "signed_curve25519": 50 },
+            "device_unused_fallback_key_types": ["signed_curve25519"]
+        }).to_string().into_bytes();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&done);
+        let handle = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            while !flag.load(Ordering::Relaxed) && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut sock, _)) => {
+                        let _ = sock.set_nonblocking(false);
+                        let Some((headers, _)) = read_http(&mut sock) else { continue };
+                        let line = headers.lines().next().unwrap_or("");
+                        let resp = if line.contains("/sync") && line.contains("since=") {
+                            sync_empty()
+                        } else if line.contains("/sync") {
+                            first.clone()
+                        } else if line.contains("/keys/") {
+                            br#"{"one_time_key_counts":{"signed_curve25519":50}}"#.to_vec()
+                        } else {
+                            b"{}".to_vec()
+                        };
+                        write_http(&mut sock, "200 OK", &resp);
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(15)),
+                    Err(_) => break,
+                }
+            }
+        });
+        (format!("http://{addr}"), done, handle)
+    }
+
+    fn text_ev(id: &str, sender: &str, ts: i64, body: &str) -> serde_json::Value {
+        serde_json::json!({ "event_id": id, "type": "m.room.message", "sender": sender, "origin_server_ts": ts, "content": { "msgtype": "m.text", "body": body } })
+    }
+    fn redaction_ev(id: &str, sender: &str, ts: i64, target: &str) -> serde_json::Value {
+        serde_json::json!({ "event_id": id, "type": "m.room.redaction", "sender": sender, "origin_server_ts": ts, "redacts": target, "content": { "redacts": target } })
+    }
+    /// A server timestamp after this process started (reactions older than the first run never wake).
+    fn later(ms: i64) -> i64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0) + 3_600_000 + ms
+    }
+    fn reaction_ev(id: &str, sender: &str, ts: i64, target: &str, key: &str) -> serde_json::Value {
+        serde_json::json!({ "event_id": id, "type": "m.reaction", "sender": sender, "origin_server_ts": ts, "content": { "m.relates_to": { "rel_type": "m.annotation", "event_id": target, "key": key } } })
+    }
+
+    /// Runs one offline catch-up (agent was down while `events` happened) and returns the routine bodies posted.
+    fn wakes_for(name: &str, events: serde_json::Value, restart: bool) -> Vec<serde_json::Value> {
+        let (base, home_done, home) = spawn_homeserver_events(events);
+        let (routine, hits, routine_done, routine_thread) = spawn_routine();
+        let dir = temp_dir(name);
+        let mut store = open_against(&base, &dir.0, "session-a");
+        store.set_wake(SessionWake { routine_url: Some(routine.clone()), ..SessionWake::default() });
+        store.drive(1_000, false).expect("drive");
+        store.drive(3_000, false).expect("drive again");
+        drop(store);
+        if restart {
+            let mut store = open_against(&base, &dir.0, "session-a");
+            store.set_wake(SessionWake { routine_url: Some(routine), ..SessionWake::default() });
+            store.drive(5_000, false).expect("drive after restart");
+            store.drive(7_000, false).expect("drive after restart again");
+        }
+        stop(&routine_done, routine_thread);
+        stop(&home_done, home);
+        let hits = hits.lock().expect("hits");
+        hits.iter().map(|h| serde_json::from_slice(&h.body).unwrap_or(serde_json::Value::Null)).collect()
+    }
+
+    #[test]
+    fn a_message_sent_and_redacted_while_the_agent_was_offline_wakes_nothing() {
+        let w = wakes_for("coalesce-redact", serde_json::json!([
+            text_ev("$m1:localhost", "@bob:localhost", 10, "oops wrong chat"),
+            redaction_ev("$x1:localhost", "@bob:localhost", 11, "$m1:localhost"),
+        ]), false);
+        assert!(w.is_empty(), "redacted-before-delivery must produce no wake: {w:?}");
+    }
+
+    #[test]
+    fn an_edit_before_the_wake_delivers_only_the_final_version() {
+        let w = wakes_for("coalesce-edit", serde_json::json!([
+            text_ev("$m1:localhost", "@bob:localhost", 10, "draft text"),
+            { "event_id": "$e1:localhost", "type": "m.room.message", "sender": "@bob:localhost", "origin_server_ts": 11,
+              "content": { "msgtype": "m.text", "body": "* final text", "m.new_content": { "msgtype": "m.text", "body": "final text" },
+                           "m.relates_to": { "rel_type": "m.replace", "event_id": "$m1:localhost" } } },
+        ]), false);
+        assert_eq!(w.len(), 1, "one wake for the edited message: {w:?}");
+        assert_eq!(w[0]["body"], "final text");
+        assert_eq!(w[0]["event_id"], "$m1:localhost");
+    }
+
+    #[test]
+    fn a_reaction_to_my_message_wakes_once_low_priority_and_mine_never() {
+        let w = wakes_for("reaction-wake", serde_json::json!([
+            text_ev("$a1:localhost", "@alice:localhost", 10, "deploy finished"),
+            reaction_ev("$r1:localhost", "@bob:localhost", later(0), "$a1:localhost", "👍"),
+            reaction_ev("$r2:localhost", "@alice:localhost", later(1), "$a1:localhost", "🎉"),
+        ]), true);
+        assert_eq!(w.len(), 1, "exactly one wake (bob's reaction), none for my own, no replay after restart: {w:?}");
+        assert_eq!(w[0]["kind"], "reaction");
+        assert_eq!(w[0]["reaction"], "👍");
+        assert_eq!(w[0]["target_event_id"], "$a1:localhost");
+        assert_eq!(w[0]["event_id"], "$r1:localhost");
+        assert_eq!(w[0]["reply_needed"], false);
+        assert_eq!(w[0]["priority"], "low");
+        assert!(w[0].get("reply").is_none());
+        assert!(w[0]["body"].as_str().unwrap_or("").contains("deploy finished"));
+    }
+
+    #[test]
+    fn reactions_from_before_the_first_run_never_wake() {
+        let w = wakes_for("reaction-history", serde_json::json!([
+            text_ev("$a1:localhost", "@alice:localhost", 10, "old"),
+            reaction_ev("$r1:localhost", "@bob:localhost", 11, "$a1:localhost", "👍"),
+        ]), false);
+        assert!(w.is_empty(), "history replayed: {w:?}");
+    }
+
+    #[test]
+    fn a_reaction_added_and_removed_before_the_wake_produces_nothing() {
+        let w = wakes_for("reaction-undo", serde_json::json!([
+            text_ev("$a1:localhost", "@alice:localhost", 10, "hello"),
+            reaction_ev("$r1:localhost", "@bob:localhost", later(0), "$a1:localhost", "👍"),
+            redaction_ev("$x1:localhost", "@bob:localhost", later(1), "$r1:localhost"),
+        ]), false);
+        assert!(w.is_empty(), "{w:?}");
     }
 
     #[test]

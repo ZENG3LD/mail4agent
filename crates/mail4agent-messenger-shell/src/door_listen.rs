@@ -159,7 +159,7 @@ pub fn run_loop(cfg: DoorListen) -> ! {
             Ok(reply) => {
                 for letter in seen.fresh(&parse_inbox(&reply)) {
                     let text = letter_text(&cfg.door, &letter);
-                    let wake = WakeLetter { body: &text, from_nick: &letter.from, event_id: &letter.message_id, room: None };
+                    let wake = WakeLetter { body: &text, from_nick: &letter.from, event_id: &letter.message_id, room: None, reaction: None };
                     match chain.wake(&cfg.session, &wake) {
                         Ok((id, outcome)) => {
                             eprintln!("door-listen: {} woke via {id}: {outcome:?}", letter.message_id);
