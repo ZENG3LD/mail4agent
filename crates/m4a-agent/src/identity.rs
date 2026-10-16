@@ -57,6 +57,9 @@ fn valid_session_id(s: &str) -> bool {
 impl SessionIdentity {
     /// Signs `msg` with the identity's private key (read from the vault just for this).
     pub fn sign(&self, vault: &dyn KeyVault, msg: &[u8]) -> Result<String> {
+        if vault.external_identity(&self.session_id).is_some() {
+            return Ok(keyproof::encode(&vault.sign_external(&self.session_id, msg)?));
+        }
         let sk = signing_key(vault, &self.session_id)?;
         Ok(keyproof::encode(&sk.sign(msg).to_bytes()))
     }
@@ -100,12 +103,26 @@ impl IdentityStore {
             return Err(AgentError::Identity("session id must be 1-64 characters of [A-Za-z0-9._-]".into()));
         }
         let server_ref = server_ref.trim_end_matches('/').to_string();
+        let external = self.vault.external_identity(session_id);
         if let Some(raw) = self.vault.get(&record_label(session_id))? {
             let id: SessionIdentity = serde_json::from_slice(&raw).map_err(|e| AgentError::Identity(format!("stored identity: {e}")))?;
             if id.tier != tier || id.server_ref != server_ref {
                 return Err(AgentError::Identity("this session is bound to another tier or server; use a new session id".into()));
             }
-            signing_key(&*self.vault, session_id)?; // the key must still be there
+            match external {
+                Some(pk) if id.public_key != keyproof::encode(&pk) => {
+                    return Err(AgentError::Identity("the stored identity does not match the external key".into()))
+                }
+                Some(_) => {}
+                None => {
+                    signing_key(&*self.vault, session_id)?; // the key must still be there
+                }
+            }
+            return Ok(id);
+        }
+        if let Some(pk) = external {
+            let id = SessionIdentity { session_id: session_id.to_string(), tier, server_ref, key_id: keyproof::key_id_of(&pk), public_key: keyproof::encode(&pk), nick: None, enrolled: false, local_session: None, requested_nick: None };
+            self.save(&id)?;
             return Ok(id);
         }
         let seed = random_bytes(32);
@@ -255,5 +272,26 @@ mod tests {
         let seed_b64 = keyproof::encode(&seed);
         assert!(!format!("{id:?}").contains(&seed_b64));
         assert!(!String::from_utf8_lossy(&serde_json::to_vec(&id).unwrap()).contains(&seed_b64));
+    }
+
+    #[test]
+    fn an_external_identity_signs_through_the_vault_and_keeps_no_seed() {
+        struct Ext(MemoryVault, SigningKey);
+        impl KeyVault for Ext {
+            fn get(&self, l: &str) -> Result<Option<Zeroizing<Vec<u8>>>> { self.0.get(l) }
+            fn put(&self, l: &str, v: &[u8]) -> Result<()> { self.0.put(l, v) }
+            fn delete(&self, l: &str) -> Result<bool> { self.0.delete(l) }
+            fn kind(&self) -> &'static str { "ext" }
+            fn external_identity(&self, _: &str) -> Option<[u8; 32]> { Some(self.1.verifying_key().to_bytes()) }
+            fn sign_external(&self, _: &str, m: &[u8]) -> Result<[u8; 64]> { Ok(self.1.sign(m).to_bytes()) }
+        }
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let ids = IdentityStore::new(Arc::new(Ext(MemoryVault::new(), sk.clone())));
+        let id = ids.resolve("s1", BackendKind::Server, "http://x").unwrap();
+        assert_eq!(id.key_id, keyproof::key_id_of(sk.verifying_key().as_bytes()));
+        assert!(ids.vault().get("identity-key/s1").unwrap().is_none());
+        let sig = id.sign(ids.vault(), b"m").unwrap();
+        assert_eq!(sig, keyproof::encode(&sk.sign(b"m").to_bytes()));
+        assert_eq!(ids.resolve("s1", BackendKind::Server, "http://x").unwrap(), id);
     }
 }

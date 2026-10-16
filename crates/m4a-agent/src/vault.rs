@@ -35,6 +35,31 @@ pub trait KeyVault: Send + Sync {
     }
     /// A short name for logs ("memory", "file+keychain", "file+keyfile").
     fn kind(&self) -> &'static str;
+    /// The public key of `session_id`'s identity when the private key lives outside this vault
+    /// (a host keystore that signs but never exports). `None` (the default) keeps the seed here.
+    fn external_identity(&self, _session_id: &str) -> Option<[u8; 32]> {
+        None
+    }
+    /// Sign `msg` with the external identity key of `session_id`.
+    fn sign_external(&self, _session_id: &str, _msg: &[u8]) -> Result<[u8; 64]> {
+        Err(AgentError::Vault("this vault holds no external identity".into()))
+    }
+}
+
+/// A vault whose master key the host supplies (for example derived from its own keystore), so the
+/// vault file opens only where that host can derive it again.
+pub struct StaticMasterKey(pub Zeroizing<Vec<u8>>);
+
+impl MasterKeySource for StaticMasterKey {
+    fn load_or_create(&self) -> Result<Zeroizing<Vec<u8>>> {
+        if self.0.len() != 32 {
+            return Err(AgentError::Vault("master key must be 32 bytes".into()));
+        }
+        Ok(self.0.clone())
+    }
+    fn name(&self) -> &'static str {
+        "hostkey"
+    }
 }
 
 /// Non-persistent vault for tests and throwaway sessions.

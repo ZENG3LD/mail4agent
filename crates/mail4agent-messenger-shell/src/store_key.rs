@@ -20,22 +20,38 @@ use zeroize::Zeroizing;
 
 use crate::{read_records, record_path, store_seal_key, ShellError};
 
-fn vault_for(store_root: &Path) -> Result<Arc<FileVault>, ShellError> {
-    static VAULTS: OnceLock<Mutex<HashMap<PathBuf, Arc<FileVault>>>> = OnceLock::new();
-    let mut m = VAULTS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+fn vaults() -> &'static Mutex<HashMap<PathBuf, Arc<dyn KeyVault>>> {
+    static VAULTS: OnceLock<Mutex<HashMap<PathBuf, Arc<dyn KeyVault>>>> = OnceLock::new();
+    VAULTS.get_or_init(Default::default)
+}
+
+/// Use `vault` for every session under `store_root` in this process, instead of the default file
+/// vault. A host that roots session keys in its own keystore installs one per session root, so a
+/// session never opens a neighbour's vault.
+pub fn install_vault(store_root: &Path, vault: Arc<dyn KeyVault>) {
+    vaults().lock().unwrap_or_else(|e| e.into_inner()).insert(store_root.to_path_buf(), vault);
+}
+
+/// Forget an installed vault (the host locked or retired the session).
+pub fn remove_vault(store_root: &Path) {
+    vaults().lock().unwrap_or_else(|e| e.into_inner()).remove(store_root);
+}
+
+fn vault_for(store_root: &Path) -> Result<Arc<dyn KeyVault>, ShellError> {
+    let mut m = vaults().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(v) = m.get(store_root) {
         return Ok(v.clone());
     }
     let dir = store_root.join(".m4a-agent");
     std::fs::create_dir_all(&dir)?;
-    let v = Arc::new(FileVault::open_default(&dir, "m4a-agent").map_err(|e| ShellError::Register(format!("key vault: {e}")))?);
+    let v: Arc<dyn KeyVault> = Arc::new(FileVault::open_default(&dir, "m4a-agent").map_err(|e| ShellError::Register(format!("key vault: {e}")))?);
     m.insert(store_root.to_path_buf(), v.clone());
     Ok(v)
 }
 
 /// The vault shared by every session under `store_root`.
 pub fn vault(store_root: &Path) -> Result<Arc<dyn KeyVault>, ShellError> {
-    Ok(vault_for(store_root)? as Arc<dyn KeyVault>)
+    vault_for(store_root)
 }
 
 /// The store key of `session_id` whose store directory is `dir` (a child of the store root).

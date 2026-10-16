@@ -23,4 +23,4 @@ pub use backend::{Backend, BackendKind, Capabilities, Session};
 pub use error::{AgentError, Result};
 pub use identity::{IdentityStore, SessionIdentity};
 pub use resolver::{ResolvedSession, ResolverChain, SessionResolver};
-pub use vault::{FileVault, KeyVault, MemoryVault};
+pub use vault::{FileVault, KeyVault, MemoryVault, StaticMasterKey};
