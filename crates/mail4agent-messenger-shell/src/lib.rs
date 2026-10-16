@@ -89,7 +89,7 @@ mod send;
 mod ipc_winpipe;
 pub mod store_key;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -602,6 +602,9 @@ pub struct OpenedStore {
     /// Last wake failure, clipped. No bearer and no message body.
     wake_note: Option<String>,
     wake_log: Vec<WakeAttempt>,
+    /// Letters whose live deliver failed and fell back to the durable inbox: retried through
+    /// the deliver link with backoff until it answers, never dropped. key -> (attempts, next try).
+    wake_retry: HashMap<String, (u32, std::time::Instant)>,
     /// Provider wake chain for a session that has no leader socket
     /// (Codex, Kimi, Claude, Cursor; Claude web / Codex cloud). Uses the
     /// same `leader-prompted` ledger as the leader path.
@@ -727,6 +730,7 @@ impl OpenedStore {
             wake_route: None,
             wake_note: None,
             wake_log: Vec::new(),
+            wake_retry: HashMap::new(),
             bus: None,
             local_peers: Vec::new(),
             pushed_room_events: Vec::new(),
@@ -1778,6 +1782,19 @@ impl OpenedStore {
         (session.clone(), crate::provider::letter_chain(kind, inbox, &config))
     }
 
+    /// Next try of a letter's live deliver: 30 s, doubling, at most 15 min apart. No limit on
+    /// attempts: a letter is never dropped.
+    fn schedule_wake_retry(&mut self, key: &str) {
+        let n = self.wake_retry.get(key).map(|(n, _)| *n + 1).unwrap_or(1);
+        let secs = (30u64 << (n - 1).min(5)).min(900);
+        self.wake_retry.insert(key.to_owned(), (n, std::time::Instant::now() + std::time::Duration::from_secs(secs)));
+    }
+
+    /// Letters waiting for a live-deliver retry (count).
+    pub fn pending_wake_retries(&self) -> usize {
+        self.wake_retry.len()
+    }
+
     fn wake_inbound(&mut self) {
         if self.routine_url.is_none() && self.leader_sock.is_none() && self.wake_chain.is_none() {
             return;
@@ -1820,6 +1837,10 @@ impl OpenedStore {
             if self.leader_sent.contains(&item.key) || self.routine_sent.contains(&item.key) {
                 continue;
             }
+            let retry = self.wake_retry.get(&item.key).copied();
+            if retry.is_some_and(|(_, next)| std::time::Instant::now() < next) {
+                continue;
+            }
             let (session, mut chain) = match self.wake_chain.take() {
                 Some(installed) => installed,
                 None => self.default_letter_chain(),
@@ -1832,20 +1853,34 @@ impl OpenedStore {
                 room: Some(&item.room_id),
                 reaction: item.reaction.as_ref().map(|(key, target)| provider::ReactionNote { key, target }),
             };
-            match chain.wake(&session, &letter) {
+            // A letter already in the durable inbox is retried through the live deliver only.
+            // Retries run the whole chain: the inbox fallback writes by event id, so it never duplicates.
+            let result = chain.wake(&session, &letter);
+            match result {
                 Ok((id, outcome)) => {
-                    self.remember_leader_prompt(&item.key);
-                    self.remember_routine_wake(&item.key);
-                    let how = match outcome {
-                        provider::WakeOutcome::Delivered => "delivered",
-                        provider::WakeOutcome::Queued(_) => "queued",
-                    };
-                    let status = (how == "delivered").then_some(200);
-                    crate::wake_policy::note_attempt(self.store_dir(), status);
-                    self.wake_log.push(WakeAttempt { event_id: item.event_id.clone(), status });
-                    self.wake_route = Some(format!("{id} {how}"));
+                    let delivered = matches!(outcome, provider::WakeOutcome::Delivered);
+                    // Queued by the fallback link (the live deliver failed): the letter is safe in
+                    // the inbox, but the agent was not woken. Keep it and try the deliver again.
+                    let fell_back = !delivered && chain.ids().first().is_some_and(|first| *first != id);
+                    if fell_back {
+                        self.schedule_wake_retry(&item.key);
+                        self.wake_note = Some(format!("wake {} queued; live deliver will be retried", item.event_id));
+                        crate::wake_policy::note_attempt(self.store_dir(), None);
+                        self.wake_log.push(WakeAttempt { event_id: item.event_id.clone(), status: None });
+                    } else {
+                        self.wake_retry.remove(&item.key);
+                        self.remember_leader_prompt(&item.key);
+                        self.remember_routine_wake(&item.key);
+                        let status = delivered.then_some(200);
+                        crate::wake_policy::note_attempt(self.store_dir(), status);
+                        self.wake_log.push(WakeAttempt { event_id: item.event_id.clone(), status });
+                    }
+                    self.wake_route = Some(format!("{id} {}", if delivered { "delivered" } else { "queued" }));
                 }
                 Err(err) => {
+                    if retry.is_some() {
+                        self.schedule_wake_retry(&item.key);
+                    }
                     self.wake_note = Some(clip_public(err.to_string()));
                 }
             }

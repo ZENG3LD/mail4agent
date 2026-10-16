@@ -79,7 +79,7 @@ pub fn run(_args: Vec<String>) {
             let n = now_counts.entry(nick.clone()).or_insert(0);
             *n += 1;
             if *n > seen.get(nick).copied().unwrap_or(0) {
-                let status = attempt.status.map(|code| code.to_string()).unwrap_or_else(|| "none".to_string());
+                let status = attempt.status.map(|code| code.to_string()).unwrap_or_else(|| "queued (live deliver retried with backoff)".to_string());
                 println!("wake {nick} event={} status={status}", attempt.event_id);
             }
         }
