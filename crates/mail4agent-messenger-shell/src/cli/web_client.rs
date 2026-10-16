@@ -51,6 +51,9 @@ pub fn run(_args: Vec<String>) {
     let run_secs = env_secs("M4A_RUN_SECS", 0);
     let started = Instant::now();
     let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let stale_secs = env_secs("M4A_STALE_SECS", 180);
+    let mut failing_since: Option<Instant> = None;
+    let mut last_probe = Instant::now();
     loop {
         let report = client.tick(now_ms(), drive_secs);
         for (nick, event_id) in &report.pushed {
@@ -97,7 +100,29 @@ pub fn run(_args: Vec<String>) {
         if streak == 1 || streak == HEAL_LOG_STREAK {
             eprintln!("homeserver unreachable or failing; backing off and retrying on its own");
         }
+        // Health check: the client failing for minutes while a brand-new connection reaches the
+        // homeserver means state inside this process went stale (seen 13.10 and 16.10: hours of
+        // "error sending request" that a restart cured at once). Exit so the supervisor restarts it.
+        if streak == 0 { failing_since = None; } else if failing_since.is_none() { failing_since = Some(Instant::now()); }
+        if let Some(since) = failing_since {
+            if stale_secs > 0 && since.elapsed().as_secs() >= stale_secs && last_probe.elapsed().as_secs() >= 60 {
+                last_probe = Instant::now();
+                if let Some(code) = fresh_probe() {
+                    eprintln!("stale client: failing {}s while a fresh connection gets HTTP {code}; exiting for a restart", since.elapsed().as_secs());
+                    std::process::exit(75);
+                }
+            }
+        }
         let pause_ms = if streak == 0 { 250 } else { (250u64 << streak.min(6)).min(10_000) };
         std::thread::sleep(Duration::from_millis(pause_ms));
     }
+}
+
+/// One request on a brand-new HTTP client (new pool, new DNS lookup): `Some(status)` if the
+/// homeserver answered at all.
+fn fresh_probe() -> Option<u16> {
+    let base = std::env::var("M4A_HOMESERVER_URL").or_else(|_| std::env::var("M4A_PRODUCT_URL")).ok()?;
+    let url = format!("{}/_matrix/client/versions", base.trim_end_matches('/'));
+    let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(10)).build().ok()?;
+    client.get(url).send().ok().map(|r| r.status().as_u16())
 }

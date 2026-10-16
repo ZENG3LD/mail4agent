@@ -25,6 +25,19 @@ pub fn clip_public(text: String) -> String {
     out
 }
 
+/// A reqwest error with its causes (connect refused, dns, timed out, tls...), URL left out:
+/// "error sending request" alone hid why the box client stayed down for hours.
+pub fn error_chain(e: &reqwest::Error) -> String {
+    let mut out = if e.is_timeout() { "timed out".to_string() } else if e.is_connect() { "connect failed".to_string() } else { "request failed".to_string() };
+    let mut src = std::error::Error::source(e);
+    while let Some(cause) = src {
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        src = cause.source();
+    }
+    out
+}
+
 pub fn percent_encode(value: &str) -> String {
     let mut out = String::new();
     for byte in value.bytes() {
@@ -62,7 +75,7 @@ impl HttpExec {
             // transport failure; short idle life and keepalive make the pool drop it on its own.
             .pool_idle_timeout(Duration::from_secs(15))
             .tcp_keepalive(Duration::from_secs(30))
-            .http1_only().build().map_err(|e| AgentError::Transport(clip_public(e.to_string())))?;
+            .http1_only().build().map_err(|e| AgentError::Transport(clip_public(error_chain(&e))))?;
         Ok(Self { client, base: parse_origin(base)?, keep_prefix: false })
     }
 
@@ -104,7 +117,7 @@ impl HttpExec {
     /// `GET path` as JSON (no bearer): `(status, json)`.
     pub fn get_json(&self, path: &str) -> Result<(u16, serde_json::Value)> {
         let url = self.url(path, &[])?;
-        let r = self.client.get(url).send().map_err(|e| AgentError::Transport(clip_public(e.to_string())))?;
+        let r = self.client.get(url).send().map_err(|e| AgentError::Transport(clip_public(error_chain(&e))))?;
         let st = r.status().as_u16();
         Ok((st, r.json().unwrap_or(serde_json::Value::Null)))
     }
@@ -112,7 +125,7 @@ impl HttpExec {
     /// `GET path` as JSON with a bearer: `(status, json)`.
     pub fn get_json_as(&self, bearer: &str, path: &str) -> Result<(u16, serde_json::Value)> {
         let url = self.url(path, &[])?;
-        let r = self.client.get(url).bearer_auth(bearer).send().map_err(|e| AgentError::Transport(clip_public(e.to_string())))?;
+        let r = self.client.get(url).bearer_auth(bearer).send().map_err(|e| AgentError::Transport(clip_public(error_chain(&e))))?;
         let st = r.status().as_u16();
         Ok((st, r.json().unwrap_or(serde_json::Value::Null)))
     }
@@ -151,9 +164,9 @@ impl HttpExec {
             let bytes = serde_json::to_vec(body).map_err(|e| AgentError::Protocol(e.to_string()))?;
             builder = builder.header(reqwest::header::CONTENT_TYPE, "application/json").body(bytes);
         }
-        let response = builder.send().map_err(|e| AgentError::Transport(clip_public(e.to_string())))?;
+        let response = builder.send().map_err(|e| AgentError::Transport(clip_public(error_chain(&e))))?;
         let status = response.status().as_u16();
-        let body = response.bytes().map_err(|e| AgentError::Transport(clip_public(e.to_string())))?.to_vec();
+        let body = response.bytes().map_err(|e| AgentError::Transport(clip_public(error_chain(&e))))?.to_vec();
         Ok(HttpResponseDescriptor { status, body })
     }
 }
