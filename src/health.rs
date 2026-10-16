@@ -37,6 +37,13 @@ pub struct HealthReport {
     pub uptime_secs: u64,
     pub dependencies: Vec<serde_json::Value>,
     pub background_tasks: Vec<String>,
+    pub pid: u32,
+    /// Control verbs this process serves (see `control.rs`).
+    pub capabilities: Vec<&'static str>,
+    pub draining: bool,
+    /// Where the owner-only control token lives (never the token itself).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub control_token_file: Option<String>,
 }
 
 pub struct HealthState {
@@ -44,11 +51,17 @@ pub struct HealthState {
     version: &'static str,
     started_at: SystemTime,
     started_at_instant: Instant,
+    control: Option<std::sync::Arc<crate::control::Control>>,
 }
 
 impl HealthState {
     pub fn new(service: &'static str, version: &'static str) -> Self {
-        Self { service, version, started_at: SystemTime::now(), started_at_instant: Instant::now() }
+        Self { service, version, started_at: SystemTime::now(), started_at_instant: Instant::now(), control: None }
+    }
+
+    pub fn with_control(mut self, control: std::sync::Arc<crate::control::Control>) -> Self {
+        self.control = Some(control);
+        self
     }
 
     pub fn report(&self) -> HealthReport {
@@ -60,6 +73,10 @@ impl HealthState {
             uptime_secs: self.started_at_instant.elapsed().as_secs(),
             dependencies: Vec::new(),
             background_tasks: Vec::new(),
+            pid: std::process::id(),
+            capabilities: if self.control.is_some() { crate::control::CAPABILITIES.to_vec() } else { Vec::new() },
+            draining: self.control.as_ref().is_some_and(|c| c.is_draining()),
+            control_token_file: self.control.as_ref().map(|c| c.token_file().display().to_string()),
         }
     }
 }

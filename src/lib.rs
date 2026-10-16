@@ -33,6 +33,7 @@
 mod auth;
 mod bootstrap;
 mod config;
+pub mod control;
 mod dto;
 mod error;
 mod health;
@@ -94,6 +95,7 @@ pub fn run() -> Result<(), MainError> {
     let db_path = config.resolve_db_path()?;
     tracing::info!(db = %db_path.display(), bind = %config.bind, "mail4agent starting");
 
+    let token_file = control::default_token_file(&db_path);
     let db_config = DbConfig::new(db_path);
     let db = Db::open(&db_config)?;
     db.run_migrations_blocking(MigrationRunner::new(migrations()))?;
@@ -105,7 +107,10 @@ pub fn run() -> Result<(), MainError> {
     let service = Arc::new(MailboxService::new(engine_store, reader_store));
 
     let runtime = tokio::runtime::Runtime::new().map_err(MainError::Runtime)?;
-    runtime.block_on(serve(service, config.bind))
+    runtime.block_on(async move {
+        let (control, stop_rx) = control::Control::create(token_file).map_err(MainError::Runtime)?;
+        serve(service, config.bind, control, stop_rx).await
+    })
 }
 
 /// Join handle for a mailbox started by [`spawn`]. Dropping detaches the
@@ -150,13 +155,18 @@ mod spawn_tests {
     }
 }
 
-async fn serve(service: Arc<MailboxService>, bind: SocketAddr) -> Result<(), MainError> {
+async fn serve(
+    service: Arc<MailboxService>,
+    bind: SocketAddr,
+    control: Arc<control::Control>,
+    mut control_stop: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), MainError> {
     bootstrap::ensure_bootstrap_operator(&service).await?;
 
     let app = Arc::new(AppState { service: service.clone(), bind_addr: bind });
 
     // `GET /health` -- the only route without authentication.
-    let health_state = Arc::new(health::HealthState::new("mail4agent", env!("CARGO_PKG_VERSION")));
+    let health_state = Arc::new(health::HealthState::new("mail4agent", env!("CARGO_PKG_VERSION")).with_control(control.clone()));
     let (health_router, health_endpoints) = DocRouter::<Arc<AppState>>::new()
         .get(
             "/health",
@@ -274,10 +284,15 @@ async fn serve(service: Arc<MailboxService>, bind: SocketAddr) -> Result<(), Mai
     endpoints.extend(mcp_endpoints);
     endpoints.extend(admin_endpoints);
 
+    let control_router: Router = Router::new()
+        .route("/control/{verb}", axum::routing::post(control::handle))
+        .with_state(control.clone());
     let router = health_router
         .merge(authenticated_router)
         .merge(admin_router)
         .with_state(app.clone())
+        .merge(control_router)
+        .layer(middleware::from_fn_with_state(control.clone(), control::drain_gate))
         .layer(middleware::from_fn(request_id::request_id_layer));
 
     let listener = tokio::net::TcpListener::bind(bind).await.map_err(|e| MainError::Bind(bind, e))?;
@@ -307,8 +322,10 @@ async fn serve(service: Arc<MailboxService>, bind: SocketAddr) -> Result<(), Mai
             .await
     });
 
-    shutdown::graceful_shutdown_signal().await;
-    tracing::info!("shutdown signal received");
+    tokio::select! {
+        () = shutdown::graceful_shutdown_signal() => tracing::info!("shutdown signal received"),
+        _ = control_stop.changed() => tracing::info!("control handoff: releasing the listener"),
+    }
     let _ = shutdown_tx.send(true);
 
     match tokio::time::timeout(Duration::from_secs(30), serve_handle).await {
