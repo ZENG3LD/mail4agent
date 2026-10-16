@@ -60,8 +60,9 @@ pub fn run(args: Vec<String>) {
     if text.trim().is_empty() {
         fail(2, "text is empty");
     }
-    // Hatchery session (signer option A): the session holds only a process-bound handle; the
-    // node proxy checks this process, hq-core signs as the session's own nick and delivers.
+    // Delegated mode (m4a_keys::Authority::Delegated): the session holds only a process-bound
+    // handle; the node proxy checks this process, the orchestrator keystore signs as the
+    // session's own nick and delivers.
     // `--as` is ignored there: the identity comes from the handle, never from arguments.
     #[cfg(unix)]
     if let (Some(handle), Some(sock)) = (std::env::var_os(SIGNER_HANDLE_ENV), std::env::var_os(SIGNER_SOCK_ENV)) {
@@ -117,8 +118,8 @@ fn print_reply(reply: &SendReply) {
     }
 }
 
-pub const SIGNER_HANDLE_ENV: &str = "M4A_SESSION_HANDLE";
-pub const SIGNER_SOCK_ENV: &str = "M4A_SIGNER_SOCK";
+pub const SIGNER_HANDLE_ENV: &str = m4a_keys::env::SESSION_HANDLE;
+pub const SIGNER_SOCK_ENV: &str = m4a_keys::env::SIGNER_SOCK;
 
 /// One JSON line to the node's signer proxy: `{handle, op:"send", payload_hex}`; the answer is
 /// `{status:"sent", result:{from, message_id, ...}}` or `{status:"refused", reason}`.

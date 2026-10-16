@@ -1,0 +1,12 @@
+[package]
+name = "m4a-keys"
+version.workspace = true
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/ZENG3LD/mail4agent"
+keywords = ["agent", "messenger", "keys", "capability"]
+categories = ["cryptography"]
+description = "m4a's embedded keystore layer on tesserax-keytree: m4a grant names, signed-letter verification, and the authority mode (own root standalone, delegated keys when run under an orchestrator)."
+
+[dependencies]
+tesserax-keytree = "0.1.2"
