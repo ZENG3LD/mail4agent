@@ -44,6 +44,7 @@ pub fn run(args: Vec<String>) {
             _ => words.push(arg),
         }
     }
+    let as_nick = as_nick.or_else(|| std::env::var_os(SIGNER_HANDLE_ENV).map(|_| String::new()));
     let (Some(as_nick), Some(to)) = (as_nick, to) else {
         fail(2, USAGE);
     };
@@ -58,6 +59,19 @@ pub fn run(args: Vec<String>) {
     };
     if text.trim().is_empty() {
         fail(2, "text is empty");
+    }
+    // Hatchery session (signer option A): the session holds only a process-bound handle; the
+    // node proxy checks this process, hq-core signs as the session's own nick and delivers.
+    // `--as` is ignored there: the identity comes from the handle, never from arguments.
+    #[cfg(unix)]
+    if let (Some(handle), Some(sock)) = (std::env::var_os(SIGNER_HANDLE_ENV), std::env::var_os(SIGNER_SOCK_ENV)) {
+        match send_via_signer(std::path::Path::new(&sock), &handle.to_string_lossy(), &to, &text) {
+            Ok(from) => {
+                println!("sent via signer as {from}");
+                return;
+            }
+            Err(e) => fail(1, &format!("signer proxy: {e}")),
+        }
     }
     if text.len() > MAX_SEND_BYTES {
         fail(2, &format!("text is longer than {MAX_SEND_BYTES} bytes"));
@@ -100,5 +114,30 @@ fn print_reply(reply: &SendReply) {
         );
     } else {
         fail(1, reply.error.as_deref().unwrap_or("send failed"));
+    }
+}
+
+pub const SIGNER_HANDLE_ENV: &str = "M4A_SESSION_HANDLE";
+pub const SIGNER_SOCK_ENV: &str = "M4A_SIGNER_SOCK";
+
+/// One JSON line to the node's signer proxy: `{handle, op:"send", payload_hex}`; the answer is
+/// `{status:"sent", result:{from, message_id, ...}}` or `{status:"refused", reason}`.
+#[cfg(unix)]
+pub fn send_via_signer(sock: &std::path::Path, handle: &str, to: &str, text: &str) -> Result<String, String> {
+    use std::io::{BufRead, Write};
+    let subject: String = text.lines().next().unwrap_or("").chars().take(80).collect();
+    let letter = serde_json::json!({ "to": to, "subject": subject, "body": text });
+    let payload: String = serde_json::to_vec(&letter).map_err(|e| e.to_string())?.iter().map(|b| format!("{b:02x}")).collect();
+    let mut req = serde_json::to_vec(&serde_json::json!({ "handle": handle, "op": "send", "payload_hex": payload })).map_err(|e| e.to_string())?;
+    req.push(b'\n');
+    let mut s = std::os::unix::net::UnixStream::connect(sock).map_err(|e| e.kind().to_string())?;
+    s.set_read_timeout(Some(Duration::from_secs(30))).ok();
+    s.write_all(&req).map_err(|e| e.kind().to_string())?;
+    let mut line = String::new();
+    std::io::BufReader::new(s).read_line(&mut line).map_err(|e| e.kind().to_string())?;
+    let v: serde_json::Value = serde_json::from_str(&line).map_err(|_| "bad answer".to_string())?;
+    match v["status"].as_str() {
+        Some("sent") => Ok(v["result"]["from"].as_str().unwrap_or("").to_owned()),
+        _ => Err(v["reason"].as_str().unwrap_or("refused").to_owned()),
     }
 }
