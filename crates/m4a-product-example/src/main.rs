@@ -71,6 +71,16 @@ async fn run() -> Result<(), String> {
         anon_read: opt("M4A_PRODUCT_ANON_READ").is_some_and(|v| v.eq_ignore_ascii_case("on")),
         tokens: Default::default(),
         challenges: m4a_product_kit::ChallengeBook::new(opt("M4A_PRODUCT_AUDIENCE").unwrap_or_else(|| "m4a-product".into())),
+        // Node registry: `M4A_PRODUCT_NODE_REGISTRY` (file), else `$STATE_DIRECTORY/nodes.json`
+        // when the service has a state directory; neither -> node registration stays off.
+        nodes: opt("M4A_PRODUCT_NODE_REGISTRY")
+            .map(std::path::PathBuf::from)
+            .or_else(|| opt("STATE_DIRECTORY").map(|d| std::path::PathBuf::from(d.split(':').next().unwrap_or_default()).join("nodes.json")))
+            .map(|p| {
+                let rate = opt("M4A_PRODUCT_NODE_RATE_PER_HOUR").and_then(|v| v.parse().ok()).unwrap_or(m4a_product_kit::node_registry::DEFAULT_RATE_PER_HOUR);
+                m4a_product_kit::node_registry::NodeRegistry::open(p, rate).map(Arc::new).map_err(|e| format!("node registry: {e}"))
+            })
+            .transpose()?,
         // Access tokens given out with refresh tokens last this long; 0 turns refresh tokens off.
         access_ttl_ms: opt("M4A_PRODUCT_ACCESS_TTL_SECS").and_then(|v| v.parse::<i64>().ok()).unwrap_or(3600) * 1000,
     });

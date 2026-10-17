@@ -48,6 +48,7 @@ async fn product() -> String {
         tokens: Default::default(),
         access_ttl_ms: 3_600_000,
         challenges: m4a_product_kit::ChallengeBook::new("test-product"),
+        nodes: None,
     });
     format!("http://{}", serve(router(app)).await)
 }
