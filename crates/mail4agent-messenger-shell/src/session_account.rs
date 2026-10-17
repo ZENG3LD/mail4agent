@@ -307,6 +307,43 @@ pub fn append_env_file(path: &Path, pairs: &[(&str, String)]) -> Result<(), Acco
     Ok(())
 }
 
+/// Keys a session file may carry: the session identity only.
+pub const SESSION_FILE_KEYS: [&str; 3] = ["M4A_NICK", "M4A_SESSION_ID", SESSION_CAP_ENV];
+
+/// Parses a node-written session file (`KEY=VALUE` lines, optional `export `), keeping only
+/// [`SESSION_FILE_KEYS`]. Used when a provider runs tools in a process that did not inherit
+/// the session's environment.
+pub fn parse_session_file(text: &str) -> Vec<(&'static str, String)> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((k, v)) = line.split_once('=') else { continue };
+        if let Some(key) = SESSION_FILE_KEYS.iter().find(|key| **key == k.trim()) {
+            let v = v.trim();
+            if !v.is_empty() && !v.chars().any(char::is_control) {
+                out.push((*key, v.to_owned()));
+            }
+        }
+    }
+    out
+}
+
+/// Applies a session file to this process's environment. Values already in the environment win.
+pub fn apply_session_file(path: &Path) -> Result<(), AccountError> {
+    let text = std::fs::read_to_string(path).map_err(|e| AccountError::Io(e.kind().to_string()))?;
+    let pairs = parse_session_file(&text);
+    if pairs.is_empty() {
+        return Err(AccountError::Io("no session identity in file".into()));
+    }
+    for (k, v) in pairs {
+        if std::env::var_os(k).filter(|x| !x.is_empty()).is_none() {
+            std::env::set_var(k, v);
+        }
+    }
+    Ok(())
+}
+
 /// After `m4a-agent enroll` succeeded with an account's own store root
 /// (`<base>/accounts/<account_ref>`), records the account as enrolled. Returns the ref, or `None`
 /// when that root is not a session account's.
@@ -492,6 +529,12 @@ mod tests {
         assert_eq!(listed[0].session_id, a.account_ref);
         assert_eq!(listed[0].store_root.as_deref(), Some(a.store_root.as_path()));
         assert_ne!(listed[0].store_root.as_deref(), Some(b.store_root.as_path()));
+    }
+
+    #[test]
+    fn session_file_keeps_only_identity_keys() {
+        let got = parse_session_file("export M4A_NICK=a-1\nM4A_SESSION_ID=s\nPATH=/x\nM4A_SESSION_CAP=\n# c\n");
+        assert_eq!(got, vec![("M4A_NICK", "a-1".to_owned()), ("M4A_SESSION_ID", "s".to_owned())]);
     }
 
     #[test]
