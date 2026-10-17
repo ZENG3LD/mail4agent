@@ -32,10 +32,11 @@ pub mod web_client;
 pub mod door_listen;
 pub mod launch;
 pub mod account;
+pub mod mcp;
 mod letter;
 
 /// The subcommand names, in the order of the table above.
-pub const COMMANDS: &[&str] = &["web-client", "grok-listen", "inbox", "send", "mail", "ensure-agent-webhooks", "enroll", "wake", "vault", "element-open", "door-listen", "launch", "account", "letter"];
+pub const COMMANDS: &[&str] = &["web-client", "grok-listen", "inbox", "send", "mail", "ensure-agent-webhooks", "enroll", "wake", "vault", "element-open", "door-listen", "launch", "account", "letter", "mcp"];
 
 /// Runs `command` with its arguments. `Err` names an unknown command (or one this build lacks).
 pub fn dispatch(command: &str, args: Vec<String>) -> Result<(), String> {
@@ -55,6 +56,7 @@ pub fn dispatch(command: &str, args: Vec<String>) -> Result<(), String> {
         "door-listen" => door_listen::run(args),
         "launch" => launch::run(args),
         "account" => account::run(args),
+        "mcp" => mcp::run(args),
         "letter" => letter::run(args),
         #[cfg(feature = "element-open")]
         "element-open" => element_open::run(args),
