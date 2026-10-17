@@ -307,8 +307,9 @@ pub fn append_env_file(path: &Path, pairs: &[(&str, String)]) -> Result<(), Acco
     Ok(())
 }
 
-/// Keys a session file may carry: the session identity only.
-pub const SESSION_FILE_KEYS: [&str; 3] = ["M4A_NICK", "M4A_SESSION_ID", SESSION_CAP_ENV];
+/// Keys a session file may carry: the session identity and where its own account lives
+/// (store root, messenger URLs, display name). No other variable rides along.
+pub const SESSION_FILE_KEYS: [&str; 7] = ["M4A_NICK", "M4A_SESSION_ID", SESSION_CAP_ENV, "M4A_BOT_NAME", "M4A_STORE_ROOT", "M4A_PRODUCT_URL", "M4A_HOMESERVER_URL"];
 
 /// Parses a node-written session file (`KEY=VALUE` lines, optional `export `), keeping only
 /// [`SESSION_FILE_KEYS`]. Used when a provider runs tools in a process that did not inherit
@@ -534,6 +535,7 @@ mod tests {
     #[test]
     fn session_file_keeps_only_identity_keys() {
         let got = parse_session_file("export M4A_NICK=a-1\nM4A_SESSION_ID=s\nPATH=/x\nM4A_SESSION_CAP=\n# c\n");
+        assert_eq!(parse_session_file("M4A_STORE_ROOT=/r\nM4A_PRODUCT_URL=u\nLD_PRELOAD=x\n"), vec![("M4A_STORE_ROOT", "/r".to_owned()), ("M4A_PRODUCT_URL", "u".to_owned())]);
         assert_eq!(got, vec![("M4A_NICK", "a-1".to_owned()), ("M4A_SESSION_ID", "s".to_owned())]);
     }
 
