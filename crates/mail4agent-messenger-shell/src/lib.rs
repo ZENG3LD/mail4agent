@@ -688,10 +688,10 @@ impl OpenedStore {
             return Err(ShellError::DeviceToken);
         }
         let base_url = backend.server_ref().to_string();
-        fs_create_dir(dir)?;
+        at("create store dir", dir, fs_create_dir(dir))?;
         let user_id = UserId::parse(user_id)?;
         let secrets = CoreSecrets {
-            store_seal_key: Some(store_key::store_key(dir, session_id)?),
+            store_seal_key: Some(at("store key", dir, store_key::store_key(dir, session_id))?),
             backup_key: None,
         };
         let config = CoreConfig {
@@ -699,14 +699,14 @@ impl OpenedStore {
             device_id,
             server_name: server_name.to_string(),
         };
-        let records = read_records(dir)?;
+        let records = at("read records", dir, read_records(dir))?;
         let mut core =
             match MessengerCore::open_sealed(records, secrets, config, 0, Box::new(ZeroJitter)) {
                 Ok(core) => core,
                 Err(MessengerError::Store(err)) => return Err(ShellError::Store(err)),
                 Err(err) => return Err(ShellError::Messenger(err)),
             };
-        persist(dir, &mut core)?;
+        at("persist records", dir, persist(dir, &mut core))?;
         let mut opened = Self {
             dir: dir.to_path_buf(),
             driver: Driver::new(core, backend, {
@@ -1951,6 +1951,11 @@ struct RegisteredSession {
 /// Identity mode: the client's own identity logs in by signature (enrolling first when it has to).
 #[cfg(any(feature = "tier-server", feature = "tier-matrix"))]
 fn identity_session(config: &SessionConfig, auth: &IdentityAuth) -> Result<RegisteredSession, ShellError> {
+    at("open identity", &config.store_root, identity_session_inner(config, auth))
+}
+
+#[cfg(any(feature = "tier-server", feature = "tier-matrix"))]
+fn identity_session_inner(config: &SessionConfig, auth: &IdentityAuth) -> Result<RegisteredSession, ShellError> {
     let fail = |e: AgentError| ShellError::Register(clip_public(e.to_string()));
     parse_base_url(&config.homeserver_url)?;
     let ids = m4a_agent::IdentityStore::new(store_key::vault(&config.store_root)?);
@@ -2007,6 +2012,14 @@ fn clip_public(text: String) -> String {
         }
     }
     out
+}
+
+/// Names the step and the path (never contents) of an io failure, so "path not found" says which.
+pub(crate) fn at<T>(step: &str, path: &Path, r: Result<T, ShellError>) -> Result<T, ShellError> {
+    r.map_err(|e| match e {
+        ShellError::Io(io) => ShellError::Io(std::io::Error::new(io.kind(), format!("{step} at {}: {io}", path.display()))),
+        other => other,
+    })
 }
 
 fn fs_create_dir(dir: &Path) -> Result<(), ShellError> {
