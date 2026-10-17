@@ -366,6 +366,12 @@ fn resolve_agents_dir(mut get: impl FnMut(&str) -> Option<String>) -> Option<Pat
 /// [`GATEWAY_FILE_ENV`] names the gateway file. When that lookup is empty,
 /// this does not look for a gateway, so a test that did not point at one
 /// does not create a mirror. The json files are not rewritten.
+/// `<base>` of a per-session store root `<base>/accounts/<account_ref>`.
+fn accounts_base_of(store_root: &Path) -> Option<PathBuf> {
+    let parent = store_root.parent()?;
+    (parent.file_name()? == "accounts").then(|| parent.parent().map(Path::to_path_buf)).flatten()
+}
+
 fn load_web_sessions(
     dir: &Path,
     mut get: impl FnMut(&str) -> Option<String>,
@@ -1649,6 +1655,20 @@ impl MachineClient {
         Self::from_env_filtered(Some(nick))
     }
 
+    /// One named session (`nick`, `session_id`) from `M4A_STORE_ROOT`: the send path of a
+    /// node-issued per-session account, which has no session record directory.
+    pub fn from_env_session(nick: &str, session_id: &str) -> Result<Self, ShellError> {
+        let homeserver_url = std::env::var(HOMESERVER_URL_ENV)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .or_else(|| std::env::var("M4A_PRODUCT_URL").ok().filter(|value| !value.is_empty()))
+            .ok_or(ShellError::HomeserverUrl)?;
+        let store_root = std::env::var(STORE_ROOT_ENV).ok().filter(|value| !value.is_empty()).ok_or(ShellError::StoreRoot)?;
+        let mut client = Self::open_with(&homeserver_url, Path::new(&store_root), vec![HostSession::new(nick.to_string(), session_id.to_string())], false)?;
+        client.store_root = Some(PathBuf::from(&store_root));
+        Ok(client)
+    }
+
     fn from_env_filtered(only: Option<&str>) -> Result<Self, ShellError> {
         let homeserver_url = std::env::var(HOMESERVER_URL_ENV)
             .ok()
@@ -1666,10 +1686,21 @@ impl MachineClient {
         let (sessions, agents_dir) = if let Some(dir) = agents_dir {
             (load_web_agents(&dir, &mut get)?, Some(dir))
         } else {
-            let sessions_dir = get(SESSIONS_DIR_ENV)
-                .ok_or_else(|| ShellError::SessionList("session directory is unset".to_string()))?;
-            sessions_dir_seen = Some(PathBuf::from(&sessions_dir));
-            (load_web_sessions(Path::new(&sessions_dir), &mut get)?, None)
+            match get(SESSIONS_DIR_ENV) {
+                Some(sessions_dir) => {
+                    sessions_dir_seen = Some(PathBuf::from(&sessions_dir));
+                    (load_web_sessions(Path::new(&sessions_dir), &mut get)?, None)
+                }
+                // A per-session account (node-issued) has no record directory: its enrolled
+                // accounts root is named, or is the parent of its own `accounts/<ref>` store root.
+                None => {
+                    let base = get(crate::ACCOUNTS_ROOT_ENV).map(PathBuf::from).or_else(|| accounts_base_of(Path::new(&store_root)));
+                    match base {
+                        Some(base) => (account_sessions(&base), None),
+                        None => return Err(ShellError::SessionList("session directory is unset".to_string())),
+                    }
+                }
+            }
         };
         let sessions = match only {
             Some(nick) => {

@@ -29,12 +29,14 @@ fn fail(code: i32, message: &str) -> ! {
 
 pub fn run(args: Vec<String>) {
     let mut as_nick = None;
+    let mut session: Option<String> = None;
     let mut to = None;
     let mut words: Vec<String> = Vec::new();
     let mut args = args.clone().into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--as" => as_nick = args.next(),
+            "--session" => session = args.next(),
             "--to" => to = args.next(),
             "-h" | "--help" => {
                 println!("{USAGE}");
@@ -93,7 +95,14 @@ pub fn run(args: Vec<String>) {
         Ok(reply) => reply,
         Err(_) => {
             // No client answered: open the one session here.
-            let mut client = match MachineClient::from_env_for(&as_nick) {
+            // Named session (the MCP path, like `inbox drain --session`): open just that session
+            // from its own store root; no session record directory is needed.
+            let session = session.clone().or_else(|| get("M4A_SESSION_ID"));
+            let opened = match session.as_deref() {
+                Some(id) => MachineClient::from_env_session(&as_nick, id),
+                None => MachineClient::from_env_for(&as_nick),
+            };
+            let mut client = match opened {
                 Ok(client) => client,
                 Err(err) => fail(
                     1,
