@@ -28,6 +28,7 @@ pub mod events;
 pub mod keylogin;
 pub mod model;
 pub mod nick_rules;
+pub mod node_registry;
 pub mod push_relay;
 pub mod service;
 pub mod tiers;

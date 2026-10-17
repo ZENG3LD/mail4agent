@@ -88,6 +88,13 @@ async fn stack_with(unix_dir: Option<&std::path::Path>) -> Stack {
         tokens: Default::default(),
         access_ttl_ms: 3_600_000,
         challenges: m4a_product_kit::ChallengeBook::new("test-product"),
+        nodes: Some(Arc::new(
+            m4a_product_kit::node_registry::NodeRegistry::open(
+                std::env::temp_dir().join(format!("m4a-e2e-nodes-{}-{}.json", std::process::id(), NODE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed))),
+                100,
+            )
+            .unwrap(),
+        )),
     });
     let product = format!("http://{}", serve(router(app)).await);
     Stack { link, edge: edge_url, core, product, c: reqwest::Client::new() }
@@ -781,4 +788,48 @@ async fn an_invite_for_an_existing_account_adds_a_key_to_it_and_nothing_else() {
     assert_eq!(s.post("/product/v1/admin/invite", Some(ADMIN), json!({ "nick": "nobody-here", "existing": true })).await.0, 404);
     assert_eq!(s.post("/product/v1/admin/invite", Some(ADMIN), json!({ "existing": true })).await.0, 400);
     assert_eq!(s.post("/product/v1/admin/invite", None, json!({ "nick": "keeper", "existing": true })).await.0, 403);
+}
+
+static NODE_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[tokio::test]
+async fn a_trusted_node_registers_its_session_account_and_the_session_enrolls_with_its_own_key() {
+    use ed25519_dalek::{Signer, SigningKey};
+    use m4a_product_kit::node_registry::request_message;
+    let s = stack().await;
+    let node = SigningKey::from_bytes(&[42u8; 32]);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+    let sign = |nonce: &str, nick: Option<&str>| {
+        let sig = node.sign(&request_message("test-product", "node-a", nick, now, nonce));
+        json!({ "node_id": "node-a", "nick": nick, "ts_ms": now, "nonce": nonce, "signature": keyproof::encode(&sig.to_bytes()) })
+    };
+    // Unregistered node: nothing.
+    assert_eq!(s.post("/product/v1/node/accounts", None, sign("nonce-000001", None)).await.0, 403);
+    // Only an admin registers a node.
+    let pk = keyproof::encode(&node.verifying_key().to_bytes());
+    assert_eq!(s.post("/product/v1/admin/nodes", None, json!({"node_id":"node-a","public_key":pk,"owner":"owner-a"})).await.0, 403);
+    assert_eq!(s.post("/product/v1/admin/nodes", Some(ADMIN), json!({"node_id":"node-a","public_key":pk,"owner":"owner-a"})).await.0, 200);
+    let (st, b) = s.post("/product/v1/node/accounts", None, sign("nonce-000002", Some("sess-agent"))).await;
+    assert_eq!(st, 200, "{b}");
+    assert_eq!(b["nick"], "sess-agent");
+    let invite = b["invite"].as_str().unwrap().to_string();
+    // Replay of the same signed request is refused.
+    assert_eq!(s.post("/product/v1/node/accounts", None, sign("nonce-000002", Some("sess-agent"))).await.0, 403);
+    // The session's own client enrolls with its own key using that invite.
+    let vault: Arc<dyn KeyVault> = Arc::new(MemoryVault::new());
+    let ids = Arc::new(IdentityStore::new(vault));
+    let url = s.product.clone();
+    let enrolled = off(move || {
+        let b = ServerBackend::new(&url).unwrap();
+        let mut id = ids.resolve("sess-agent", BackendKind::Server, b.server_ref()).unwrap();
+        b.ensure_session(&ids, &mut id, Some(&invite)).unwrap();
+        id.enrolled
+    })
+    .await;
+    assert!(enrolled);
+    // Revoking the node removes the accounts it registered and stops further registrations.
+    let (st, b) = s.post("/product/v1/admin/nodes/revoke", Some(ADMIN), json!({"node_id":"node-a"})).await;
+    assert_eq!(st, 200, "{b}");
+    assert_eq!(b["removed"], json!(["sess-agent"]));
+    assert_eq!(s.post("/product/v1/node/accounts", None, sign("nonce-000003", None)).await.0, 403);
 }

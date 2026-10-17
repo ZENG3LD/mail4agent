@@ -36,6 +36,8 @@ pub struct ProductApp {
     pub access_ttl_ms: i64,
     /// Open key-login challenges (replay protection) and this product's audience name.
     pub challenges: m4a_product_kit::ChallengeBook,
+    /// Trusted nodes that may register their sessions' accounts (`None`: node registration off).
+    pub nodes: Option<Arc<m4a_product_kit::node_registry::NodeRegistry>>,
 }
 
 /// A refresh token lives this long.
@@ -121,6 +123,9 @@ pub fn router(app: App) -> Router {
         .route("/product/v1/login/key", post(key_login))
         .route("/product/v1/login/key/token", post(key_login_token))
         .route("/product/v1/admin/invite", post(admin_invite))
+        .route("/product/v1/admin/nodes", get(admin_nodes_list).post(admin_node_register))
+        .route("/product/v1/admin/nodes/revoke", post(admin_node_revoke))
+        .route("/product/v1/node/accounts", post(node_account))
         .route("/client/v3/login", get(matrix_login_flows).post(matrix_login))
         .route("/_matrix/client/v3/login", get(matrix_login_flows).post(matrix_login))
         .route("/client/v3/refresh", post(matrix_refresh))
@@ -667,6 +672,68 @@ async fn admin_invite(State(app): State<App>, headers: HeaderMap, Json(b): Json<
     }
     let (code, user) = blk(&app, move |a| a.users.invite(nick.as_deref(), tier.as_deref(), now_ms())).await??;
     Ok(Json(json!({ "invite": code, "nick": user.nick, "audience": app.challenges.audience() })))
+}
+
+fn nodes(app: &App) -> Result<Arc<m4a_product_kit::node_registry::NodeRegistry>, ApiError> {
+    app.nodes.clone().ok_or_else(|| err(StatusCode::NOT_FOUND, "M_UNRECOGNIZED", "node registration is not enabled"))
+}
+
+fn node_err(e: m4a_product_kit::node_registry::NodeError) -> ApiError {
+    use m4a_product_kit::node_registry::NodeError as E;
+    let status = match e {
+        E::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+        E::Invalid(_) => StatusCode::BAD_REQUEST,
+        E::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        _ => StatusCode::FORBIDDEN,
+    };
+    err(status, "M4A_NODE", &e.to_string())
+}
+
+/// `GET /product/v1/admin/nodes`: registered nodes (public data).
+async fn admin_nodes_list(State(app): State<App>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
+    staff(&app, &headers, Role::Admin).await?;
+    Ok(Json(json!({ "nodes": nodes(&app)?.list() })))
+}
+
+/// `POST /product/v1/admin/nodes {node_id, public_key, owner}`: trust a node.
+async fn admin_node_register(State(app): State<App>, headers: HeaderMap, Json(b): Json<Value>) -> Result<Json<Value>, ApiError> {
+    staff(&app, &headers, Role::Admin).await?;
+    let s = |k: &str| b.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let reg = nodes(&app)?;
+    let rec = reg.register(&s("node_id"), &s("public_key"), &s("owner"), now_ms()).map_err(node_err)?;
+    Ok(Json(json!({ "node_id": s("node_id"), "node": rec })))
+}
+
+/// `POST /product/v1/admin/nodes/revoke {node_id}`: revoke a node and remove the accounts it registered.
+async fn admin_node_revoke(State(app): State<App>, headers: HeaderMap, Json(b): Json<Value>) -> Result<Json<Value>, ApiError> {
+    staff(&app, &headers, Role::Admin).await?;
+    let id = b.get("node_id").and_then(Value::as_str).unwrap_or("").to_string();
+    let nicks = nodes(&app)?.revoke(&id, now_ms()).map_err(node_err)?;
+    let mut removed = Vec::new();
+    for nick in nicks {
+        let n = nick.clone();
+        match blk(&app, move |a| a.users.delete(&n)).await? {
+            Ok(evs) => {
+                app.events.publish(evs);
+                removed.push(nick);
+            }
+            Err(e) => tracing::warn!(%nick, error = ?e, "node revoke: account not removed"),
+        }
+    }
+    Ok(Json(json!({ "node_id": id, "revoked": true, "removed": removed })))
+}
+
+/// `POST /product/v1/node/accounts {node_id, nick?, ts_ms, nonce, signature}`: a trusted node
+/// registers one account for its own session. The answer is a one-time invite the session's own
+/// client spends in the key enroll (`/product/v1/enroll`), so the account gets its own key.
+async fn node_account(State(app): State<App>, Json(req): Json<m4a_product_kit::node_registry::NodeAccountRequest>) -> Result<Json<Value>, ApiError> {
+    let reg = nodes(&app)?;
+    let audience = app.challenges.audience().to_owned();
+    reg.authorize(&audience, &req, now_ms()).map_err(node_err)?;
+    let nick = req.nick.clone();
+    let (code, user) = blk(&app, move |a| a.users.invite(nick.as_deref(), None, now_ms())).await??;
+    reg.record_account(&req.node_id, &user.nick, now_ms()).map_err(node_err)?;
+    Ok(Json(json!({ "invite": code, "nick": user.nick, "audience": audience })))
 }
 
 /// `POST /product/v1/enroll {invite, public_key, signature, label?}`.
