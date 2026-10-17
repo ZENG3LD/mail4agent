@@ -1502,7 +1502,7 @@ impl MachineClient {
                 return Err(ShellError::SessionList("duplicate session id".to_string()));
             }
             seen_ids.push(config.session_id().to_string());
-            let lock = match lock_store(&config.store_dir()) {
+            let lock = match crate::at("lock store", &config.store_dir(), lock_store(&config.store_dir())) {
                 Ok(lock) => lock,
                 Err(err) if lenient => {
                     eprintln!("mail4agent: session {} left out: {err}", config.session_id());
@@ -1548,7 +1548,7 @@ impl MachineClient {
             }
         }
         ensure_server_name(server_name)?;
-        let bus = Arc::new(LocalBus::open(&prepared)?);
+        let bus = Arc::new(crate::at("local bus", store_root, LocalBus::open(&prepared))?);
         let peers: Vec<(String, String)> = prepared
             .iter()
             .map(|item| (item.nick.to_string(), item.user_id.clone()))
@@ -1583,8 +1583,8 @@ impl MachineClient {
             if item.routine_url.is_none() {
                 attach_detected_chain(&mut store, &item.config, &item.nick);
             }
-            store.drive(1_000, false)?;
-            store.abandon_inflight_sync(1_000)?;
+            crate::at("first drive", &item.config.store_dir(), store.drive(1_000, false))?;
+            crate::at("abandon inflight", &item.config.store_dir(), store.abandon_inflight_sync(1_000))?;
             opened.push(store);
         }
         let tokens: Vec<String> = prepared

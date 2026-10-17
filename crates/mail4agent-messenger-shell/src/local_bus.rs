@@ -4,8 +4,6 @@
 //! `local_bus_off.rs` stands in and every request goes to the real server.
 
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::Read;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -85,9 +83,8 @@ impl LocalBus {
             .enable_all()
             .build()
             .map_err(|_| ShellError::Http("local bus runtime failed".into()))?;
-        let mut secret = [0u8; 32];
-        File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut secret)).map_err(ShellError::Io)?;
-        let secret = secret.to_vec();
+        // OS randomness on every platform (there is no /dev/urandom on Windows).
+        let secret = m4a_agent::vault::random_bytes(32).to_vec();
         let state = Arc::new(Homeserver::new(conn));
         let _ = state.seam.set(Arc::new(Seam::new(vec![secret.clone()], 30, None, None)));
         Ok(Self {
@@ -326,7 +323,7 @@ fn open_persistent(path: &std::path::Path) -> Result<Connection, ShellError> {
         Ok(text) if text.trim().len() == 64 => Zeroizing::new(text.trim().to_string()),
         _ => {
             let mut bytes = [0u8; 32];
-            File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes)).map_err(ShellError::Io)?;
+            bytes.copy_from_slice(&m4a_agent::vault::random_bytes(32));
             let hex = Zeroizing::new(crate::hex_encode(&bytes));
             zeroize::Zeroize::zeroize(&mut bytes);
             let mut options = std::fs::OpenOptions::new();
@@ -351,9 +348,7 @@ fn open_persistent(path: &std::path::Path) -> Result<Connection, ShellError> {
 
 fn open_keyed_memory() -> Result<Connection, ShellError> {
     let mut bytes = [0u8; 32];
-    File::open("/dev/urandom")
-        .and_then(|mut file| file.read_exact(&mut bytes))
-        .map_err(|err| ShellError::Io(err))?;
+    bytes.copy_from_slice(&m4a_agent::vault::random_bytes(32));
     let hex = Zeroizing::new(crate::hex_encode(&bytes));
     zeroize::Zeroize::zeroize(&mut bytes);
     let conn = Connection::open_in_memory()
