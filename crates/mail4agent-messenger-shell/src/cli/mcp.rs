@@ -29,6 +29,10 @@ pub struct Identity {
     pub nick: String,
     pub session_id: String,
     cap: String,
+    /// The account's own store root and the messenger URL, when the node told them (attach) or
+    /// the environment has them. Directories and URLs only, no secret.
+    pub store_root: String,
+    pub product_url: String,
 }
 
 impl std::fmt::Debug for Identity {
@@ -44,11 +48,22 @@ impl Identity {
             nick: get("M4A_NICK")?,
             session_id: get("M4A_SESSION_ID").unwrap_or_default(),
             cap: get(crate::session_account::SESSION_CAP_ENV).unwrap_or_default(),
+            store_root: get("M4A_STORE_ROOT").unwrap_or_default(),
+            product_url: get("M4A_PRODUCT_URL").unwrap_or_default(),
         })
     }
 
     fn child_env(&self, cmd: &mut Command) {
         cmd.env("M4A_NICK", &self.nick);
+        if !self.store_root.is_empty() {
+            cmd.env("M4A_STORE_ROOT", &self.store_root);
+        }
+        if !self.product_url.is_empty() {
+            cmd.env("M4A_PRODUCT_URL", &self.product_url);
+            if std::env::var_os("M4A_HOMESERVER_URL").is_none_or(|v| v.is_empty()) {
+                cmd.env("M4A_HOMESERVER_URL", &self.product_url);
+            }
+        }
         if !self.session_id.is_empty() {
             cmd.env("M4A_SESSION_ID", &self.session_id);
         }
@@ -151,7 +166,12 @@ impl Server {
                 let to = args.get("to").and_then(Value::as_str).filter(|s| !s.trim().is_empty()).ok_or("`to` is required")?;
                 let text = args.get("text").and_then(Value::as_str).filter(|s| !s.trim().is_empty()).ok_or("`text` is required")?;
                 let i = self.identity()?;
-                run_self(&i, &["send", "--as", &i.nick, "--to", to, "-"], Some(text))
+                let mut a = vec!["send", "--as", i.nick.as_str(), "--to", to];
+                if !i.session_id.is_empty() {
+                    a.extend(["--session", i.session_id.as_str()]);
+                }
+                a.push("-");
+                run_self(&i, &a, Some(text))
             }
             "inbox" => {
                 let i = self.identity()?;
@@ -228,7 +248,7 @@ pub fn attach(node_ops: &str, provider: &str, provider_session: Option<&str>, pi
         return Err(format!("attach refused ({status}): {}", v.get("error").and_then(Value::as_str).unwrap_or("no reason")));
     }
     let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
-    let identity = Identity { nick: s("nick"), session_id: s("session_id"), cap: s("cap") };
+    let identity = Identity { nick: s("nick"), session_id: s("session_id"), cap: s("cap"), store_root: s("store_root"), product_url: s("product_url") };
     if identity.nick.is_empty() {
         return Err("attach reply has no nick".into());
     }
@@ -256,7 +276,7 @@ mod tests {
 
     #[test]
     fn whoami_never_reveals_the_capability() {
-        let mut s = server(Some(Identity { nick: "a-1".into(), session_id: "s".into(), cap: "secret-cap-value".into() }));
+        let mut s = server(Some(Identity { nick: "a-1".into(), session_id: "s".into(), cap: "secret-cap-value".into(), ..Default::default() }));
         let r = s.handle_line(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"whoami","arguments":{}}}"#).unwrap();
         let text = r.to_string();
         assert!(text.contains("a-1") && text.contains("has_capability"));
